@@ -31,6 +31,7 @@ import cv2
 from decord import AudioReader, VideoReader
 import shutil
 import subprocess
+import shlex
 
 
 # Machine epsilon for a float32 (single precision)
@@ -50,7 +51,8 @@ def read_video(video_path: str, change_fps=True, use_decord=True):
             shutil.rmtree(temp_dir)
         os.makedirs(temp_dir, exist_ok=True)
         command = (
-            f"ffmpeg -loglevel error -y -nostdin -i {video_path} -r 25 -crf 18 {os.path.join(temp_dir, 'video.mp4')}"
+            f"ffmpeg -loglevel error -y -nostdin -i {shlex.quote(video_path)} "
+            f"-r 25 -crf 18 {shlex.quote(os.path.join(temp_dir, 'video.mp4'))}"
         )
         subprocess.run(command, shell=True)
         target_video_path = os.path.join(temp_dir, "video.mp4")
@@ -61,6 +63,56 @@ def read_video(video_path: str, change_fps=True, use_decord=True):
         return read_video_decord(target_video_path)
     else:
         return read_video_cv2(target_video_path)
+
+
+def normalize_video_25fps(video_path: str, out_dir: str = "temp_in"):
+    """ffmpeg re-encode to 25fps and return the normalized file path WITHOUT reading frames.
+
+    Same conversion as read_video(change_fps=True) but writes to a STABLE dir distinct from
+    the pipeline's `temp/` output dir (which gets rmtree'd mid-run). Used by the streaming
+    inference path so the normalized input survives while we read it chunk-by-chunk.
+    """
+    if os.path.exists(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    target = os.path.join(out_dir, "video.mp4")
+    command = (
+        f"ffmpeg -loglevel error -y -nostdin -i {shlex.quote(video_path)} "
+        f"-r 25 -crf 18 {shlex.quote(target)}"
+    )
+    subprocess.run(command, shell=True)
+    return target
+
+
+def count_video_frames(video_path: str) -> int:
+    cap = cv2.VideoCapture(video_path)
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+    return n
+
+
+def read_video_chunks(video_path: str, chunk_size: int = 16):
+    """Sequentially read `video_path` and yield np.ndarray batches of up to `chunk_size`
+    RGB frames (the last batch may be shorter). Streaming counterpart of read_video_cv2 — same
+    BGR->RGB decode path, same order — so constant RAM regardless of video length.
+    """
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"Could not open video: {video_path}")
+    try:
+        batch = []
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            batch.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            if len(batch) == chunk_size:
+                yield np.stack(batch, axis=0)
+                batch = []
+        if batch:
+            yield np.stack(batch, axis=0)
+    finally:
+        cap.release()
 
 
 def read_video_decord(video_path: str):

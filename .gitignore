@@ -49,3 +49,34 @@ wandb/
 !/docs/*
 !/internal/*.png
 .cog/
+
+# --- model weights / binaries (too large for GitHub) ---
+*.pth
+*.onnx
+*.npz
+*.zip
+/gfpgan/weights/
+
+# --- runtime artifacts / caches ---
+/avatar_cache/
+/output/
+/downloads/
+/uploads/
+/backups/
+/logs/
+/temp_in/
+/clips_test/
+/audios_test/
+
+# --- media files (render in/out, test clips) ---
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.mp3
+*.wav
+*.m4a
+*.aac
+temp_*.mp3
+temp_*.mp4
+temp_*.wav

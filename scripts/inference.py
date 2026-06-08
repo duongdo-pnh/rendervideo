@@ -16,6 +16,8 @@ import argparse
 import os
 from omegaconf import OmegaConf
 import torch
+# Hardware accel: autotune cuDNN conv algorithms for the fixed (16, 512, 512) chunk shape.
+torch.backends.cudnn.benchmark = True
 from diffusers import AutoencoderKL, DDIMScheduler
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
@@ -38,7 +40,12 @@ def main(config, args):
     print(f"Input audio path: {args.audio_path}")
     print(f"Loaded checkpoint path: {args.inference_ckpt_path}")
 
-    scheduler = DDIMScheduler.from_pretrained("configs")
+    if os.environ.get("LATENTSYNC_SCHEDULER", "dpm").lower().startswith("dpm"):
+        from diffusers import DPMSolverMultistepScheduler
+        scheduler = DPMSolverMultistepScheduler.from_pretrained("configs", algorithm_type="dpmsolver++")
+        print("Scheduler: DPMSolverMultistep (dpmsolver++)")
+    else:
+        scheduler = DDIMScheduler.from_pretrained("configs")
 
     if config.model.cross_attention_dim == 768:
         whisper_model_path = "checkpoints/whisper/small.pt"

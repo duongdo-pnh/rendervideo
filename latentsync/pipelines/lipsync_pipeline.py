@@ -31,8 +31,17 @@ from einops import rearrange
 import cv2
 
 from ..models.unet import UNet3DConditionModel
-from ..utils.util import read_video, read_audio, write_video, check_ffmpeg_installed
+from ..utils.util import (
+    read_video,
+    read_audio,
+    write_video,
+    check_ffmpeg_installed,
+    normalize_video_25fps,
+    count_video_frames,
+    read_video_chunks,
+)
 from ..utils.image_processor import ImageProcessor, load_fixed_mask
+from ..utils.runtime import CANCEL, LatentSyncCancelled
 from ..whisper.audio2feature import Audio2Feature
 import tqdm
 import soundfile as sf
@@ -278,26 +287,30 @@ class LipsyncPipeline(DiffusionPipeline):
             out_frames.append(out_frame)
         return np.stack(out_frames, axis=0)
 
-    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray):
+    def loop_video(self, whisper_chunks: list, video_frames: np.ndarray,
+                   faces=None, boxes=None, affine_matrices=None):
+        # `faces`/`boxes`/`affine_matrices` may be supplied from an avatar precompute cache
+        # (precompute_avatar.py) to SKIP the per-frame insightface detect+align here. When they
+        # are None we fall back to computing them (original behaviour). They cover the full avatar
+        # video 1:1; the loop/trim below applies identically to cached or freshly-computed data.
+        precomputed = faces is not None
         # If the audio is longer than the video, we need to loop the video
         if len(whisper_chunks) > len(video_frames):
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            if not precomputed:
+                faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
             num_loops = math.ceil(len(whisper_chunks) / len(video_frames))
             loop_video_frames = []
             loop_faces = []
             loop_boxes = []
             loop_affine_matrices = []
+            # Forward-only loop (never reverse — reversed playback looks unnatural for a
+            # talking head). Normally unreached: gradio pre-extends the video smoothly so the
+            # else-branch is taken; this is a safety net if preprocessing is skipped.
             for i in range(num_loops):
-                if i % 2 == 0:
-                    loop_video_frames.append(video_frames)
-                    loop_faces.append(faces)
-                    loop_boxes += boxes
-                    loop_affine_matrices += affine_matrices
-                else:
-                    loop_video_frames.append(video_frames[::-1])
-                    loop_faces.append(faces.flip(0))
-                    loop_boxes += boxes[::-1]
-                    loop_affine_matrices += affine_matrices[::-1]
+                loop_video_frames.append(video_frames)
+                loop_faces.append(faces)
+                loop_boxes += boxes
+                loop_affine_matrices += affine_matrices
 
             video_frames = np.concatenate(loop_video_frames, axis=0)[: len(whisper_chunks)]
             faces = torch.cat(loop_faces, dim=0)[: len(whisper_chunks)]
@@ -305,9 +318,29 @@ class LipsyncPipeline(DiffusionPipeline):
             affine_matrices = loop_affine_matrices[: len(whisper_chunks)]
         else:
             video_frames = video_frames[: len(whisper_chunks)]
-            faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            if not precomputed:
+                faces, boxes, affine_matrices = self.affine_transform_video(video_frames)
+            else:
+                faces = faces[: len(whisper_chunks)]
+                boxes = boxes[: len(whisper_chunks)]
+                affine_matrices = affine_matrices[: len(whisper_chunks)]
 
         return video_frames, faces, boxes, affine_matrices
+
+    @staticmethod
+    def count_whisper_chunks(feature_len: int, fps: int) -> int:
+        """Number of output frames the audio drives, WITHOUT materializing the chunk list.
+        Mirrors Audio2Feature.feature2chunks exactly (append-then-break => +1 boundary)."""
+        multiplier = 50.0 / fps
+        i = 0
+        n = 0
+        while True:
+            start_idx = int(i * multiplier)
+            n += 1
+            i += 1
+            if start_idx > feature_len:
+                break
+        return n
 
     @torch.no_grad()
     def __call__(
@@ -329,6 +362,9 @@ class LipsyncPipeline(DiffusionPipeline):
         generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: Optional[int] = 1,
+        precomputed_faces=None,
+        precomputed_boxes=None,
+        precomputed_affine_matrices=None,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -339,6 +375,10 @@ class LipsyncPipeline(DiffusionPipeline):
         # 0. Define call parameters
         device = self._execution_device
         mask_image = load_fixed_mask(height, mask_image_path)
+        # ONE ImageProcessor for the whole run: affine_transform's smoothing (align_warp_face
+        # smooth=True) carries a sequential EMA state (p_bias). Detecting faces chunk-by-chunk in
+        # global frame order through THIS instance reproduces the all-at-once result bit-for-bit;
+        # re-instantiating or going out of order would diverge.
         self.image_processor = ImageProcessor(height, device="cuda", mask_image=mask_image)
         self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
 
@@ -356,122 +396,182 @@ class LipsyncPipeline(DiffusionPipeline):
 
         # 3. set timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=device)
-        timesteps = self.scheduler.timesteps
 
         # 4. Prepare extra step kwargs.
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
         whisper_feature = self.audio_encoder.audio2feat(audio_path)
-        whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+        # Number of output frames (audio-driven). We DON'T materialize whisper_chunks (a list with
+        # one entry per frame would be ~20GB for a 3h clip); each chunk's features are sliced on
+        # demand below via get_sliced_feature — bit-identical to feature2chunks.
+        num_audio_frames = self.count_whisper_chunks(len(whisper_feature), video_fps)
 
         audio_samples = read_audio(audio_path)
-        video_frames = read_video(video_path, use_decord=False)
-
-        video_frames, faces, boxes, affine_matrices = self.loop_video(whisper_chunks, video_frames)
-
-        synced_video_frames = []
 
         num_channels_latents = self.vae.config.latent_channels
 
-        # Prepare latent variables
-        all_latents = self.prepare_latents(
-            len(whisper_chunks),
-            num_channels_latents,
-            height,
-            width,
-            weight_dtype,
-            device,
-            generator,
-        )
+        # STREAMING latents (constraint #2): the original prepare_latents draws ONE frame of noise
+        # and repeats it across all frames, so every chunk slice is the same noise. Draw it once
+        # here (seeded generator, before the loop so generator-consumption order matches), then
+        # rebuild each chunk's latents by repeating to the chunk length and scaling by init_sigma.
+        noise_shape = (1, num_channels_latents, 1, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        rand_device = "cpu" if device.type == "mps" else device
+        base_noise = torch.randn(noise_shape, generator=generator, device=rand_device, dtype=weight_dtype).to(device)
+        init_noise_sigma = self.scheduler.init_noise_sigma
 
-        num_inferences = math.ceil(len(whisper_chunks) / num_frames)
-        for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+        num_inferences = math.ceil(num_audio_frames / num_frames)
+
+        # --- decide TRIM vs LOOP, and set up the per-chunk frame/face source ---------------------
+        # The original frames (for restore) always come from the 25fps-normalized input. Written to
+        # a STABLE dir (temp_in/) distinct from the output temp_dir so it survives the whole loop.
+        precomputed = precomputed_faces is not None
+        normalized_path = normalize_video_25fps(video_path)
+        video_len = count_video_frames(normalized_path)
+        loop_mode = num_audio_frames > video_len
+
+        loop_base = None  # filled for LOOP mode: (frames, faces, boxes, affines) over the short base
+        if loop_mode:
+            # Audio longer than video. The base video is SHORTER than the audio, so detecting/holding
+            # its faces once is bounded; we then forward-loop (g % video_len) exactly like loop_video.
+            base_frames = read_video(normalized_path, use_decord=False)
+            if precomputed:
+                base_faces = precomputed_faces
+                base_boxes = list(precomputed_boxes)
+                base_affines = list(precomputed_affine_matrices)
+            else:
+                base_faces, base_boxes, base_affines = self.affine_transform_video(base_frames)
+            loop_base = (base_frames, base_faces, base_boxes, base_affines)
+
+        # streaming frame reader for TRIM mode (sequential, constant RAM). precomputed faces cover
+        # the video 1:1 (avatar cache, bounded) and are sliced per chunk below.
+        chunk_reader = None
+        if not loop_mode:
+            chunk_reader = read_video_chunks(normalized_path, chunk_size=num_frames)
+
+        def _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, global_start, chunk_len):
+            """Run diffusion + restore on one chunk; return restored RGB frames (np, chunk_len)."""
             if self.unet.add_audio_layer:
-                audio_embeds = torch.stack(whisper_chunks[i * num_frames : (i + 1) * num_frames])
-                audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
+                feats = [
+                    self.audio_encoder.get_sliced_feature(whisper_feature, vid_idx=g, fps=video_fps)[0]
+                    for g in range(global_start, global_start + chunk_len)
+                ]
+                audio_embeds = torch.stack(feats).to(device, dtype=weight_dtype)
                 if do_classifier_free_guidance:
                     null_audio_embeds = torch.zeros_like(audio_embeds)
                     audio_embeds = torch.cat([null_audio_embeds, audio_embeds])
             else:
                 audio_embeds = None
-            inference_faces = faces[i * num_frames : (i + 1) * num_frames]
-            latents = all_latents[:, :, i * num_frames : (i + 1) * num_frames]
+
+            latents = base_noise.repeat(1, 1, chunk_len, 1, 1) * init_noise_sigma
+
             ref_pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
-                inference_faces, affine_transform=False
+                faces_chunk, affine_transform=False
             )
-
-            # 7. Prepare mask latent variables
             mask_latents, masked_image_latents = self.prepare_mask_latents(
-                masks,
-                masked_pixel_values,
-                height,
-                width,
-                weight_dtype,
-                device,
-                generator,
-                do_classifier_free_guidance,
+                masks, masked_pixel_values, height, width, weight_dtype, device, generator, do_classifier_free_guidance
             )
-
-            # 8. Prepare image latents
             ref_latents = self.prepare_image_latents(
-                ref_pixel_values,
-                device,
-                weight_dtype,
-                generator,
-                do_classifier_free_guidance,
+                ref_pixel_values, device, weight_dtype, generator, do_classifier_free_guidance
             )
 
-            # 9. Denoising loop
+            # Reset scheduler state for each chunk — stateful schedulers (e.g. DPMSolverMultistep
+            # track step_index/model_outputs) break on the 2nd chunk otherwise; idempotent for DDIM.
+            self.scheduler.set_timesteps(num_inference_steps, device=device)
+            timesteps = self.scheduler.timesteps
+
             num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for j, t in enumerate(timesteps):
-                    # expand the latents if we are doing classifier free guidance
                     unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-
                     unet_input = self.scheduler.scale_model_input(unet_input, t)
-
-                    # concat latents, mask, masked_image_latents in the channel dimension
                     unet_input = torch.cat([unet_input, mask_latents, masked_image_latents, ref_latents], dim=1)
-
-                    # predict the noise residual
                     noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
-
-                    # perform guidance
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
-
-                    # compute the previous noisy sample x_t -> x_t-1
                     latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
-
-                    # call the callback, if provided
                     if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
                         progress_bar.update()
                         if callback is not None and j % callback_steps == 0:
                             callback(j, t, latents)
 
-            # Recover the pixel values
             decoded_latents = self.decode_latents(latents)
             decoded_latents = self.paste_surrounding_pixels_back(
                 decoded_latents, ref_pixel_values, 1 - masks, device, weight_dtype
             )
-            synced_video_frames.append(decoded_latents)
+            # chunk-local restore: index 0 == this chunk's first frame
+            restored = self.restore_video(decoded_latents, frames_chunk, boxes_chunk, affines_chunk)
+            del audio_embeds, latents, mask_latents, masked_image_latents, ref_latents, decoded_latents
+            del ref_pixel_values, masked_pixel_values, masks
+            return restored
 
-        synced_video_frames = self.restore_video(torch.cat(synced_video_frames), video_frames, boxes, affine_matrices)
+        # --- streaming output writer (constraint #4: distinct path from normalized input) --------
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+        synced_path = os.path.join(temp_dir, "synced.mp4")
+        import imageio
 
-        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        writer = imageio.get_writer(
+            synced_path, fps=video_fps, codec="libx264", macro_block_size=None,
+            ffmpeg_params=["-crf", "13"], ffmpeg_log_level="error",
+        )
+
+        total_written = 0
+        try:
+            for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+                if CANCEL.is_set():
+                    raise LatentSyncCancelled("cancelled by user")
+                global_start = i * num_frames
+                chunk_len = min(num_frames, num_audio_frames - global_start)
+
+                if loop_mode:
+                    base_frames, base_faces, base_boxes, base_affines = loop_base
+                    idxs = [(global_start + k) % video_len for k in range(chunk_len)]
+                    frames_chunk = base_frames[idxs]
+                    faces_chunk = base_faces[idxs]
+                    boxes_chunk = [base_boxes[j] for j in idxs]
+                    affines_chunk = [base_affines[j] for j in idxs]
+                elif precomputed:
+                    frames_chunk = next(chunk_reader)[:chunk_len]
+                    faces_chunk = precomputed_faces[global_start : global_start + chunk_len]
+                    boxes_chunk = list(precomputed_boxes[global_start : global_start + chunk_len])
+                    affines_chunk = list(precomputed_affine_matrices[global_start : global_start + chunk_len])
+                else:
+                    frames_chunk = next(chunk_reader)[:chunk_len]
+                    faces_list, boxes_chunk, affines_chunk = [], [], []
+                    for frame in frames_chunk:
+                        face, box, affine_matrix = self.image_processor.affine_transform(frame)
+                        faces_list.append(face)
+                        boxes_chunk.append(box)
+                        affines_chunk.append(affine_matrix)
+                    faces_chunk = torch.stack(faces_list)
+
+                restored = _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, global_start, chunk_len)
+                for frame in restored:
+                    writer.append_data(frame)
+                total_written += len(restored)
+                # Drop references so the caching allocator REUSES these blocks next chunk (every
+                # chunk allocates identical shapes => VRAM stabilizes after chunk 1, stays bounded).
+                # NOT torch.cuda.empty_cache() per chunk: that returns blocks to the driver and forces
+                # a re-allocation + sync each chunk — ~4x slowdown for no memory benefit here.
+                del restored, faces_chunk, frames_chunk
+        except Exception:
+            writer.close()
+            if os.path.exists(synced_path):
+                os.remove(synced_path)
+            raise
+
+        writer.close()
+
+        # trim audio to the total number of written frames (constraint #6)
+        audio_samples_remain_length = int(total_written / video_fps * audio_sample_rate)
         audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
 
         if is_train:
             self.unet.train()
 
-        if os.path.exists(temp_dir):
-            shutil.rmtree(temp_dir)
-        os.makedirs(temp_dir, exist_ok=True)
-
-        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=video_fps)
-
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        command = f"ffmpeg -y -loglevel error -nostdin -i {synced_path} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
         subprocess.run(command, shell=True)
