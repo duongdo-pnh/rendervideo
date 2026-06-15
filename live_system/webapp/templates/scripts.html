@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid grid-cols-12 gap-4">
+
+  <!-- Intents -->
+  <section class="col-span-12 lg:col-span-5 bg-panel rounded-xl border border-line p-3">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs text-slate-400">INTENT / DANH MỤC TRẢ LỜI</div>
+      <button id="i-new" class="text-xs bg-panel2 hover:bg-line rounded px-2 py-1">+ Mới</button>
+    </div>
+    <input type="hidden" id="i-id">
+    <div class="space-y-2 text-sm">
+      <input id="i-name" placeholder="Tên intent (vd: hỏi giá)" class="w-full bg-panel2 border border-line rounded px-2 py-1.5">
+      <textarea id="i-keywords" rows="2" placeholder="Keywords, phân tách bằng dấu phẩy (giá, bao nhiêu, mắc không...)" class="w-full bg-panel2 border border-line rounded px-2 py-1.5"></textarea>
+      <div class="grid grid-cols-3 gap-2">
+        <select id="i-trigger" class="bg-panel2 border border-line rounded px-2 py-1.5">
+          <option value="enqueue">Xếp hàng đợi</option>
+          <option value="play_now">Chèn ngay</option>
+        </select>
+        <input id="i-cooldown" type="number" placeholder="Cooldown (s)" class="bg-panel2 border border-line rounded px-2 py-1.5">
+        <label class="flex items-center gap-1 text-xs text-slate-400"><input type="checkbox" id="i-enabled" checked> Bật</label>
+      </div>
+      <div class="flex gap-2">
+        <button id="i-save" class="flex-1 bg-brand hover:bg-brand/80 text-white rounded py-2">💾 Lưu intent</button>
+        <button id="i-del" class="bg-live/80 hover:bg-live text-white rounded px-3 py-2 hidden">🗑</button>
+      </div>
+      <div id="i-msg" class="text-xs"></div>
+    </div>
+    <div class="mt-3 overflow-y-auto max-h-72">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 text-left"><tr><th class="py-1">Intent</th><th>Keywords</th><th class="w-14">Video</th><th class="w-16">Kích</th></tr></thead>
+        <tbody id="i-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- Answer videos của intent đang chọn -->
+  <section class="col-span-12 lg:col-span-7 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">VIDEO TRẢ LỜI <span id="a-intent" class="text-brand"></span> <span class="text-slate-600">(chọn intent bên trái)</span></div>
+    <div class="flex gap-2 mb-3">
+      <select id="a-file" class="flex-1 bg-panel2 border border-line rounded px-2 py-1.5"></select>
+      <select id="a-product" class="flex-1 bg-panel2 border border-line rounded px-2 py-1.5"></select>
+      <button id="a-add" class="bg-brand hover:bg-brand/80 text-white rounded px-3 py-1.5 text-xs">➕ Thêm</button>
+    </div>
+    <div class="overflow-y-auto max-h-[26rem]">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 text-left"><tr>
+          <th class="py-1">Tên</th><th>Sản phẩm</th><th class="w-12">Phát</th><th>Lần cuối</th><th class="w-28"></th>
+        </tr></thead>
+        <tbody id="a-body"></tbody>
+      </table>
+    </div>
+    <p class="text-[11px] text-slate-500 mt-2">Round-robin: hệ thống luân phiên các video cùng intent (ít phát gần đây nhất trước).
+      "Phát thử" đẩy video vào hàng đợi theo chế độ của intent.</p>
+  </section>
+
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/scripts.js?v={{ v }}"></script>{% endblock %}

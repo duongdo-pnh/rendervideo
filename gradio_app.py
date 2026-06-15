@@ -229,12 +229,12 @@ with gr.Blocks(title="LatentSync demo") as demo:
             with gr.Row():
                 model_res = gr.Radio(
                     choices=["512", "256"],
-                    value="512",
+                    value="256",
                     label="Model: 512 (nét/tự nhiên, chậm) | 256 (nhanh ~2×, hợp video mặt nhỏ — close-up có thể hơi giả)",
                 )
                 out_res = gr.Radio(
                     choices=["Gốc", "1080", "720"],
-                    value="1080",
+                    value="720",
                     label="Độ phân giải output (cạnh ngắn): Gốc | 1080 | 720 (720 nhẹ + nhanh hơn ~15-20%, hợp live sales)",
                 )
 

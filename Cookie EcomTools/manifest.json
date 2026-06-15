@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "EcomTools",
+  "version": "1.0",
+  "description": "",
+  "permissions": [
+    "cookies",
+    "tabs",
+    "storage",
+    "activeTab",
+    "scripting",
+    "webRequest"
+  ],
+  "host_permissions": [
+    "https://*.shopee.vn/*",
+    "https://*.shopee.com.my/*",
+    "https://*.shopee.ph/*",
+    "https://*.shopee.tw/*",
+    "https://*.shopee.co.th/*",
+    "https://*.shopee.co.id/*",
+    "https://affiliate.shopee.vn/*",
+    "https://affiliate.shopee.com.my/*",
+    "https://affiliate.shopee.ph/*",
+    "https://affiliate.shopee.tw/*",
+    "https://affiliate.shopee.co.th/*",
+    "https://affiliate.shopee.co.id/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://*.shopee.vn/*", "*://*.shopee.com.my/*", "*://*.shopee.ph/*",
+        "*://*.shopee.tw/*", "*://*.shopee.co.th/*", "*://*.shopee.co.id/*", "*://*.shopee.sg/*"
+      ],
+      "js": ["inject.js"],
+      "world": "MAIN",
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "*://*.shopee.vn/*", "*://*.shopee.com.my/*", "*://*.shopee.ph/*",
+        "*://*.shopee.tw/*", "*://*.shopee.co.th/*", "*://*.shopee.co.id/*", "*://*.shopee.sg/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}

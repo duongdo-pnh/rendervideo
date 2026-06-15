@@ -80,3 +80,19 @@ wandb/
 temp_*.mp3
 temp_*.mp4
 temp_*.wav
+
+# --- SECRET / DB (KHÔNG bao giờ push: cookie đăng nhập Shopee + API key) ---
+*.db
+*.sqlite
+*.sqlite3
+API_Shopee.txt
+.gpu.lock
+*.env
+secrets*.py
+
+# --- runtime data hệ live host ---
+/work/
+/temp/
+live_system/product_images/
+live_system/videos/
+live_system/logs/

@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid grid-cols-12 gap-4">
+
+  <!-- Asset libraries -->
+  <section class="col-span-12 lg:col-span-8 space-y-4">
+    {% for key, label, acc in [("background","NỀN (BACKGROUNDS)","image/*"), ("banner","BANNER","image/*"), ("table","BÀN SẢN PHẨM (ảnh, nên PNG nền trong suốt)","image/*"), ("tvc","TVC (ẢNH HOẶC VIDEO)","video/*,image/*")] %}
+    <div class="bg-panel rounded-xl border border-line p-3">
+      <div class="flex items-center justify-between mb-2">
+        <div class="text-xs text-slate-400">{{ label }}</div>
+        <label class="text-xs bg-brand/80 hover:bg-brand text-white rounded px-2 py-1 cursor-pointer">⬆ Tải lên
+          <input type="file" data-up="{{ key }}" accept="{{ acc }}" multiple class="hidden"></label>
+      </div>
+      <div data-grid="{{ key }}" class="grid grid-cols-3 sm:grid-cols-4 gap-2"></div>
+      <div data-empty="{{ key }}" class="text-slate-500 text-xs py-3 text-center">Chưa có. Bấm "Tải lên".</div>
+    </div>
+    {% endfor %}
+  </section>
+
+  <!-- Random settings + preview -->
+  <section class="col-span-12 lg:col-span-4 bg-panel rounded-xl border border-line p-3 space-y-3 text-sm">
+    <div class="text-xs text-slate-400">RANDOM SETTINGS</div>
+    <label class="flex items-center gap-2"><input type="checkbox" id="r-random_bg"> Random background mỗi phiên</label>
+    <label class="flex items-center gap-2"><input type="checkbox" id="r-random_banner"> Random banner mỗi phiên</label>
+    <label class="flex items-center gap-2"><input type="checkbox" id="r-random_tvc"> Random TVC mỗi phiên</label>
+    <label class="flex items-center gap-2"><input type="checkbox" id="r-random_table"> Random bàn SP mỗi phiên</label>
+    <p class="text-[11px] text-slate-500">Chỉ đổi <b>nội dung file</b> mỗi phiên — vị trí & kích thước source giữ <b>cố định</b>.</p>
+    <div class="flex items-center gap-2 text-xs">Seed:
+      <select id="r-seed_mode" class="bg-panel2 border border-line rounded px-2 py-1">
+        <option value="auto">Auto</option><option value="fix">Fix</option>
+      </select>
+      <input id="r-seed_value" placeholder="vd 12345" class="flex-1 bg-panel2 border border-line rounded px-2 py-1">
+    </div>
+    <div class="border-t border-line/60 pt-2 text-xs space-y-1">
+      <div class="text-slate-400">TỰ ĐỘNG ĐỔI THEO THỜI GIAN (khi đang stream)</div>
+      {% for k, lb in [("background","Nền"),("banner","Banner"),("table","Bàn SP"),("tvc","TVC")] %}
+      <div class="flex items-center gap-2">
+        <label class="flex items-center gap-1 w-20"><input type="checkbox" id="rot-{{k}}-en"> {{lb}}</label>
+        <span class="text-slate-500">mỗi</span>
+        <input type="number" id="rot-{{k}}-num" min="1" class="w-14 bg-panel2 border border-line rounded px-1 py-0.5">
+        <select id="rot-{{k}}-unit" class="bg-panel2 border border-line rounded px-1 py-0.5">
+          <option value="60">phút</option><option value="1">giây</option>
+        </select>
+        <span id="rot-{{k}}-cd" class="text-brand ml-auto"></span>
+      </div>
+      {% endfor %}
+      <p class="text-[10px] text-slate-500">Min 10 giây · Max 60 phút. Đổi ngẫu nhiên trong các asset đang bật.</p>
+    </div>
+    <button id="r-save" class="w-full bg-panel2 hover:bg-line rounded py-1.5 text-xs">💾 Lưu cấu hình</button>
+
+    <div class="border-t border-line/60 pt-3">
+      <div class="text-[11px] text-slate-400 mb-1">XEM TRƯỚC (canvas OBS thật)</div>
+      <div class="mx-auto relative bg-black rounded-lg overflow-hidden aspect-[9/16] max-h-[42vh] grid place-items-center">
+        <img id="pv-obs" class="w-full h-full object-contain" alt="preview">
+        <div id="pv-empty" class="absolute text-slate-600 text-xs">(OBS chưa kết nối)</div>
+      </div>
+      <button id="btn-random" class="w-full mt-2 bg-brand hover:bg-brand/80 text-white rounded py-2">🎲 Đổi combo ngẫu nhiên (áp lên OBS)</button>
+      <div id="pv-info" class="text-[11px] text-slate-400 mt-1"></div>
+    </div>
+    <div class="border-t border-line/60 pt-3">
+      <button id="btn-ensure" class="w-full bg-panel2 hover:bg-line rounded py-1.5 text-xs">🧩 Tạo source Background/Banner/TVC trong OBS</button>
+      <button id="btn-reset-layout" class="w-full mt-1.5 bg-panel2 hover:bg-line rounded py-1.5 text-xs">↺ Reset vị trí/kích thước mặc định</button>
+    </div>
+    <div id="msg" class="text-xs"></div>
+  </section>
+
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/assets.js?v={{ v }}"></script>{% endblock %}

@@ -1,0 +1,5 @@
+/* Tinh chỉnh ngoài Tailwind */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #2a2f40; border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+input[type="range"] { accent-color: #7c5cff; }

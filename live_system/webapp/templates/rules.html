@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid grid-cols-12 gap-4">
+  <section class="col-span-12 lg:col-span-7 bg-panel rounded-xl border border-line p-4">
+    <div class="text-xs text-slate-400 mb-3">QUY TẮC PHÁT TỰ ĐỘNG (áp dụng cho mỗi phiên live)</div>
+    <div class="space-y-4 text-sm">
+
+      <label class="flex items-center gap-2">
+        <input type="checkbox" id="r-play_limit_enabled">
+        <span>Giới hạn số lần phát mỗi video / phiên <span class="text-slate-500">(dùng cột "Giới hạn phát" của video)</span></span>
+      </label>
+
+      <div class="border-t border-line/60 pt-3">
+        <div class="text-slate-300 mb-1">Chèn video kêu gọi <b>Follow</b></div>
+        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+          Sau mỗi
+          <input id="r-follow_every_n" type="number" min="0" class="w-20 bg-panel2 border border-line rounded px-2 py-1 text-slate-200">
+          video → chèn 1 video có category
+          <input id="r-follow_category" class="w-32 bg-panel2 border border-line rounded px-2 py-1 text-slate-200" placeholder="follow">
+          <span class="text-slate-600">(0 = tắt)</span>
+        </div>
+      </div>
+
+      <div class="border-t border-line/60 pt-3">
+        <div class="text-slate-300 mb-1">Chèn video <b>Voucher</b></div>
+        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+          Sau mỗi
+          <input id="r-voucher_every_min" type="number" min="0" class="w-20 bg-panel2 border border-line rounded px-2 py-1 text-slate-200">
+          phút → chèn 1 video có category
+          <input id="r-voucher_category" class="w-32 bg-panel2 border border-line rounded px-2 py-1 text-slate-200" placeholder="voucher">
+          <span class="text-slate-600">(0 = tắt)</span>
+        </div>
+      </div>
+
+      <div class="border-t border-line/60 pt-3">
+        <div class="text-slate-300 mb-1">Phát lại <b>Top sản phẩm</b> (hoa hồng cao)</div>
+        <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+          Sau mỗi
+          <input id="r-top_every_min" type="number" min="0" class="w-20 bg-panel2 border border-line rounded px-2 py-1 text-slate-200">
+          phút → phát lại
+          <input id="r-top_count" type="number" min="1" class="w-20 bg-panel2 border border-line rounded px-2 py-1 text-slate-200">
+          video top <span class="text-slate-600">(0 phút = tắt)</span>
+        </div>
+      </div>
+
+      <div class="border-t border-line/60 pt-3 flex items-center gap-3">
+        <button id="r-save" class="bg-brand hover:bg-brand/80 text-white rounded px-4 py-2">💾 Lưu quy tắc</button>
+        <span id="r-msg" class="text-xs"></span>
+      </div>
+    </div>
+  </section>
+
+  <section class="col-span-12 lg:col-span-5 bg-panel rounded-xl border border-line p-4 text-xs text-slate-400 space-y-2">
+    <div class="text-slate-300 font-medium">Ghi chú</div>
+    <p>• <b>Ưu tiên hoa hồng / SP sale / ngẫu nhiên</b>: đặt ở <b>chế độ phát của từng playlist</b> (trang Playlist → ô "Phát").</p>
+    <p>• <b>Video lỗi</b> luôn được bỏ qua tự động.</p>
+    <p>• <b>Loop playlist / reconnect OBS / tự start lại khi rớt</b>: đã bật sẵn.</p>
+    <p>• Video Follow/Voucher cần gắn <b>category</b> tương ứng (đặt khi thêm video / import — cột "category"/"danh mục").</p>
+    <p>• Bộ đếm/đồng hồ <b>reset mỗi khi bắt đầu phiên live</b> (start stream).</p>
+  </section>
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/rules.js?v={{ v }}"></script>{% endblock %}

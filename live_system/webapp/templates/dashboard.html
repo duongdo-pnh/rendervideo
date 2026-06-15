@@ -1,0 +1,199 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid grid-cols-12 gap-4">
+
+  <!-- PREVIEW -->
+  <section class="col-span-12 lg:col-span-6 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">PREVIEW (OBS Program) · dọc 9:16</div>
+    <div class="relative rounded-lg overflow-hidden bg-black aspect-[9/16] max-h-[72vh] mx-auto grid place-items-center">
+      <img id="preview" class="w-full h-full object-contain" alt="preview">
+      <span id="prev-live" class="hidden absolute top-2 left-2 px-2 py-0.5 rounded bg-live text-white text-xs">● LIVE</span>
+    </div>
+  </section>
+
+  <!-- SCENE + SOURCES -->
+  <section class="col-span-12 md:col-span-6 lg:col-span-3 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">SCENE HIỆN TẠI</div>
+    <div id="scene-name" class="text-brand font-medium mb-3">—</div>
+    <div class="text-xs text-slate-400 mb-1">Nguồn (<span id="src-count">0</span>)</div>
+    <ul id="src-list" class="space-y-1 text-slate-300 max-h-44 overflow-y-auto"></ul>
+    <select id="scene-pick" class="mt-3 w-full bg-panel2 border border-line rounded px-2 py-1.5 text-slate-200"></select>
+    <button data-scene-go class="mt-2 w-full bg-panel2 hover:bg-line rounded py-1.5">↺ Đổi scene</button>
+  </section>
+
+  <!-- TRẠNG THÁI LIVE -->
+  <section class="col-span-12 md:col-span-6 lg:col-span-3 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">TRẠNG THÁI LIVE</div>
+    <dl class="text-xs space-y-1.5">
+      <div class="flex justify-between"><dt class="text-slate-500">Nền tảng</dt><dd id="st-platform">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">RTMP</dt><dd id="st-rtmp" class="truncate max-w-[140px]">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Stream key</dt><dd id="st-key">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Trạng thái</dt><dd id="st-status">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Thời gian live</dt><dd id="st-dur">00:00:00</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">FPS</dt><dd id="st-fps">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Bitrate</dt><dd id="st-bitrate">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Dropped</dt><dd id="st-drop">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">CPU OBS</dt><dd id="st-cpu">—</dd></div>
+      <div class="flex justify-between"><dt class="text-slate-500">Memory</dt><dd id="st-mem">—</dd></div>
+    </dl>
+    <div class="mt-3 space-y-1.5 text-xs">
+      <label class="block text-slate-500">Playlist phát
+        <select id="go-pl" class="w-full bg-panel2 border border-line rounded px-2 py-1.5 mt-0.5 text-slate-200"></select>
+      </label>
+      <select id="go-platform" class="w-full bg-panel2 border border-line rounded px-2 py-1.5">
+        <option value="TikTok">TikTok</option>
+        <option value="Shopee">Shopee Live</option>
+        <option value="YouTube">YouTube</option>
+        <option value="Facebook">Facebook</option>
+        <option value="Custom">Custom RTMP</option>
+      </select>
+      <input id="go-rtmp" placeholder="RTMP server (rtmp://...)" class="w-full bg-panel2 border border-line rounded px-2 py-1.5">
+      <div class="flex gap-1.5">
+        <input id="go-key" type="password" placeholder="Stream key" class="flex-1 bg-panel2 border border-line rounded px-2 py-1.5">
+        <button id="go-eye" type="button" class="bg-panel2 hover:bg-line rounded px-3">👁</button>
+      </div>
+      <p id="go-msg" class="text-[11px] text-slate-500">Nhập Server + Key từ nền tảng rồi bấm BẮT ĐẦU LIVE.</p>
+    </div>
+    <div class="grid grid-cols-2 gap-2 mt-2">
+      <button id="go-live-btn" class="bg-live/90 hover:bg-live text-white rounded py-1.5 text-xs">▶ BẮT ĐẦU LIVE</button>
+      <button data-act="stop_stream" class="bg-panel2 hover:bg-line rounded py-1.5 text-xs">■ DỪNG LIVE</button>
+      <button data-act="start_record" class="bg-panel2 hover:bg-line rounded py-1.5 text-xs">● Ghi hình</button>
+      <button data-act="stop_record" class="bg-panel2 hover:bg-line rounded py-1.5 text-xs">■ Dừng ghi</button>
+    </div>
+  </section>
+
+  <!-- PLAYLIST -->
+  <section class="col-span-12 lg:col-span-6 bg-panel rounded-xl border border-line p-3">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs text-slate-400">PLAYLIST VIDEO</div>
+      <div class="text-[11px] text-slate-500">
+        <span id="pl-name" class="text-slate-300"></span>
+        <span id="pl-mode-badge" class="ml-1 px-1.5 py-0.5 rounded bg-panel2 border border-line text-brand"></span>
+        <span id="pl-group-badge" class="ml-1 px-1.5 py-0.5 rounded bg-panel2 border border-line text-slate-400 hidden"></span>
+      </div>
+    </div>
+    <div class="flex flex-wrap items-center gap-2 mb-2 text-xs">
+      <a href="/playlist" class="bg-brand/80 hover:bg-brand text-white rounded px-2 py-1">＋ Thêm video</a>
+      <a href="/playlist" class="bg-panel2 hover:bg-line rounded px-2 py-1">⬆ Nhập hàng loạt</a>
+      <a href="/playlist" class="bg-panel2 hover:bg-line rounded px-2 py-1">↕ Sắp xếp</a>
+      <span class="flex-1"></span>
+      <label class="inline-flex items-center gap-1 cursor-pointer">
+        <span class="text-slate-400">Tự động phát</span>
+        <input type="checkbox" id="d-autoplay" class="sr-only peer">
+        <span class="w-8 h-4 bg-line rounded-full relative transition peer-checked:bg-brand after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-3 after:h-3 after:bg-white after:rounded-full after:transition peer-checked:after:translate-x-4"></span>
+      </label>
+      <label class="inline-flex items-center gap-1 cursor-pointer">
+        <span class="text-slate-400">Random</span>
+        <input type="checkbox" id="d-random" class="sr-only peer">
+        <span class="w-8 h-4 bg-line rounded-full relative transition peer-checked:bg-brand after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-3 after:h-3 after:bg-white after:rounded-full after:transition peer-checked:after:translate-x-4"></span>
+      </label>
+      <label class="inline-flex items-center gap-1 cursor-pointer">
+        <span class="text-slate-400">Loop</span>
+        <input type="checkbox" id="d-loop" class="sr-only peer">
+        <span class="w-8 h-4 bg-line rounded-full relative transition peer-checked:bg-brand after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:w-3 after:h-3 after:bg-white after:rounded-full after:transition peer-checked:after:translate-x-4"></span>
+      </label>
+    </div>
+    <div class="overflow-y-auto max-h-72">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 text-left"><tr>
+          <th class="py-1 w-8">#</th><th class="w-16">Thumb</th><th>Tên video</th><th>Sản phẩm</th><th class="w-16">Thời lượng</th><th class="w-20">Trạng thái</th>
+        </tr></thead>
+        <tbody id="pl-body"></tbody>
+      </table>
+    </div>
+    <div id="pl-empty" class="text-slate-500 text-xs py-4 text-center hidden">Playlist trống — thêm video ở trang Playlist.</div>
+  </section>
+
+  <!-- SẢN PHẨM ĐANG GHIM + KỊCH BẢN -->
+  <section class="col-span-12 md:col-span-6 lg:col-span-3 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">SẢN PHẨM ĐANG GHIM</div>
+    <div id="pin-empty" class="text-slate-500 text-xs">Chưa ghim sản phẩm.</div>
+    <div id="pin-box" class="hidden">
+      <div class="flex gap-3">
+        <img id="pin-img" class="w-16 h-16 rounded object-cover bg-panel2 shrink-0" onerror="this.style.visibility='hidden'">
+        <div class="flex-1 min-w-0">
+          <div id="pin-name" class="text-white font-medium leading-tight"></div>
+          <div id="pin-sku" class="text-xs text-slate-500"></div>
+          <div class="mt-1"><span id="pin-price" class="text-live font-bold text-base"></span>
+               <span id="pin-old" class="text-slate-500 line-through text-xs ml-1"></span></div>
+          <div class="text-xs mt-0.5 text-slate-400">Hoa hồng: <span id="pin-comm" class="text-amber-400">—</span></div>
+          <div class="text-xs text-slate-400">Tồn kho: <span id="pin-stock" class="text-amber-400">—</span></div>
+        </div>
+      </div>
+      <button data-act="unpin" class="w-full mt-2 bg-panel2 hover:bg-line rounded py-1.5 text-xs">Bỏ ghim</button>
+      <div id="pin-link-box" class="mt-3 text-xs hidden">
+        <div class="text-slate-500 mb-0.5">Link sản phẩm</div>
+        <div class="flex items-center gap-2">
+          <a id="pin-link" href="#" target="_blank" rel="noopener" class="text-brand truncate flex-1 hover:underline"></a>
+          <button id="pin-copy" title="Sao chép link" class="bg-panel2 hover:bg-line rounded px-2 py-1 shrink-0">⧉</button>
+        </div>
+      </div>
+    </div>
+    <div class="text-xs text-slate-400 mt-3 mb-1">KỊCH BẢN (AI SCRIPT)</div>
+    <div id="pin-script" class="text-xs text-slate-300 bg-panel2 rounded p-2 max-h-28 overflow-y-auto">—</div>
+    <textarea id="pin-script-edit" class="hidden w-full text-xs text-slate-200 bg-panel2 border border-line rounded p-2 h-28 mt-0"></textarea>
+    <div class="flex gap-2 mt-1">
+      <button id="pin-script-btn" class="flex-1 bg-panel2 hover:bg-line rounded py-1.5 text-xs">Chỉnh sửa script</button>
+      <button id="pin-script-save" class="hidden flex-1 bg-brand hover:bg-brand/80 text-white rounded py-1.5 text-xs">💾 Lưu</button>
+      <button id="pin-script-cancel" class="hidden bg-panel2 hover:bg-line rounded px-3 py-1.5 text-xs">Hủy</button>
+    </div>
+  </section>
+
+  <!-- ĐIỀU KHIỂN NHANH -->
+  <section class="col-span-12 md:col-span-6 lg:col-span-3 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">ĐIỀU KHIỂN NHANH</div>
+    <div class="grid grid-cols-3 gap-2 text-xs">
+      <button data-act="next" class="bg-panel2 hover:bg-line rounded py-2">⏭ Next</button>
+      <button data-act="previous" class="bg-panel2 hover:bg-line rounded py-2">⏮ Previous</button>
+      <button data-act="toggle_pause" id="btn-pause" class="bg-panel2 hover:bg-line rounded py-2">⏸ Tạm dừng</button>
+      <button data-act="reload_media" class="bg-panel2 hover:bg-line rounded py-2">↻ Tải media</button>
+      <button data-src-toggle="Product Image" class="bg-panel2 hover:bg-line rounded py-2">👁 Ảnh SP</button>
+      <button data-act="unpin" class="bg-panel2 hover:bg-line rounded py-2">📌 Bỏ ghim</button>
+    </div>
+    <div class="mt-3 space-y-2 text-xs">
+      <div class="flex items-center gap-2"><span class="w-16 text-slate-400">Mic/Aux</span>
+        <input type="range" min="0" max="100" value="80" data-vol="Mic/Aux" class="flex-1">
+        <button data-mute="Mic/Aux" title="Bật/tắt mic" class="bg-panel2 hover:bg-line rounded px-2 py-1">🔇</button></div>
+      <div class="flex items-center gap-2"><span class="w-16 text-slate-400">Nhạc nền</span>
+        <input type="range" min="0" max="100" value="30" data-vol="Desktop Audio" class="flex-1">
+        <button data-mute="Desktop Audio" title="Bật/tắt nhạc nền" class="bg-panel2 hover:bg-line rounded px-2 py-1">🔇</button></div>
+    </div>
+  </section>
+
+  <!-- PHÁT VIDEO TRẢ LỜI THEO INTENT / HÀNG ĐỢI -->
+  <section class="col-span-12 lg:col-span-4 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">PHÁT VIDEO TRẢ LỜI (theo intent)</div>
+    <div class="flex gap-2 mb-2">
+      <select id="pv-select" class="flex-1 bg-panel2 border border-line rounded px-2 py-1.5 text-xs"></select>
+      <button id="pv-rescan" class="bg-panel2 hover:bg-line rounded px-2 text-xs" title="Tải lại intent">⟳</button>
+    </div>
+    <div class="grid grid-cols-2 gap-2 text-xs">
+      <button id="pv-now" class="bg-brand hover:bg-brand/80 text-white rounded py-1.5">▶ Phát ngay</button>
+      <button id="pv-queue" class="bg-panel2 hover:bg-line rounded py-1.5">➕ Vào hàng đợi</button>
+    </div>
+    <div class="flex items-center justify-between mt-3 mb-1">
+      <span class="text-xs text-slate-400">Hàng đợi chờ phát (<span id="q-count">0</span>)</span>
+      <button id="q-clear" class="text-[11px] text-slate-500 hover:text-live">Xóa hàng đợi</button>
+    </div>
+    <ol id="q-list" class="text-xs text-slate-300 list-decimal list-inside space-y-0.5 max-h-28 overflow-y-auto"></ol>
+  </section>
+
+  <!-- NHẬT KÝ -->
+  <section class="col-span-12 lg:col-span-8 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">NHẬT KÝ HOẠT ĐỘNG</div>
+    <pre id="logs" class="text-[11px] leading-5 text-slate-400 bg-panel2 rounded p-2 h-40 overflow-y-auto whitespace-pre-wrap"></pre>
+  </section>
+
+  <!-- THỐNG KÊ (placeholder) -->
+  <section class="col-span-12 lg:col-span-4 bg-panel rounded-xl border border-line p-3">
+    <div class="text-xs text-slate-400 mb-2">THỐNG KÊ PHIÊN LIVE</div>
+    <div class="grid grid-cols-2 gap-2 text-center">
+      <div class="bg-panel2 rounded p-2"><div class="text-lg text-white">—</div><div class="text-xs text-slate-500">Lượt xem</div></div>
+      <div class="bg-panel2 rounded p-2"><div class="text-lg text-white">—</div><div class="text-xs text-slate-500">Đơn hàng</div></div>
+    </div>
+    <p class="text-[11px] text-slate-500 mt-2">Cần API nền tảng (Shopee/TikTok) — sẽ nối ở giai đoạn sau.</p>
+  </section>
+
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/app.js?v={{ v }}"></script>{% endblock %}

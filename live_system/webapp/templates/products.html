@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="grid grid-cols-12 gap-4">
+
+  <!-- Sản phẩm chỉ đến từ phiên live (không thêm tay) -->
+  <section class="col-span-12 bg-panel rounded-xl border border-line p-3">
+    <div class="flex items-center justify-between mb-2">
+      <div class="text-xs text-slate-400">SẢN PHẨM (cào từ phiên live)
+        <span class="text-slate-600">— không thêm tay; bấm Đồng bộ khi đang live</span></div>
+      <div class="flex gap-1.5 items-center">
+        <select id="session-select" title="Chọn ĐÚNG phiên live (mới nhất / đủ SP) — không phụ thuộc status"
+                class="text-xs bg-panel2 border border-line rounded px-2 py-1 text-slate-200 max-w-[18rem]"></select>
+        <button id="reload-sessions" class="text-xs bg-panel2 hover:bg-line rounded px-2 py-1" title="Tải lại danh sách phiên">⟳</button>
+        <button id="sync-btn" class="text-xs bg-ok/80 hover:bg-ok text-white rounded px-2 py-1"
+                title="Đồng bộ SP + khóa phiên đã chọn cho comment/ghim">
+          🔄 Đồng bộ SP từ phiên
+        </button>
+        <button id="rematch-vid-btn" class="text-xs bg-brand/80 hover:bg-brand text-white rounded px-2 py-1"
+                title="Khớp lại các video chưa gắn SP sau khi đồng bộ">
+          ↻ Khớp lại video
+        </button>
+      </div>
+    </div>
+    <div id="match-result" class="text-[11px] mb-2"></div>
+    <div class="overflow-y-auto max-h-[36rem]">
+      <table class="w-full text-xs">
+        <thead class="text-slate-500 text-left"><tr>
+          <th class="py-1 w-14">Ảnh</th><th>Tên</th><th class="w-24">Giá</th>
+          <th class="w-36">Shopee item_id</th><th>Link</th><th class="w-12">Xóa</th>
+        </tr></thead>
+        <tbody id="prod-body"></tbody>
+      </table>
+    </div>
+  </section>
+
+</div>
+{% endblock %}
+{% block scripts %}<script src="/static/products.js?v={{ v }}"></script>{% endblock %}
