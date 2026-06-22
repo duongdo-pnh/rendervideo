@@ -51,17 +51,17 @@ def _save_image(image_file):
 
 # ============================================================ PRODUCTS
 
-PRODUCT_HEADERS = ["ID", "Tên", "SKU", "Giá gốc", "Giá KM", "HH%", "Kho", "Nhóm", "Ghim", "Ảnh"]
+PRODUCT_HEADERS = ["ID", "Tên", "Giá", "Tồn kho", "Ảnh"]
 
 
 def _product_rows():
-    return [[p.id, p.name, p.sku or "", p.price, p.sale_price, p.commission, p.stock,
-             p.group_name or "", p.pin_order, Path(p.image_path).name if p.image_path else ""]
+    return [[p.id, p.name, p.price or 0, p.stock or 0,
+             Path(p.image_path).name if p.image_path else ""]
             for p in db.get_all_products()]
 
 
 def _product_choices():
-    return [f"#{p.id} · {p.name}" + (f" [{p.sku}]" if p.sku else "") for p in db.get_all_products()]
+    return [f"#{p.id} · {p.name}" for p in db.get_all_products()]
 
 
 def _after_product_change():

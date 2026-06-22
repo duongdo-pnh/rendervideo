@@ -9,6 +9,10 @@ from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "jobs.db"
 
+# Nơi xuất video đã render — đặt TRÊN DESKTOP cho dễ tìm/nhìn. Cả "Render ngay" (web_ui)
+# lẫn worker nền (queue_worker) đều ghi kết quả ra đây.
+RENDERS_DIR = Path.home() / "Desktop" / "Renders"
+
 # Maps the user's model choice (256/512) -> (config, checkpoint). Kept in sync with
 # the MODELS dict in gradio_app.py. We persist the resolved paths per job so a later
 # config change never retroactively rewrites what an already-queued job renders with.
@@ -193,6 +197,38 @@ def reset_stuck_jobs():
             "UPDATE jobs SET status='queued', started_at=NULL WHERE status='rendering'"
         )
         return cur.rowcount
+
+
+def worker_busy():
+    """True nếu worker đang render 1 job trong queue (status='rendering').
+    web_ui dùng để KHÔNG 'Render ngay' song song với worker (tránh tranh GPU)."""
+    with _connect() as con:
+        return con.execute(
+            "SELECT 1 FROM jobs WHERE status='rendering' LIMIT 1"
+        ).fetchone() is not None
+
+
+def delete_job(job_id):
+    """Xóa 1 job. TỪ CHỐI job đang 'rendering' (worker đang giữ nó).
+    Trả về dict của hàng đã xóa (kèm đường dẫn file) để caller dọn file; None nếu không tìm thấy."""
+    with _connect() as con:
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return None
+        if row["status"] == STATUS_RENDERING:
+            raise ValueError(f"Job #{job_id} đang render — không thể xóa (chờ xong hoặc dừng worker).")
+        con.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        return dict(row)
+
+
+def clear_jobs(status):
+    """Xóa hàng loạt job theo trạng thái (không cho xóa 'rendering'). Trả về list các hàng đã xóa."""
+    if status == STATUS_RENDERING:
+        raise ValueError("Không thể xóa hàng loạt job đang render.")
+    with _connect() as con:
+        rows = con.execute("SELECT * FROM jobs WHERE status=?", (status,)).fetchall()
+        con.execute("DELETE FROM jobs WHERE status=?", (status,))
+        return [dict(r) for r in rows]
 
 
 if __name__ == "__main__":

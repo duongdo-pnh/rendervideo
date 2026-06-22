@@ -7,18 +7,26 @@ copy result to downloads/ on success, else retry up to MAX_RETRIES then fail.
 The render runs as a subprocess (render_job.py) so a crash there never kills this loop.
 Run with:  conda activate latentsync && python queue_worker.py
 """
+import os
 import shutil
 import signal
 import subprocess
 import sys
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
+
+# Thêm bin của python hiện hành (conda env) vào PATH -> subprocess thấy ffmpeg/ffprobe
+# (chạy 'python queue_worker.py' trực tiếp không activate env nên PATH thiếu bin của env).
+_envbin = os.path.dirname(sys.executable)
+if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
 import database as db
 
 ROOT = Path(__file__).parent
-DOWNLOADS_DIR = ROOT / "downloads"
+DOWNLOADS_DIR = db.RENDERS_DIR        # video render xong tự đổ ra Desktop cho dễ nhìn
 WORK_DIR = ROOT / "work"
 LOGS_DIR = ROOT / "logs"
 BACKUP_DIR = ROOT / "backups"
@@ -106,10 +114,44 @@ def normalize_audio(src, work_dir):
     return dst
 
 
-def render_timeout(video_path):
-    """Dynamic ceiling: max(1h, 10x video duration). 30-min video -> 5h."""
+def render_timeout(video_path, audio_path=None):
+    """Dynamic ceiling. The renderer extends the carrier to AUDIO length and (with mouth
+    enhancement) runs GFPGAN per frame, so the work scales with the LONGER of video/audio,
+    not the (possibly shorter, pre-extension) normalized video. Budget ~12x realtime plus a
+    fixed ~20min headroom for model load + scenedetect + normalize. 30-min clip -> ~6.3h."""
     dur = _ffprobe_duration(video_path)
-    return int(max(3600, dur * 10))
+    if audio_path:
+        dur = max(dur, _ffprobe_duration(audio_path))
+    return int(max(3600, dur * 12) + 1200)
+
+
+def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
+    """If the carrier video is LONGER than the audio, stream-copy trim it to ~audio length BEFORE
+    NVENC normalize, so we never re-encode (here + downscale + scenedetect downstream) the tail the
+    renderer discards anyway — it only renders audio-length. Near-instant (no re-encode).
+
+    No-op if the video is already <= audio+margin: short carriers are forward-looped + cut to audio
+    length downstream by prepare_carrier. +margin keeps it safely longer than the audio (stream-copy
+    cuts on keyframe boundaries). Falls back to the original on any failure (correctness first)."""
+    vdur = _ffprobe_duration(video_path)
+    adur = _ffprobe_duration(audio_path)
+    if not vdur or not adur or vdur <= adur + margin:
+        return str(video_path)
+    keep = adur + margin
+    out = str(Path(work_dir) / "trim_video.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", str(video_path),
+             "-t", f"{keep:.3f}", "-c", "copy", "-an", out],
+            check=True,
+        )
+    except Exception as e:
+        _log(f"trim failed ({e}); using full video")
+        return str(video_path)
+    if _ffprobe_duration(out) < adur:            # keyframe cut landed too short -> unsafe, skip
+        return str(video_path)
+    _log(f"trim carrier {vdur:.0f}s -> ~{keep:.0f}s (audio {adur:.0f}s) before normalize")
+    return out
 
 
 # ---------------------------------------------------------------- backup
@@ -136,7 +178,10 @@ def backup_db():
 # ---------------------------------------------------------------- one job
 
 def _safe_name(name):
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in (name or "job"))[:60] or "job"
+    # NFC: gộp dấu tổ hợp tiếng Việt (NFD) -> ký tự dựng sẵn, để isalnum() GIỮ được chữ có dấu
+    # (không thì 'ả' = 'a'+dấu rời, dấu bị thay '_' -> tên nát kiểu 'Cha_o_chô_ng').
+    name = unicodedata.normalize("NFC", name or "job")
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60] or "job"
 
 
 def process_job(job):
@@ -146,10 +191,13 @@ def process_job(job):
     work.mkdir(parents=True, exist_ok=True)
     log_path = LOGS_DIR / f"job_{job_id}.log"
 
-    nv = normalize_video(job["video_path"], work)
+    # Trim a too-long carrier to ~audio length first (cheap) so NVENC normalize + the renderer's
+    # downscale/scenedetect don't churn through video that gets discarded. Short videos pass through.
+    src_video = trim_video_to_audio(job["video_path"], job["audio_path"], work)
+    nv = normalize_video(src_video, work)
     na = normalize_audio(job["audio_path"], work)
     out_path = work / "out.mp4"
-    timeout = render_timeout(nv)
+    timeout = render_timeout(nv, na)
     _log(f"job #{job_id} normalized; rendering (timeout {timeout//60}min) -> {log_path.name}")
 
     cmd = [

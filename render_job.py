@@ -8,12 +8,23 @@ imports NO gradio, so it runs in a clean subprocess.
 Exit 0 = success and the output file exists at --output. Any non-zero exit = failure;
 the worker reads the captured log and decides retry vs fail.
 """
+import os
+import sys
+# Chạy 'python ...' trực tiếp (không activate conda env) -> PATH thiếu bin của env nên không thấy
+# ffmpeg/ffprobe. Thêm thư mục bin của python hiện hành vào PATH để mọi subprocess gọi ffmpeg chạy được.
+_envbin = os.path.dirname(sys.executable)
+if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
+
+# LƯU Ý (đã kiểm chứng 2026-06-15): KHÔNG ép insightface/onnxruntime chạy CUDAExecutionProvider.
+# Diffusion nhanh hơn ~43% (5.55->3.22 s/it) NHƯNG output bị HỎNG — vẽ ô ĐEN lên mặt (mediapipe
+# dò mặt 0/98 frame). insightface PHẢI chạy CPUExecutionProvider để kết quả dò mặt đúng. Đừng
+# preload các lib CUDA (libnvrtc/cudnn…) để "sửa" cảnh báo onnxruntime — đó là fallback ĐÚNG.
+
 import argparse
 import contextlib
 import fcntl
-import os
 import subprocess
-import sys
 from pathlib import Path
 
 import cv2
@@ -72,6 +83,52 @@ def _maybe_downscale(video_path, target_short, work_dir):
     return out
 
 
+def _probe_duration(path):
+    """Media duration in seconds via ffprobe, or 0.0 if unknown."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return 0.0
+
+
+def _trim_to_audio(video_path, audio_path, work_dir, margin=2.0):
+    """If the carrier video is LONGER than the audio, physically trim it to ~audio length
+    (stream-copy, near-instant) BEFORE the heavy steps (downscale / normalize_25fps / scenedetect)
+    so those never re-encode the tail we discard anyway — the pipeline only renders audio-length.
+
+    No-op if the video is shorter than (or near) the audio: that case is handled downstream by
+    prepare_carrier (forward-loop + crossfade to audio length). +margin keeps the carrier safely
+    longer than the audio (stream-copy cuts on keyframe boundaries) so the pipeline stays on the
+    truncate path and never re-loops. Falls back to the original on any failure (correctness first).
+    """
+    vdur = _probe_duration(video_path)
+    adur = _probe_duration(audio_path)
+    if not vdur or not adur:
+        return video_path
+    keep = adur + margin
+    if vdur <= keep:
+        return video_path                                  # already short enough -> let prepare_carrier loop
+    out = os.path.join(work_dir, "_trim.mp4")
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", video_path,
+             "-t", f"{keep:.3f}", "-c", "copy", "-an", out],
+            check=True,
+        )
+    except Exception as e:
+        print(f"[render_job] trim failed ({e}); using original video", flush=True)
+        return video_path
+    if _probe_duration(out) < adur:                        # keyframe cut landed too short -> unsafe, skip
+        return video_path
+    print(f"[render_job] trim carrier {vdur:.1f}s -> ~{keep:.1f}s (audio {adur:.1f}s) before heavy steps", flush=True)
+    return out
+
+
 def _build_args(video_path, audio_path, output_path, checkpoint, steps, guidance, seed, temp_dir):
     parser = argparse.ArgumentParser()
     parser.add_argument("--inference_ckpt_path", type=str, required=True)
@@ -104,6 +161,11 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     video_path = Path(video_path).absolute().as_posix()
     audio_path = Path(audio_path).absolute().as_posix()
     output_path = Path(output_path).absolute().as_posix()
+
+    # Carrier longer than audio? Trim to ~audio length FIRST (cheap stream-copy) so the heavy
+    # downscale / normalize / scenedetect below process ~audio-length, not the full clip. Shorter
+    # videos pass through untouched -> prepare_carrier forward-loops + cuts them to audio length.
+    video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
 
     # Output resolution: downscale input to chosen shorter side (output res = input res).
     video_path = _maybe_downscale(video_path, OUT_RES.get(out_res), str(work_dir))
