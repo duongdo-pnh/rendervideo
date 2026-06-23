@@ -17,7 +17,19 @@ from pathlib import Path
 import gradio as gr
 
 import database as db
+import excel_import
+import tts_config
+from latentsync.tts.factory import available_providers, list_voices
 from render_job import OUT_RES  # bảng độ phân giải; render THỰC do queue_worker chạy nền
+
+# Provider list for the Import-Excel tab dropdowns (label shows config status).
+_TTS_PROVIDERS = available_providers()
+TTS_PROVIDER_CHOICES = [
+    (f"{p['label']}{'' if p['enabled'] else ' (chưa cấu hình)'}", p["name"])
+    for p in _TTS_PROVIDERS
+]
+_TTS_DEFAULT = next((p["name"] for p in _TTS_PROVIDERS if p["is_default"]),
+                    (_TTS_PROVIDERS[0]["name"] if _TTS_PROVIDERS else None))
 
 ROOT = Path(__file__).parent
 UPLOADS_DIR = ROOT / "uploads"
@@ -223,6 +235,151 @@ def do_clear(status_key, label):
     return table, dd, f"✅ Đã xóa {len(rows)} job {label}."
 
 
+# ---------------------------------------------------------------- Tab Import Excel
+
+def make_template_file():
+    """Sinh file template.xlsx (header + 3 ví dụ + comment) để tải về."""
+    path = str(ROOT / "template.xlsx")
+    return excel_import.make_template(path)
+
+
+def update_voice_choices(provider):
+    """Đổi provider -> nạp danh sách giọng gợi ý (cho phép tự gõ thêm)."""
+    vs = list_voices(provider)
+    return gr.update(choices=vs, value=(vs[0] if vs else None))
+
+
+def _preview_rows_table(rows, errors, shopee_item_id=None):
+    table = []
+    for r in rows:
+        out_name = excel_import.build_name_excel(r["product"], r["video_type"], r["question_type"])
+        table.append([r["row"], r["product"] or "(chung)", Path(r["video_path"]).name, r["video_type"],
+                      out_name + ".mp4", r["tts_provider"] or "(mặc định)", "✅ Ready"])
+    for e in errors:
+        table.append([e["row"], "—", "—", "—", "—", "—", f"❌ {e['error']}"])
+    return table
+
+
+def _stabilize_video(path):
+    """Video tải lên qua Gradio là file TẠM (bị dọn). Copy vào uploads/videos/ để worker render sau còn đọc được."""
+    if not path:
+        return None
+    p = Path(path)
+    if not p.exists():
+        return str(p)
+    vids = UPLOADS_DIR / "videos"
+    vids.mkdir(parents=True, exist_ok=True)
+    if vids in p.parents:                       # đã nằm trong kho bền rồi
+        return str(p)
+    dst = vids / (uuid.uuid4().hex[:12] + (p.suffix or ".mp4"))
+    shutil.copy(p, dst)
+    return str(dst)
+
+
+def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
+    if not excel_file:
+        raise gr.Error("Chưa chọn file Excel.")
+    shopee = (shopee_item_id or "").strip() or None
+    stable_default = _stabilize_video(default_video)   # copy video tải lên -> đường dẫn bền
+    rows, errors = excel_import.process_excel(
+        excel_file, stable_default, default_provider, shopee)
+    table = _preview_rows_table(rows, errors, shopee)
+    summary = (f"**Tổng: {len(rows) + len(errors)} | "
+               f"Sẵn sàng: {len(rows)} | Lỗi: {len(errors)}**")
+    state = {"rows": rows, "shopee": (shopee_item_id or "").strip() or None}
+    gr.Info(f"Preview: {len(rows)} sẵn sàng, {len(errors)} lỗi.")
+    return table, summary, state
+
+
+def submit_excel(state, progress=gr.Progress()):
+    if not state or not state.get("rows"):
+        raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
+    rows = state["rows"]
+    shopee = state.get("shopee")
+
+    def _cb(done, total, label):
+        progress(done / max(1, total), desc=label)
+
+    submitted, tts_errors = excel_import.submit_jobs(rows, shopee_item_id=shopee, progress=_cb)
+    lines = [f"### ✅ Đã submit **{len(submitted)}** job vào hàng đợi."]
+    if submitted:
+        lines.append("Job IDs: " + ", ".join(f"#{s['job_id']} ({s['name']})" for s in submitted))
+    if tts_errors:
+        lines.append(f"\n⚠ **{len(tts_errors)} dòng TTS lỗi** (đã bỏ qua, batch KHÔNG crash):")
+        for e in tts_errors:
+            lines.append(f"- dòng {e['row']}: {e['error']}")
+    gr.Info(f"Submit xong: {len(submitted)} job, {len(tts_errors)} lỗi TTS.")
+    return "\n".join(lines), gr.update(value=_table_rows())
+
+
+# ---------------------------------------------------------------- Tab Cấu hình TTS
+
+def save_tts_config(default_provider, *vals):
+    """Lưu cấu hình 4 provider vào .env + áp dụng ngay (reset factory). Outputs: [status_md, provider_dropdowns...]."""
+    values = dict(zip(tts_config.ALL_KEYS, vals))
+    providers = tts_config.save_config(values, default_provider)
+    md = "### ✅ Đã lưu cấu hình TTS\n\n" + tts_config.status_markdown(providers)
+    # Cập nhật lại dropdown provider mặc định ở tab Import (nhãn (chưa cấu hình) có thể đổi).
+    choices = [(f"{p['label']}{'' if p['enabled'] else ' (chưa cấu hình)'}", p["name"]) for p in providers]
+    gr.Info("Đã lưu .env và áp dụng cấu hình TTS.")
+    return md, gr.update(choices=choices, value=default_provider)
+
+
+def vbee_connect(app_id, token):
+    """Gọi Vbee lấy danh sách giọng (App ID + Token đang gõ, chưa cần Lưu)."""
+    from latentsync.tts.vbee import VbeeTTS
+    try:
+        voices = VbeeTTS(app_id=app_id, token=token).fetch_voices()
+    except Exception as e:
+        raise gr.Error(f"Kết nối Vbee lỗi: {e}")
+    codes = [v["code"] for v in voices if v.get("code")]
+    gr.Info(f"Đã tải {len(codes)} giọng Vbee.")
+    return gr.update(choices=codes, value=(codes[0] if codes else None)), f"✅ Tải **{len(codes)}** giọng."
+
+
+def vbee_test(app_id, token, voice, text):
+    """Nghe thử end-to-end: synth 1 câu bằng credential đang gõ -> trả file audio."""
+    from latentsync.tts.vbee import VbeeTTS
+    if not (text or "").strip():
+        raise gr.Error("Nhập câu cần đọc thử.")
+    out = str(UPLOADS_DIR / "vbee_test.wav")
+    try:
+        VbeeTTS(app_id=app_id, token=token, default_voice=voice or None).synthesize(text, out, voice or None)
+    except Exception as e:
+        raise gr.Error(f"Nghe thử lỗi: {e}")
+    return out
+
+
+def ausynclab_connect(api_key):
+    """Gọi AusyncLab lấy danh sách voice (API key đang gõ). Nhãn dễ đọc, value = voice id."""
+    from latentsync.tts.ausynclab import AusynclabTTS
+    try:
+        voices = AusynclabTTS(api_key=api_key).fetch_voices()
+    except Exception as e:
+        raise gr.Error(f"Kết nối AusyncLab lỗi: {e}")
+    choices = []
+    for v in voices:
+        if not v.get("code"):
+            continue
+        meta = " · ".join(x for x in (v.get("language_code"), v.get("gender"), v.get("use_case")) if x)
+        label = f"{v.get('name') or 'voice'}" + (f" ({meta})" if meta else "") + f" · #{v['code']}"
+        choices.append((label, v["code"]))
+    gr.Info(f"Đã tải {len(choices)} voice AusyncLab.")
+    return gr.update(choices=choices, value=(choices[0][1] if choices else None)), f"✅ Tải **{len(choices)}** voice."
+
+
+def ausynclab_test(api_key, voice, text):
+    from latentsync.tts.ausynclab import AusynclabTTS
+    if not (text or "").strip():
+        raise gr.Error("Nhập câu cần đọc thử.")
+    out = str(UPLOADS_DIR / "ausynclab_test.wav")
+    try:
+        AusynclabTTS(api_key=api_key, default_voice=voice or None).synthesize(text, out, voice or None)
+    except Exception as e:
+        raise gr.Error(f"Nghe thử lỗi: {e}")
+    return out
+
+
 CSS = """
 #name-box {
   border: 2px solid #f59e0b;
@@ -344,9 +501,131 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         # Cập nhật danh sách video ở khu xem lại Tab 1 (chỉ choices -> không cắt ngang video đang phát).
         timer.tick(lambda: gr.update(choices=list(_video_choices().keys())), None, result_dd)
 
+    with gr.Tab("📥 Import Excel"):
+        gr.Markdown(
+            "### Import hàng loạt từ Excel → TTS đa luồng → hàng đợi render\n"
+            "Mỗi dòng = 1 job. TTS chạy **song song**; render vẫn **tuần tự** (1 GPU). "
+            "Job dùng cấu hình mặc định **model 256 + làm nét miệng**.")
+
+        with gr.Row():
+            tpl_btn = gr.Button("📥 Tải mẫu Excel")
+            tpl_file = gr.File(label="template.xlsx")
+        tpl_btn.click(make_template_file, None, tpl_file)
+
+        gr.Markdown("#### Cấu hình mặc định (áp dụng cho ô để trống trong Excel)")
+        with gr.Row():
+            xl_default_video = gr.Video(
+                label="Video mặc định (tải lên — dùng cho dòng để TRỐNG cột video_path)",
+                sources=["upload"])
+            xl_default_provider = gr.Dropdown(
+                choices=TTS_PROVIDER_CHOICES, value=_TTS_DEFAULT,
+                label="TTS Provider mặc định")
+            xl_default_voice = gr.Dropdown(
+                choices=list_voices(_TTS_DEFAULT), value=None,
+                label="Giọng mặc định", allow_custom_value=True)
+            xl_shopee = gr.Textbox(label="Shopee Item ID / Sản phẩm chung (fallback)",
+                                   placeholder="dùng cho dòng để TRỐNG cột 'product'")
+        xl_default_provider.change(update_voice_choices, xl_default_provider, xl_default_voice)
+
+        gr.Markdown("#### Import")
+        xl_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
+        with gr.Row():
+            xl_preview_btn = gr.Button("🔍 Preview", variant="secondary")
+            xl_submit_btn = gr.Button("🚀 Submit các job sẵn sàng", variant="primary")
+        xl_summary = gr.Markdown()
+        xl_table = gr.Dataframe(
+            headers=["Row", "Sản phẩm", "Video", "Type", "Tên xuất (.mp4)", "Provider", "Status"],
+            datatype=["number", "str", "str", "str", "str", "str", "str"],
+            interactive=False, wrap=True)
+        xl_state = gr.State()
+        xl_result = gr.Markdown()
+
+        xl_preview_btn.click(
+            preview_excel,
+            [xl_file, xl_default_video, xl_default_provider, xl_shopee],
+            [xl_table, xl_summary, xl_state])
+        # Submit: chạy TTS (đa luồng) + đẩy queue, rồi refresh luôn bảng trạng thái ở tab kia.
+        xl_submit_btn.click(submit_excel, xl_state, [xl_result, status_table])
+
+    with gr.Tab("⚙️ Cấu hình TTS"):
+        gr.Markdown(
+            "### Cấu hình 4 loại TTS\n"
+            "Điền API key / URL / giọng cho từng provider rồi **Lưu** — ghi vào `.env` và "
+            "áp dụng ngay (không cần restart). Provider 'local' chạy offline, không cần key.")
+        cfg_status = gr.Markdown(tts_config.status_markdown())
+
+        cfg_default = gr.Dropdown(
+            choices=[(tts_config.PROVIDER_LABELS[n], n) for n in tts_config.PROVIDER_FIELDS],
+            value=tts_config.current_default_provider(),
+            label="⭐ Provider mặc định (DEFAULT_TTS_PROVIDER)")
+
+        _cur = tts_config.current_values()
+        cfg_inputs = []          # giữ ĐÚNG THỨ TỰ tts_config.ALL_KEYS để map khi lưu
+        cfg_comp = {}            # key -> component, để wire nút Vbee
+        for prov, fields in tts_config.PROVIDER_FIELDS.items():
+            with gr.Accordion(f"🔊 {tts_config.PROVIDER_LABELS[prov]}", open=(prov in ("vbee", "ausynclab"))):
+                with gr.Row():
+                    for key, label, secret in fields:
+                        box = gr.Textbox(
+                            label=label, value=_cur.get(key, ""),
+                            type=("password" if secret else "text"),
+                            placeholder=key)
+                        cfg_inputs.append(box)
+                        cfg_comp[key] = box
+                # Vbee: kết nối lấy giọng + nghe thử (đúng luồng tài liệu Vbee A3/A4).
+                if prov == "vbee":
+                    with gr.Row():
+                        vbee_conn_btn = gr.Button("🔌 Kết nối & tải giọng")
+                        vbee_voices_dd = gr.Dropdown(label="Giọng Vbee (chọn → đặt làm mặc định)",
+                                                     choices=[], allow_custom_value=True)
+                    vbee_conn_msg = gr.Markdown()
+                    with gr.Row():
+                        vbee_test_text = gr.Textbox(label="Nghe thử câu nói",
+                                                    value="Xin chào, đây là giọng đọc thử.")
+                        vbee_test_btn = gr.Button("▶ Nghe thử")
+                    vbee_test_audio = gr.Audio(label="Kết quả nghe thử", type="filepath")
+                    vbee_conn_btn.click(vbee_connect,
+                                        [cfg_comp["VBEE_APP_ID"], cfg_comp["VBEE_TOKEN"]],
+                                        [vbee_voices_dd, vbee_conn_msg])
+                    vbee_voices_dd.change(lambda v: gr.update(value=v),
+                                          vbee_voices_dd, cfg_comp["VBEE_DEFAULT_VOICE"])
+                    vbee_test_btn.click(vbee_test,
+                                        [cfg_comp["VBEE_APP_ID"], cfg_comp["VBEE_TOKEN"],
+                                         cfg_comp["VBEE_DEFAULT_VOICE"], vbee_test_text],
+                                        vbee_test_audio)
+                # AusyncLab: kết nối lấy voice + nghe thử.
+                if prov == "ausynclab":
+                    with gr.Row():
+                        aus_conn_btn = gr.Button("🔌 Kết nối & tải giọng")
+                        aus_voices_dd = gr.Dropdown(label="Voice AusyncLab (chọn → đặt mặc định)",
+                                                    choices=[], allow_custom_value=True)
+                    aus_conn_msg = gr.Markdown()
+                    with gr.Row():
+                        aus_test_text = gr.Textbox(label="Nghe thử câu nói",
+                                                   value="Xin chào, đây là giọng đọc thử.")
+                        aus_test_btn = gr.Button("▶ Nghe thử")
+                    aus_test_audio = gr.Audio(label="Kết quả nghe thử", type="filepath")
+                    aus_conn_btn.click(ausynclab_connect, cfg_comp["AUSYNCLAB_API_KEY"],
+                                       [aus_voices_dd, aus_conn_msg])
+                    # Lưu ĐÚNG voice id (rút '#id' nếu Gradio trả nhãn).
+                    aus_voices_dd.change(
+                        lambda v: gr.update(value=(__import__("re").search(r"#(\d+)", str(v)).group(1)
+                                                   if __import__("re").search(r"#(\d+)", str(v)) else v)),
+                        aus_voices_dd, cfg_comp["AUSYNCLAB_DEFAULT_VOICE"])
+                    aus_test_btn.click(ausynclab_test,
+                                       [cfg_comp["AUSYNCLAB_API_KEY"],
+                                        cfg_comp["AUSYNCLAB_DEFAULT_VOICE"], aus_test_text],
+                                       aus_test_audio)
+        cfg_save = gr.Button("💾 Lưu cấu hình TTS", variant="primary")
+        # Lưu: ghi .env + reset factory; cập nhật bảng trạng thái + dropdown provider ở tab Import.
+        cfg_save.click(save_tts_config, [cfg_default, *cfg_inputs],
+                       [cfg_status, xl_default_provider])
+
     # Khi mở/refresh trang: nạp bảng + danh sách video; khu Tab 1 tự hiện video mới nhất.
     demo.load(refresh_status, outputs=[status_table, done_dd])
     demo.load(load_video_area, outputs=[result_dd, result_video, result_dl])
+    # Trạng thái cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
+    demo.load(lambda: tts_config.status_markdown(), outputs=cfg_status)
 
 
 if __name__ == "__main__":
