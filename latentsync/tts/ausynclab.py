@@ -197,8 +197,21 @@ class AusynclabTTS(TTSProvider):
 
     # ---- voices -----------------------------------------------------------
 
+    # Giọng cố định để hiện sẵn trong dropdown (operator khỏi gõ id). (nhãn, voice_id).
+    CURATED_VOICES = [
+        ("Nữ · Khả Hân", "508363"),
+        ("Nữ · Hamsa test", "1918847"),
+        ("Nam · HN - Minh Khang", "319657"),
+        ("Nam · An Khôi", "213055"),
+    ]
+
     def voices(self):
-        return [self.default_voice] if self.default_voice else []
+        out = list(self.CURATED_VOICES)
+        codes = {c for _, c in out}
+        dv = str(self.default_voice) if self.default_voice else None
+        if dv and dv not in codes:
+            out.insert(0, (dv, dv))
+        return out
 
     def fetch_voices(self):
         """GET {base}/voices -> list dict {code/voice_id, name, ...}. Raise nếu key sai."""

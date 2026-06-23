@@ -244,9 +244,13 @@ def make_template_file():
 
 
 def update_voice_choices(provider):
-    """Đổi provider -> nạp danh sách giọng gợi ý (cho phép tự gõ thêm)."""
+    """Đổi provider -> nạp danh sách giọng gợi ý (cho phép tự gõ thêm).
+
+    list_voices có thể trả (nhãn, code) hoặc code thuần -> value phải là code."""
     vs = list_voices(provider)
-    return gr.update(choices=vs, value=(vs[0] if vs else None))
+    first = vs[0] if vs else None
+    val = first[1] if isinstance(first, tuple) else first
+    return gr.update(choices=vs, value=val)
 
 
 def _preview_rows_table(rows, errors, shopee_item_id=None):

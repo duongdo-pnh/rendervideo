@@ -155,9 +155,23 @@ class VbeeTTS(TTSProvider):
 
     # ---- voices -----------------------------------------------------------
 
+    # Giọng quảng cáo clone (_advertise_vc): gọi TTS được nhưng KHÔNG xuất hiện trong /voices,
+    # nên liệt kê cứng để hiện trong dropdown (operator khỏi gõ tay code). (nhãn, voiceCode).
+    CURATED_VOICES = [
+        ("Nữ · Quảng cáo 02 (Bắc)", "n_hanoi_female_quangcao02_advertise_vc"),
+        ("Nữ · Vy Quảng Cáo (Nam)", "s_hochiminh_female_vyquangcao_advertise_vc"),
+        ("Nam · Thắng chuyên nghiệp (Bắc)", "n_hanoi_male_thangchuyennghiep_advertise_vc"),
+        ("Nam · Quang Quảng Cáo (Bắc)", "n_hanoi_male_quangquangcao_advertise_vc"),
+    ]
+
     def voices(self):
-        # Không gọi mạng ở đây (factory.list_voices gọi mỗi lần đổi provider). Chỉ trả giọng mặc định.
-        return [self.default_voice] if self.default_voice else []
+        # Không gọi mạng ở đây (factory.list_voices gọi mỗi lần đổi provider).
+        # Trả danh sách giọng quảng cáo cố định + giọng mặc định (nếu chưa có trong list).
+        out = list(self.CURATED_VOICES)
+        codes = {c for _, c in out}
+        if self.default_voice and self.default_voice not in codes:
+            out.insert(0, (self.default_voice, self.default_voice))
+        return out
 
     def fetch_voices(self, limit=100):
         """Gọi Vbee lấy TẤT CẢ giọng (VBEE + PERSONAL + COMMUNITY), gộp & khử trùng.
