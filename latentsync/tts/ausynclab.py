@@ -206,12 +206,8 @@ class AusynclabTTS(TTSProvider):
     ]
 
     def voices(self):
-        out = list(self.CURATED_VOICES)
-        codes = {c for _, c in out}
-        dv = str(self.default_voice) if self.default_voice else None
-        if dv and dv not in codes:
-            out.insert(0, (dv, dv))
-        return out
+        # Chỉ hiện ĐÚNG 4 giọng cố định (không gọi mạng, không liệt kê giọng khác).
+        return list(self.CURATED_VOICES)
 
     def fetch_voices(self):
         """GET {base}/voices -> list dict {code/voice_id, name, ...}. Raise nếu key sai."""

@@ -20,6 +20,8 @@ import database as db
 import excel_import
 import tts_config
 from latentsync.tts.factory import available_providers, list_voices
+from latentsync.tts.vbee import VbeeTTS
+from latentsync.tts.ausynclab import AusynclabTTS
 from render_job import OUT_RES  # bảng độ phân giải; render THỰC do queue_worker chạy nền
 
 # Provider list for the Import-Excel tab dropdowns (label shows config status).
@@ -576,46 +578,36 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                             placeholder=key)
                         cfg_inputs.append(box)
                         cfg_comp[key] = box
-                # Vbee: kết nối lấy giọng + nghe thử (đúng luồng tài liệu Vbee A3/A4).
+                # Vbee: 4 giọng cố định + nghe thử (bỏ phần kết nối/tải giọng).
                 if prov == "vbee":
-                    with gr.Row():
-                        vbee_conn_btn = gr.Button("🔌 Kết nối & tải giọng")
-                        vbee_voices_dd = gr.Dropdown(label="Giọng Vbee (chọn → đặt làm mặc định)",
-                                                     choices=[], allow_custom_value=True)
-                    vbee_conn_msg = gr.Markdown()
+                    vbee_voices_dd = gr.Dropdown(
+                        label="Giọng Vbee (chọn → đặt làm mặc định)",
+                        choices=VbeeTTS.CURATED_VOICES,
+                        value=VbeeTTS.CURATED_VOICES[0][1])
                     with gr.Row():
                         vbee_test_text = gr.Textbox(label="Nghe thử câu nói",
                                                     value="Xin chào, đây là giọng đọc thử.")
                         vbee_test_btn = gr.Button("▶ Nghe thử")
                     vbee_test_audio = gr.Audio(label="Kết quả nghe thử", type="filepath")
-                    vbee_conn_btn.click(vbee_connect,
-                                        [cfg_comp["VBEE_APP_ID"], cfg_comp["VBEE_TOKEN"]],
-                                        [vbee_voices_dd, vbee_conn_msg])
                     vbee_voices_dd.change(lambda v: gr.update(value=v),
                                           vbee_voices_dd, cfg_comp["VBEE_DEFAULT_VOICE"])
                     vbee_test_btn.click(vbee_test,
                                         [cfg_comp["VBEE_APP_ID"], cfg_comp["VBEE_TOKEN"],
                                          cfg_comp["VBEE_DEFAULT_VOICE"], vbee_test_text],
                                         vbee_test_audio)
-                # AusyncLab: kết nối lấy voice + nghe thử.
+                # AusyncLab: 4 giọng cố định + nghe thử (bỏ phần kết nối/tải giọng).
                 if prov == "ausynclab":
-                    with gr.Row():
-                        aus_conn_btn = gr.Button("🔌 Kết nối & tải giọng")
-                        aus_voices_dd = gr.Dropdown(label="Voice AusyncLab (chọn → đặt mặc định)",
-                                                    choices=[], allow_custom_value=True)
-                    aus_conn_msg = gr.Markdown()
+                    aus_voices_dd = gr.Dropdown(
+                        label="Voice AusyncLab (chọn → đặt mặc định)",
+                        choices=AusynclabTTS.CURATED_VOICES,
+                        value=AusynclabTTS.CURATED_VOICES[0][1])
                     with gr.Row():
                         aus_test_text = gr.Textbox(label="Nghe thử câu nói",
                                                    value="Xin chào, đây là giọng đọc thử.")
                         aus_test_btn = gr.Button("▶ Nghe thử")
                     aus_test_audio = gr.Audio(label="Kết quả nghe thử", type="filepath")
-                    aus_conn_btn.click(ausynclab_connect, cfg_comp["AUSYNCLAB_API_KEY"],
-                                       [aus_voices_dd, aus_conn_msg])
-                    # Lưu ĐÚNG voice id (rút '#id' nếu Gradio trả nhãn).
-                    aus_voices_dd.change(
-                        lambda v: gr.update(value=(__import__("re").search(r"#(\d+)", str(v)).group(1)
-                                                   if __import__("re").search(r"#(\d+)", str(v)) else v)),
-                        aus_voices_dd, cfg_comp["AUSYNCLAB_DEFAULT_VOICE"])
+                    aus_voices_dd.change(lambda v: gr.update(value=v),
+                                         aus_voices_dd, cfg_comp["AUSYNCLAB_DEFAULT_VOICE"])
                     aus_test_btn.click(ausynclab_test,
                                        [cfg_comp["AUSYNCLAB_API_KEY"],
                                         cfg_comp["AUSYNCLAB_DEFAULT_VOICE"], aus_test_text],

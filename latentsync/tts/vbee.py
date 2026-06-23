@@ -165,13 +165,8 @@ class VbeeTTS(TTSProvider):
     ]
 
     def voices(self):
-        # Không gọi mạng ở đây (factory.list_voices gọi mỗi lần đổi provider).
-        # Trả danh sách giọng quảng cáo cố định + giọng mặc định (nếu chưa có trong list).
-        out = list(self.CURATED_VOICES)
-        codes = {c for _, c in out}
-        if self.default_voice and self.default_voice not in codes:
-            out.insert(0, (self.default_voice, self.default_voice))
-        return out
+        # Chỉ hiện ĐÚNG 4 giọng cố định (không gọi mạng, không liệt kê giọng khác).
+        return list(self.CURATED_VOICES)
 
     def fetch_voices(self, limit=100):
         """Gọi Vbee lấy TẤT CẢ giọng (VBEE + PERSONAL + COMMUNITY), gộp & khử trùng.
