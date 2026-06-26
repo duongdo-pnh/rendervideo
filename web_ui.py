@@ -318,6 +318,66 @@ def submit_excel(state, progress=gr.Progress()):
     return "\n".join(lines), gr.update(value=_table_rows())
 
 
+# ---------------------------------------------------------------- Tab Pipeline Excel (format mới)
+
+def preview_excel_new(excel_file, default_video, default_provider):
+    """Preview file Excel định dạng mới (sheet 'FILE IMPORT', header row 3, data từ row 5)."""
+    if not excel_file:
+        raise gr.Error("Chưa chọn file Excel.")
+    try:
+        from latentsync.excel_import import ExcelImporter
+        importer = ExcelImporter(excel_file)
+        rows = importer.parse()
+    except Exception as e:
+        raise gr.Error(f"Lỗi đọc Excel: {e}")
+    table = []
+    for r in rows:
+        status = r.get("status") or "pending"
+        if r.get("_error"):
+            status = f"❌ {r['_error']}"
+        table.append([
+            r["_row"],
+            r.get("product_name") or r.get("shopee_item_id") or "(trống)",
+            r.get("video_type") or "",
+            (r.get("text") or "")[:50],
+            r.get("tts_provider") or f"({default_provider or 'default'})",
+            status,
+        ])
+    ok = sum(1 for r in rows if not r.get("_error"))
+    err = sum(1 for r in rows if r.get("_error"))
+    summary = f"**Tổng: {len(rows)} dòng | Sẵn sàng: {ok} | Lỗi validate: {err}**"
+    gr.Info(f"Preview: {ok} sẵn sàng, {err} lỗi.")
+    return table, summary
+
+
+def run_pipeline_ui(excel_file, default_video, default_provider, upload_drive):
+    """Generator — yield log strings cập nhật Textbox realtime."""
+    if not excel_file:
+        yield "❌ Chưa upload file Excel."
+        return
+    try:
+        from latentsync.excel_pipeline import ExcelPipeline
+        pipeline = ExcelPipeline(
+            excel_path=excel_file,
+            default_video=(default_video or "").strip() or None,
+            default_tts_provider=default_provider or None,
+            upload_drive=bool(upload_drive),
+        )
+        log = ""
+        for line in pipeline.run():
+            log += line + "\n"
+            yield log
+    except Exception as e:
+        yield f"❌ Pipeline lỗi: {e}"
+
+
+def export_excel_ui(excel_file):
+    """Trả file Excel (đã cập nhật video_done/video_url/status) để download."""
+    if not excel_file or not Path(excel_file).exists():
+        raise gr.Error("Chưa có file Excel nào để xuất.")
+    return excel_file
+
+
 _TTS_LABEL = {"pending": "⏳ chờ", "submitting": "🔄 đang chạy", "retry_wait": "🔁 chờ retry",
               "done": "✅ xong", "failed_retryable": "🟠 dead-letter", "failed_permanent": "❌ lỗi cứng"}
 
@@ -586,6 +646,53 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_submit_btn.click(submit_excel, xl_state, [xl_result, status_table])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         timer.tick(tts_status_md, outputs=xl_tts_status)   # 'timer' định nghĩa ở tab Trạng thái queue
+
+    with gr.Tab("📦 Pipeline Excel"):
+        gr.Markdown(
+            "### Pipeline Excel → TTS → Render → Google Drive → Excel\n"
+            "Định dạng: sheet **FILE IMPORT**, header **row 3**, data từ **row 5**.\n"
+            "Chạy tuần tự từng dòng (TTS inline → đợi render xong → Drive) và ghi kết quả "
+            "ngược vào Excel (video_done, video_url, status, render_time_s).")
+
+        gr.Markdown("#### Cấu hình mặc định")
+        with gr.Row():
+            pip_default_video = gr.Textbox(
+                label="Video mặc định (đường dẫn local, cho dòng trống cột video_path)",
+                placeholder="/home/ubuntu/videos/avatar.mp4", scale=2)
+            pip_default_provider = gr.Dropdown(
+                choices=TTS_PROVIDER_CHOICES, value=_TTS_DEFAULT,
+                label="TTS Provider mặc định", scale=1)
+            pip_default_voice = gr.Dropdown(
+                choices=list_voices(_TTS_DEFAULT), value=None,
+                label="Giọng mặc định", allow_custom_value=True, scale=1)
+            pip_upload_drive = gr.Checkbox(
+                value=False, label="☁️ Upload Google Drive sau render", scale=1)
+        pip_default_provider.change(update_voice_choices, pip_default_provider, pip_default_voice)
+
+        gr.Markdown("#### Import")
+        pip_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
+        with gr.Row():
+            pip_preview_btn = gr.Button("🔍 Preview", variant="secondary")
+            pip_import_btn  = gr.Button("🚀 Bắt đầu Import", variant="primary")
+            pip_export_btn  = gr.Button("📤 Xuất Excel đã cập nhật", variant="secondary")
+        pip_summary = gr.Markdown()
+        pip_table = gr.Dataframe(
+            headers=["Row", "Sản phẩm", "Type", "Text (50 ký tự)", "Provider", "Status"],
+            datatype=["number", "str", "str", "str", "str", "str"],
+            interactive=False, wrap=True)
+        pip_progress = gr.Textbox(
+            label="📋 Log realtime", lines=18, interactive=False, show_copy_button=True)
+        pip_export_file = gr.File(label="File Excel đã cập nhật (download)")
+
+        pip_preview_btn.click(
+            preview_excel_new,
+            [pip_file, pip_default_video, pip_default_provider],
+            [pip_table, pip_summary])
+        pip_import_btn.click(
+            run_pipeline_ui,
+            [pip_file, pip_default_video, pip_default_provider, pip_upload_drive],
+            pip_progress)
+        pip_export_btn.click(export_excel_ui, pip_file, pip_export_file)
 
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
