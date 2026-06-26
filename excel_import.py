@@ -15,6 +15,7 @@ matches video <-> product by name.
 """
 import os
 import re
+import time
 import unicodedata
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +28,17 @@ from latentsync.tts.factory import synthesize
 
 ROOT = Path(__file__).parent
 TTS_AUDIO_DIR = ROOT / "uploads" / "tts"   # stable dir (uploads/ persists; pipeline temp gets wiped)
+
+# --- Chống rate-limit TTS (AusyncLab/Vbee qua Cloudflare hay trả 429 khi gửi dồn dập) ---
+# Ít luồng song song + retry có backoff -> không tông rate-limit, lỗi tạm thời tự phục hồi.
+TTS_MAX_WORKERS = int(os.getenv("TTS_MAX_WORKERS", "2"))      # số luồng TTS song song (mặc định 2)
+TTS_MAX_RETRIES = int(os.getenv("TTS_MAX_RETRIES", "3"))      # số lần thử lại mỗi dòng
+TTS_RETRY_BACKOFF = [3, 8, 20]                               # giây chờ trước mỗi lần retry
+
+
+def _is_rate_limited(err):
+    s = str(err).lower()
+    return any(k in s for k in ("429", "too many requests", "rate limit", "1015"))
 
 COLUMNS = ["product", "video_path", "video_type", "question_type", "text", "tts_provider", "tts_voice"]
 
@@ -230,24 +242,42 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
 
 # ----------------------------------------------------------------- TTS + submit
 
-def submit_jobs(rows, shopee_item_id=None, max_workers=4, progress=None):
+def submit_jobs(rows, shopee_item_id=None, max_workers=None, progress=None):
     """Synthesize TTS for each ready row IN PARALLEL, then enqueue render jobs.
 
     Returns (submitted, tts_errors). A TTS failure on one row is isolated — it lands in
     tts_errors and the rest of the batch still submits (does not crash the whole batch).
+    Mỗi dòng được retry có backoff khi lỗi tạm thời (đặc biệt 429 rate-limit) nên không
+    bị rớt vì lỗi nhất thời; song song giới hạn TTS_MAX_WORKERS để khỏi tông rate-limit.
     `progress(done, total, label)` is an optional callback for a UI progress bar.
     """
     db.init_db()
     TTS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     total = len(rows)
+    if max_workers is None:
+        max_workers = TTS_MAX_WORKERS
 
     def _do_tts(i, row):
         audio_path = str(TTS_AUDIO_DIR / f"tts_{i}_{uuid.uuid4().hex[:8]}.wav")
-        synthesize(text=row["text"], output_path=audio_path,
-                   provider=row["tts_provider"], voice=row["tts_voice"])
-        if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
-            raise RuntimeError("TTS không tạo được file audio.")
-        return audio_path
+        last = None
+        for attempt in range(TTS_MAX_RETRIES + 1):
+            try:
+                synthesize(text=row["text"], output_path=audio_path,
+                           provider=row["tts_provider"], voice=row["tts_voice"])
+                if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
+                    raise RuntimeError("TTS không tạo được file audio.")
+                return audio_path
+            except Exception as e:
+                last = e
+                if attempt >= TTS_MAX_RETRIES:
+                    break
+                wait = TTS_RETRY_BACKOFF[min(attempt, len(TTS_RETRY_BACKOFF) - 1)]
+                if _is_rate_limited(e):
+                    wait *= 2     # bị rate-limit -> chờ lâu hơn cho hết giới hạn
+                _log_import_error(row["row"],
+                                  f"TTS retry {attempt + 1}/{TTS_MAX_RETRIES} sau {wait}s: {e}")
+                time.sleep(wait)
+        raise last
 
     audio_by_idx = {}
     tts_errors = []
