@@ -30,7 +30,10 @@ OWNERSHIPS = ("VBEE", "PERSONAL", "COMMUNITY")
 
 
 class VbeeError(RuntimeError):
-    pass
+    def __init__(self, message, status_code=None, retry_after=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
 
 
 def _clean_voice(v):
@@ -102,9 +105,10 @@ class VbeeTTS(TTSProvider):
         }
         r = requests.post(self.tts_url, json=body, headers=self._headers(json_body=True), timeout=30)
         if r.status_code == 401:
-            raise VbeeError("Sai App ID hoặc Token (401).")
+            raise VbeeError("Sai App ID hoặc Token (401).", status_code=401)
         if not r.ok:                       # lộ message + voiceCode đã gửi (để thấy ký tự lạ nếu có)
-            raise VbeeError(f"Vbee {r.status_code} (voiceCode={voice!r}): {r.text[:300]}")
+            raise VbeeError(f"Vbee {r.status_code} (voiceCode={voice!r}): {r.text[:300]}",
+                            status_code=r.status_code, retry_after=r.headers.get("Retry-After"))
         res = self._result(r.json())
         req_id = res.get("requestId") or res.get("request_id")
         if not req_id:
@@ -116,8 +120,10 @@ class VbeeTTS(TTSProvider):
         while time.time() < end:
             r = requests.get(f"{self.status_url}/{req_id}", headers=self._headers(), timeout=30)
             if r.status_code == 401:
-                raise VbeeError("Sai App ID hoặc Token (401).")
-            r.raise_for_status()
+                raise VbeeError("Sai App ID hoặc Token (401).", status_code=401)
+            if not r.ok:                   # 429/5xx khi poll -> kèm status để classifier retry
+                raise VbeeError(f"Vbee {r.status_code} (poll): {r.text[:200]}",
+                                status_code=r.status_code, retry_after=r.headers.get("Retry-After"))
             res = self._result(r.json())
             status = str(res.get("status", "")).upper()
             if status == "COMPLETED":

@@ -306,16 +306,44 @@ def submit_excel(state, progress=gr.Progress()):
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
 
-    submitted, tts_errors = excel_import.submit_jobs(rows, shopee_item_id=shopee, progress=_cb)
-    lines = [f"### ✅ Đã submit **{len(submitted)}** job vào hàng đợi."]
-    if submitted:
-        lines.append("Job IDs: " + ", ".join(f"#{s['job_id']} ({s['name']})" for s in submitted))
-    if tts_errors:
-        lines.append(f"\n⚠ **{len(tts_errors)} dòng TTS lỗi** (đã bỏ qua, batch KHÔNG crash):")
-        for e in tts_errors:
-            lines.append(f"- dòng {e['row']}: {e['error']}")
-    gr.Info(f"Submit xong: {len(submitted)} job, {len(tts_errors)} lỗi TTS.")
+    enqueued, warnings, batch_id = excel_import.submit_jobs(rows, shopee_item_id=shopee, progress=_cb)
+    lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
+             "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
+             "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
+    if warnings:
+        lines.append(f"\n⚠ **{len(warnings)} dòng được sửa voice** (voice guard):")
+        for w in warnings:
+            lines.append(f"- dòng {w['row']}: {w['warn']}")
+    gr.Info(f"Đã enqueue {len(enqueued)} dòng vào TTS queue.")
     return "\n".join(lines), gr.update(value=_table_rows())
+
+
+_TTS_LABEL = {"pending": "⏳ chờ", "submitting": "🔄 đang chạy", "retry_wait": "🔁 chờ retry",
+              "done": "✅ xong", "failed_retryable": "🟠 dead-letter", "failed_permanent": "❌ lỗi cứng"}
+
+
+def tts_status_md():
+    """Tóm tắt TTS queue + vài dòng dead-letter gần nhất (cho mục Trạng thái TTS)."""
+    import tts_db
+    counts = tts_db.status_counts()
+    if not counts:
+        return "**TTS queue:** (trống)"
+    order = ["pending", "submitting", "retry_wait", "done", "failed_retryable", "failed_permanent"]
+    parts = [f"{_TTS_LABEL.get(k, k)}: **{counts[k]}**" for k in order if k in counts]
+    md = "**TTS queue** — " + " · ".join(parts)
+    dead = tts_db.list_jobs(limit=5, status="failed_retryable")
+    if dead:
+        md += "\n\n*Dead-letter gần đây:*"
+        for d in dead:
+            md += f"\n- dòng {d['excel_row']}: {str(d['last_error'])[:90]}"
+    return md
+
+
+def requeue_dead_letter():
+    import tts_db
+    n = tts_db.requeue_dead_letter()
+    gr.Info(f"Đưa lại {n} dòng dead-letter vào queue." if n else "Không có dòng dead-letter.")
+    return tts_status_md()
 
 
 # ---------------------------------------------------------------- Tab Cấu hình TTS
@@ -546,12 +574,18 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_state = gr.State()
         xl_result = gr.Markdown()
 
+        gr.Markdown("#### 📨 Trạng thái TTS queue (tự cập nhật 10s)")
+        xl_tts_status = gr.Markdown()
+        xl_tts_requeue = gr.Button("🔁 Chạy lại dead-letter (các dòng lỗi tạm thời)")
+
         xl_preview_btn.click(
             preview_excel,
             [xl_file, xl_default_video, xl_default_provider, xl_shopee],
             [xl_table, xl_summary, xl_state])
-        # Submit: chạy TTS (đa luồng) + đẩy queue, rồi refresh luôn bảng trạng thái ở tab kia.
+        # Submit: enqueue vào TTS queue (worker tự synth + đẩy render), refresh bảng trạng thái.
         xl_submit_btn.click(submit_excel, xl_state, [xl_result, status_table])
+        xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
+        timer.tick(tts_status_md, outputs=xl_tts_status)   # 'timer' định nghĩa ở tab Trạng thái queue
 
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
@@ -620,6 +654,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
     # Khi mở/refresh trang: nạp bảng + danh sách video; khu Tab 1 tự hiện video mới nhất.
     demo.load(refresh_status, outputs=[status_table, done_dd])
     demo.load(load_video_area, outputs=[result_dd, result_video, result_dl])
+    demo.load(tts_status_md, outputs=xl_tts_status)
     # Trạng thái cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
     demo.load(lambda: tts_config.status_markdown(), outputs=cfg_status)
 

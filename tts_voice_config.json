@@ -1,0 +1,20 @@
+{
+  "_help": "Voice guard cho từng provider. empty->default_voice_id; trong deprecated_voice_map->map sang mới; ngoài allowed_voice_ids (nếu danh sách khác rỗng)->thay bằng default + cảnh báo (KHÔNG drop dòng). allowed rỗng = không kiểm tra.",
+  "ausynclab": {
+    "default_voice_id": "508363",
+    "deprecated_voice_map": {},
+    "allowed_voice_ids": ["508363", "1918847", "319657", "213055"]
+  },
+  "vbee": {
+    "default_voice_id": "n_hanoi_female_quangcao02_advertise_vc",
+    "deprecated_voice_map": {
+      "hn_female_ngochuyen_full_48k-fhg": "n_hanoi_female_quangcao02_advertise_vc"
+    },
+    "allowed_voice_ids": [
+      "n_hanoi_female_quangcao02_advertise_vc",
+      "s_hochiminh_female_vyquangcao_advertise_vc",
+      "n_hanoi_male_thangchuyennghiep_advertise_vc",
+      "n_hanoi_male_quangquangcao_advertise_vc"
+    ]
+  }
+}

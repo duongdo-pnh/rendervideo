@@ -50,7 +50,10 @@ def _dig(obj, keys):
 
 
 class AusynclabError(RuntimeError):
-    pass
+    def __init__(self, message, status_code=None, retry_after=None):
+        super().__init__(message)
+        self.status_code = status_code        # giúp tts_errors phân loại retry/permanent
+        self.retry_after = retry_after        # giây theo header Retry-After (nếu có)
 
 
 class AusynclabTTS(TTSProvider):
@@ -148,9 +151,11 @@ class AusynclabTTS(TTSProvider):
         r = requests.post(self.base + self.tts_path, json=body,
                           headers=self._headers(json_body=True), timeout=self.req_timeout)
         if r.status_code == 401:
-            raise AusynclabError("X-API-Key không hợp lệ (401 invalid_api_key).")
+            raise AusynclabError("X-API-Key không hợp lệ (401 invalid_api_key).", status_code=401)
         if not r.ok:                       # lộ message + voice_id đã gửi
-            raise AusynclabError(f"AusyncLab {r.status_code} (voice_id={body.get('voice_id')!r}): {r.text[:300]}")
+            raise AusynclabError(
+                f"AusyncLab {r.status_code} (voice_id={body.get('voice_id')!r}): {r.text[:300]}",
+                status_code=r.status_code, retry_after=r.headers.get("Retry-After"))
         return r
 
     def _poll(self, audio_id):
@@ -159,8 +164,10 @@ class AusynclabTTS(TTSProvider):
         while time.time() < end:
             r = requests.get(url, headers=self._headers(), timeout=self.req_timeout)
             if r.status_code == 401:
-                raise AusynclabError("X-API-Key không hợp lệ (401).")
-            r.raise_for_status()
+                raise AusynclabError("X-API-Key không hợp lệ (401).", status_code=401)
+            if not r.ok:                   # 429/5xx khi poll -> kèm status để classifier retry
+                raise AusynclabError(f"AusyncLab {r.status_code} (poll): {r.text[:200]}",
+                                     status_code=r.status_code, retry_after=r.headers.get("Retry-After"))
             res = self._result(r.json())
             state = str(res.get("state") or res.get("status") or "").upper()
             link = _dig(res, _AUDIO_URL_KEYS)
