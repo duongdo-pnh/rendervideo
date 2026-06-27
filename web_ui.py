@@ -306,15 +306,23 @@ def submit_excel(state, progress=gr.Progress()):
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
 
-    enqueued, warnings, batch_id = excel_import.submit_jobs(rows, shopee_item_id=shopee, progress=_cb)
+    enqueued, warnings, batch_id, skipped = excel_import.submit_jobs(
+        rows, shopee_item_id=shopee, progress=_cb)
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
+    if skipped:
+        lines.append(f"\n⏭ **Bỏ qua {len(skipped)} dòng TRÙNG** (đã có job chờ/đang chạy/đã xong — "
+                     "tránh render lại cùng nội dung):")
+        for s in skipped[:15]:
+            lines.append(f"- dòng {s['row']}: '{s['name']}' (trùng tts#{s['dup_id']})")
+        if len(skipped) > 15:
+            lines.append(f"- … và {len(skipped) - 15} dòng nữa")
     if warnings:
         lines.append(f"\n⚠ **{len(warnings)} dòng được sửa voice** (voice guard):")
         for w in warnings:
             lines.append(f"- dòng {w['row']}: {w['warn']}")
-    gr.Info(f"Đã enqueue {len(enqueued)} dòng vào TTS queue.")
+    gr.Info(f"Enqueue {len(enqueued)} dòng, bỏ {len(skipped)} dòng trùng.")
     return "\n".join(lines), gr.update(value=_table_rows())
 
 

@@ -245,13 +245,23 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None):
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:12]
 
-    enqueued, warnings = [], []
+    enqueued, warnings, skipped = [], [], []
+    dedup = os.getenv("TTS_DEDUP", "1") != "0"      # chống trùng (tắt bằng TTS_DEDUP=0)
     for n, row in enumerate(rows, 1):
         provider = row["tts_provider"] or DEFAULT_PROVIDER
         voice, warn = normalize_voice(provider, row["tts_voice"])
         if warn:
             warnings.append({"row": row["row"], "warn": warn})
             _log_import_error(row["row"], f"voice guard: {warn}")
+        # Chống trùng: cùng (sản phẩm+loại+text) đã có job đang chờ/đang chạy/đã xong -> bỏ qua.
+        if dedup:
+            dup = tts_db.find_duplicate(row["product"], row["video_type"],
+                                        row["question_type"], row["text"])
+            if dup:
+                skipped.append({"row": row["row"], "dup_id": dup,
+                                "name": build_name_excel(row["product"], row["video_type"],
+                                                         row["question_type"])})
+                continue
         tid = tts_db.enqueue(batch_id, row["row"], row["text"], provider, voice,
                              row["product"], row["video_path"], row["video_type"],
                              row["question_type"])
@@ -259,4 +269,4 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None):
         if progress:
             progress(n, len(rows), f"Enqueue {n}/{len(rows)}")
 
-    return enqueued, warnings, batch_id
+    return enqueued, warnings, batch_id, skipped

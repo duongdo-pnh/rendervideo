@@ -89,6 +89,26 @@ def enqueue(batch_id, excel_row, text, provider, voice_id,
         return cur.lastrowid
 
 
+# Trạng thái coi là "đã có việc" -> chống trùng (bỏ failed_* để cho phép import lại dòng từng lỗi).
+ACTIVE_STATUSES = ("pending", "submitting", "retry_wait", "done")
+
+
+def find_duplicate(product, video_type, question_type, text, statuses=ACTIVE_STATUSES):
+    """Trả id tts_job trùng (cùng sản phẩm + loại + text) đang ở trạng thái 'đã có việc', else None."""
+    ph = ",".join("?" * len(statuses))
+    with _connect() as con:
+        r = con.execute(
+            f"""SELECT id FROM tts_jobs
+                 WHERE COALESCE(product,'')=COALESCE(?,'')
+                   AND COALESCE(video_type,'')=COALESCE(?,'')
+                   AND COALESCE(question_type,'')=COALESCE(?,'')
+                   AND text=? AND status IN ({ph})
+                 LIMIT 1""",
+            (product, video_type, question_type, text, *statuses),
+        ).fetchone()
+        return r["id"] if r else None
+
+
 def claim_next():
     """Atomically lấy job pending/retry_wait đã tới hạn (next_attempt_at<=now) -> 'submitting'."""
     now = time.time()
