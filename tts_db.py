@@ -61,6 +61,15 @@ def init_db():
         )
         con.execute(
             """
+            CREATE TABLE IF NOT EXISTS tts_batch (
+                batch_id    TEXT PRIMARY KEY,
+                excel_path  TEXT,
+                created_at  TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+            )
+            """
+        )
+        con.execute(
+            """
             CREATE TABLE IF NOT EXISTS tts_rate_limit (
                 provider        TEXT PRIMARY KEY,
                 last_request_at REAL NOT NULL DEFAULT 0,
@@ -70,6 +79,40 @@ def init_db():
             )
             """
         )
+
+
+# ------------------------------------------------------------------ batch (ghi ngược Excel)
+
+def save_batch(batch_id, excel_path):
+    """Nhớ file Excel gốc của batch để sau xuất lại (điền video_done)."""
+    with _connect() as con:
+        con.execute("INSERT OR REPLACE INTO tts_batch(batch_id, excel_path) VALUES (?,?)",
+                    (batch_id, str(excel_path) if excel_path else None))
+
+
+def get_batch_excel(batch_id):
+    with _connect() as con:
+        r = con.execute("SELECT excel_path FROM tts_batch WHERE batch_id=?", (batch_id,)).fetchone()
+        return r["excel_path"] if r else None
+
+
+def latest_batch():
+    with _connect() as con:
+        r = con.execute("SELECT batch_id, excel_path FROM tts_batch ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
+        return dict(r) if r else None
+
+
+def results_for_batch(batch_id):
+    """Map excel_row -> {tts_status, render_status, output_path, name} (join sang jobs render)."""
+    with _connect() as con:
+        rows = con.execute(
+            """SELECT t.excel_row, t.status AS tts_status, t.render_job_id,
+                      j.status AS render_status, j.output_path, j.name
+                 FROM tts_jobs t LEFT JOIN jobs j ON t.render_job_id = j.id
+                WHERE t.batch_id = ?""",
+            (batch_id,),
+        ).fetchall()
+        return {r["excel_row"]: dict(r) for r in rows}
 
 
 # ------------------------------------------------------------------ enqueue / claim

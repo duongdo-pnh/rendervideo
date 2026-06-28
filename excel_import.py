@@ -30,7 +30,33 @@ ROOT = Path(__file__).parent
 TTS_AUDIO_DIR = ROOT / "uploads" / "tts"   # stable dir (uploads/ persists; pipeline temp gets wiped)
 
 
-COLUMNS = ["product", "video_path", "video_type", "question_type", "text", "tts_provider", "tts_voice"]
+# Template đầy đủ (header dòng 1) — khớp file mẫu khách dùng. Hệ CHỈ xử lý các cột:
+#   product_name, subText, video_type, question_type, video_path(optional), tts_provider, tts_voice
+#   -> render xong ghi ngược 'video_done' (đường dẫn local). Cột khác giữ nguyên, không xử lý.
+COLUMNS = ["product_name", "product_link", "product_info", "subText",
+           "video_type", "question_type", "video_path", "video_url",
+           "video_done", "tts_provider", "tts_voice"]
+
+# Tên cột chấp nhận (alias) khi đọc — tương thích file cũ.
+COL_PRODUCT = ("product_name", "product")
+COL_TEXT = ("subText", "subtext", "text")
+
+# Giá trị cho dropdown trong file mẫu (data validation) — khách chọn, khỏi gõ sai.
+VIDEO_TYPE_OPTIONS = ["gioi_thieu", "tra_loi"]
+QUESTION_TYPE_OPTIONS = ["ASK_PRICE", "ASK_QUALITY", "ASK_USAGE", "ASK_STOCK", "ASK_BUY",
+                         "ASK_SHIPPING", "ASK_VOUCHER", "ASK_RETURN", "ASK_PRODUCT"]
+TTS_PROVIDER_OPTIONS = ["vbee", "ausynclab", "local"]
+
+
+def _voice_options():
+    """Mã giọng cố định của hệ (4 vbee + 4 ausynclab) cho dropdown tts_voice."""
+    try:
+        from latentsync.tts.vbee import VbeeTTS
+        from latentsync.tts.ausynclab import AusynclabTTS
+        return [code for _, code in VbeeTTS.CURATED_VOICES] + \
+               [code for _, code in AusynclabTTS.CURATED_VOICES]
+    except Exception:
+        return []
 
 # Intent codes the downstream/Relive system matches on — MUST stay in sync with
 # INTENT_CHOICES in web_ui.py ("Mã PHẢI trùng intents bên hệ live (ASK_*)").
@@ -86,20 +112,19 @@ def resolve_intent(question_type):
     return INTENT_MAP.get(key)
 
 
-# Per-column guidance written as cell comments in the downloadable template.
+# Chú thích từng cột (cell comment trong file mẫu). Chỉ các cột hệ DÙNG mới có hướng dẫn rõ.
 _COL_HELP = {
-    "product": ("TÊN SẢN PHẨM / TÊN VIDEO — đặt tên file xuất (Relive match theo tên này). "
-                "Shopee item_id hoặc tên sản phẩm. Để TRỐNG = CÂU TRẢ LỜI CHUNG (tên '__ASK_*', "
-                "không gắn sản phẩm) — hoặc dùng ô 'Shopee Item ID' chung nếu có điền."),
-    "video_path": "Đường dẫn local tới video avatar. Để TRỐNG = dùng video mặc định.",
-    "video_type": ("CHỈ 2 giá trị: 'gioi_thieu' (video giới thiệu, tên = <sản phẩm>) "
-                   "hoặc 'tra_loi' (trả lời câu hỏi, tên = <sản phẩm>__ASK_*)."),
-    "question_type": ("Loại câu hỏi — CHỈ điền khi video_type = tra_loi. Nhận tiếng Việt "
-                      "(gia/chat_luong/cach_dung/con_hang/mua/ship/voucher/doi_tra/san_pham) "
-                      "hoặc mã ASK_* trực tiếp. Khi giới thiệu thì để TRỐNG."),
-    "text": "Script cần chuyển thành giọng nói (TTS). BẮT BUỘC.",
-    "tts_provider": "vbee / ausynclab / api / local. Để TRỐNG = provider mặc định.",
-    "tts_voice": "Tên giọng theo provider. Để TRỐNG = giọng mặc định.",
+    "product_name": "TÊN SẢN PHẨM — đặt tên video. Để TRỐNG = câu trả lời CHUNG (tên '__ASK_*').",
+    "product_link": "(Không bắt buộc, hệ không xử lý) link sản phẩm.",
+    "product_info": "(Không bắt buộc, hệ không xử lý) mô tả sản phẩm.",
+    "subText": "Script cần chuyển thành giọng nói (TTS). BẮT BUỘC.",
+    "video_type": "Chọn từ dropdown: gioi_thieu (giới thiệu) hoặc tra_loi (trả lời câu hỏi).",
+    "question_type": "CHỈ khi video_type = tra_loi — chọn loại câu hỏi (ASK_*) từ dropdown.",
+    "video_path": "Đường dẫn local video avatar (không bắt buộc). TRỐNG = dùng video mặc định.",
+    "video_url": "(Hệ không xử lý) — để trống.",
+    "video_done": "HỆ TỰ ĐIỀN sau khi render xong (đường dẫn local video). Khách để TRỐNG.",
+    "tts_provider": "Chọn từ dropdown: vbee / ausynclab / local. TRỐNG = mặc định.",
+    "tts_voice": "Chọn giọng từ dropdown. TRỐNG = giọng mặc định của provider.",
 }
 
 # Default render config for jobs created from Excel (matches the web UI defaults).
@@ -122,28 +147,64 @@ def _log_import_error(row, msg):
 
 # ----------------------------------------------------------------- template
 
-def make_template(path):
-    """Write an .xlsx template: header + 3 example rows + per-header comments."""
+def _col_letter(name):
+    from openpyxl.utils import get_column_letter
+    return get_column_letter(COLUMNS.index(name) + 1)
+
+
+def make_template(path, max_rows=1000):
+    """Write an .xlsx template: header + ví dụ + comment + DROPDOWN (data validation).
+
+    Dropdown lấy từ sheet ẩn '_lists' (tránh giới hạn 255 ký tự của list inline) cho
+    video_type / question_type / tts_provider / tts_voice -> khách chọn, khỏi gõ sai.
+    """
     from openpyxl import Workbook
     from openpyxl.comments import Comment
+    from openpyxl.worksheet.datavalidation import DataValidation
+    from openpyxl.utils import get_column_letter
 
     wb = Workbook()
     ws = wb.active
     ws.title = "import"
     ws.append(COLUMNS)
-    # product: tên/ID sản phẩm (đặt tên video). video_type: gioi_thieu (tên=<sp>) | tra_loi (<sp>__ASK_*)
+
+    def row(**kw):
+        return [kw.get(c, "") for c in COLUMNS]
     examples = [
-        ["23525384022", "/videos/avatar.mp4", "gioi_thieu", "",     "Chào cả nhà, hôm nay shop có sản phẩm cực hot!", "vbee",      ""],
-        ["23525384022", "/videos/avatar.mp4", "tra_loi",    "gia",  "Dạ giá chỉ 299k ạ, đang sale cực mạnh!",         "vbee",      ""],
-        ["set kep toc", "",                   "tra_loi",    "mua",  "Bấm giỏ hàng chốt đơn ngay đi ạ!",               "local",     ""],
-        ["ao thun nam", "/videos/avatar2.mp4","tra_loi",    "ship", "Bên em freeship toàn quốc nha!",                 "ausynclab", ""],
+        row(product_name="23525384022", subText="Chào cả nhà, hôm nay shop có sản phẩm cực hot!",
+            video_type="gioi_thieu", tts_provider="vbee"),
+        row(product_name="23525384022", subText="Dạ giá chỉ 299k ạ, đang sale cực mạnh!",
+            video_type="tra_loi", question_type="ASK_PRICE", tts_provider="vbee"),
+        row(product_name="set kep toc", subText="Bấm giỏ hàng chốt đơn ngay đi ạ!",
+            video_type="tra_loi", question_type="ASK_BUY", tts_provider="local"),
     ]
     for r in examples:
         ws.append(r)
+
+    # comment + độ rộng cột
     for idx, col in enumerate(COLUMNS, start=1):
         cell = ws.cell(row=1, column=idx)
-        cell.comment = Comment(_COL_HELP[col], "LatentSync")
-        ws.column_dimensions[cell.column_letter].width = max(16, len(col) + 4)
+        cell.comment = Comment(_COL_HELP.get(col, ""), "LatentSync")
+        ws.column_dimensions[get_column_letter(idx)].width = max(16, len(col) + 4)
+
+    # sheet ẩn chứa danh sách hợp lệ cho dropdown
+    lists = wb.create_sheet("_lists")
+    lists.sheet_state = "hidden"
+    options = {"video_type": VIDEO_TYPE_OPTIONS, "question_type": QUESTION_TYPE_OPTIONS,
+               "tts_provider": TTS_PROVIDER_OPTIONS, "tts_voice": _voice_options()}
+    for col_i, (field, vals) in enumerate(options.items(), start=1):
+        letter = get_column_letter(col_i)
+        lists.cell(row=1, column=col_i, value=field)
+        for r_i, v in enumerate(vals, start=2):
+            lists.cell(row=r_i, column=col_i, value=v)
+        if not vals:
+            continue
+        rng = f"_lists!${letter}$2:${letter}${len(vals) + 1}"
+        dv = DataValidation(type="list", formula1=rng, allow_blank=True, showDropDown=False)
+        col_letter = _col_letter(field)
+        dv.add(f"{col_letter}2:{col_letter}{max_rows}")
+        ws.add_data_validation(dv)
+
     wb.save(path)
     return path
 
@@ -180,6 +241,16 @@ def _clean(val):
     return s or None
 
 
+def _get(raw, names):
+    """Lấy giá trị cột đầu tiên có trong raw theo danh sách alias (vd subText/text)."""
+    for n in names:
+        if n in raw:
+            v = _clean(raw.get(n))
+            if v is not None:
+                return v
+    return None
+
+
 def process_excel(excel_path, default_video=None, default_provider=None, shopee_item_id=None):
     """Read + validate. Returns (ready_rows, errors). No TTS, no DB writes."""
     df = pd.read_excel(excel_path)
@@ -192,18 +263,18 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
             if not video or not os.path.exists(video):
                 raise ValueError(f"Video không tồn tại: {video!r}")
 
-            text = _clean(raw.get("text"))
+            text = _get(raw, COL_TEXT)                                       # subText (alias text)
             if not text:
-                raise ValueError("Text rỗng")
+                raise ValueError("subText rỗng")
 
             provider = _clean(raw.get("tts_provider")) or default_provider  # None -> factory default
             voice = _clean(raw.get("tts_voice"))                            # None -> provider default
             video_type = _clean(raw.get("video_type")) or "gioi_thieu"
             question_type = _clean(raw.get("question_type")) or ""
 
-            # Tên sản phẩm/video: ưu tiên cột 'product' của dòng, else ô Shopee Item ID chung.
+            # Tên sản phẩm/video: ưu tiên product_name (alias product) của dòng, else Item ID chung.
             # ĐƯỢC PHÉP rỗng -> câu trả lời CHUNG (tên '__ASK_*', không gắn sản phẩm cụ thể).
-            product = _clean(raw.get("product")) or (str(shopee_item_id).strip() if shopee_item_id else None)
+            product = _get(raw, COL_PRODUCT) or (str(shopee_item_id).strip() if shopee_item_id else None)
 
             # Trả lời câu hỏi -> bắt buộc có loại câu hỏi hợp lệ (để dựng <sp>__ASK_*).
             if not is_intro(video_type, question_type):
@@ -232,18 +303,19 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
 
 # ----------------------------------------------------------------- enqueue vào TTS queue
 
-def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None):
+def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_path=None):
     """ENQUEUE mỗi dòng vào TTS queue bền vững (tts_jobs). KHÔNG gọi TTS tại chỗ —
     tts_worker.py sẽ synth (rate-limit + retry + adaptive throttle) rồi tạo render job.
 
-    Trả (enqueued, warnings, batch_id). Voice được chuẩn hoá trước (voice guard): rỗng/cũ/
-    ngoài whitelist -> thay bằng mặc định + cảnh báo (không drop dòng).
+    excel_path: file Excel gốc của batch -> lưu để sau xuất lại (điền video_done).
+    Trả (enqueued, warnings, batch_id, skipped). Voice chuẩn hoá trước (voice guard).
     """
     db.init_db()
     tts_db.init_db()
     TTS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:12]
+    tts_db.save_batch(batch_id, excel_path)
 
     enqueued, warnings, skipped = [], [], []
     dedup = os.getenv("TTS_DEDUP", "1") != "0"      # chống trùng (tắt bằng TTS_DEDUP=0)
@@ -270,3 +342,70 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None):
             progress(n, len(rows), f"Enqueue {n}/{len(rows)}")
 
     return enqueued, warnings, batch_id, skipped
+
+
+# ----------------------------------------------------------------- ghi ngược video_done -> Excel
+
+def export_results(batch_id, out_path=None):
+    """Mở Excel gốc của batch, điền cột 'video_done' = đường dẫn local video đã render xong,
+    lưu thành file mới. Dòng chưa render xong để trống (hoặc ghi trạng thái).
+
+    Trả (out_path, filled, total). filled = số dòng đã điền được link video.
+    """
+    from openpyxl import load_workbook
+
+    src = tts_db.get_batch_excel(batch_id)
+    if not src or not os.path.exists(src):
+        raise FileNotFoundError(f"Không tìm thấy Excel gốc của batch {batch_id}: {src!r}")
+
+    wb = load_workbook(src)
+    ws = wb["import"] if "import" in wb.sheetnames else wb.active
+
+    # map tên cột (header dòng 1) -> chỉ số cột
+    header = {}
+    for c in range(1, ws.max_column + 1):
+        name = ws.cell(row=1, column=c).value
+        if name:
+            header[str(name).strip()] = c
+    # đảm bảo có cột video_done (thêm vào cuối nếu thiếu)
+    done_col = header.get("video_done")
+    if not done_col:
+        done_col = ws.max_column + 1
+        ws.cell(row=1, column=done_col, value="video_done")
+
+    results = tts_db.results_for_batch(batch_id)
+    # fallback theo TÊN cho dòng bị dedup bỏ qua (không có tts_job trong batch)
+    name_out = {}
+    for j in db.list_done_jobs(limit=2000):
+        if j.get("output_path"):
+            name_out[j["name"]] = j["output_path"]      # list_done_jobs mới nhất trước -> không ghi đè
+
+    def cell(r, field):
+        ci = header.get(field)
+        return _clean(ws.cell(row=r, column=ci).value) if ci else None
+
+    filled = total = 0
+    for r in range(2, ws.max_row + 1):
+        # bỏ dòng trống hoàn toàn
+        if not any(_clean(ws.cell(row=r, column=c).value) for c in header.values()):
+            continue
+        total += 1
+        out = None
+        res = results.get(r)
+        if res and res.get("render_status") == "done" and res.get("output_path"):
+            out = res["output_path"]
+        else:
+            # fallback theo tên (dòng dedup-skip hoặc chưa join được)
+            product = cell(r, "product_name") or cell(r, "product")
+            nm = build_name_excel(product, cell(r, "video_type") or "gioi_thieu",
+                                  cell(r, "question_type") or "")
+            out = name_out.get(nm)
+        if out:
+            ws.cell(row=r, column=done_col, value=out)
+            filled += 1
+
+    if out_path is None:
+        p = Path(src)
+        out_path = str(p.with_name(f"{p.stem}_ketqua{p.suffix}"))
+    wb.save(out_path)
+    return out_path, filled, total
