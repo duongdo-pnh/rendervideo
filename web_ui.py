@@ -312,18 +312,25 @@ def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
     return table, summary, state
 
 
-def submit_excel(state, progress=gr.Progress()):
+def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region,
+                 progress=gr.Progress()):
     if not state or not state.get("rows"):
         raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
     rows = state["rows"]
     shopee = state.get("shopee")
+    render_config = dict(model_res=str(model), out_res=str(out_res),
+                         enhance_mouth=int(bool(enhance_mouth)), enhance_region=region,
+                         guidance=float(guidance), steps=int(steps), seed=int(seed))
 
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
 
     enqueued, warnings, batch_id, skipped = excel_import.submit_jobs(
-        rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"))
+        rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"),
+        render_config=render_config)
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
+             f"⚙️ Cấu hình render: **model {model} · {out_res} · "
+             f"{'làm nét '+region if enhance_mouth else 'KHÔNG làm nét'} · guidance {guidance} · {steps} steps**.",
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
     if skipped:
@@ -576,7 +583,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         gr.Markdown(
             "### Import hàng loạt từ Excel → TTS đa luồng → hàng đợi render\n"
             "Mỗi dòng = 1 job. TTS chạy **song song**; render vẫn **tuần tự** (1 GPU). "
-            "Job dùng cấu hình mặc định **model 256 + làm nét miệng**.")
+            "Cấu hình render bên dưới áp cho **TOÀN BỘ** file Excel.")
 
         with gr.Row():
             tpl_btn = gr.Button("📥 Tải mẫu Excel")
@@ -597,6 +604,19 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             xl_shopee = gr.Textbox(label="Shopee Item ID / Sản phẩm chung (fallback)",
                                    placeholder="dùng cho dòng để TRỐNG cột 'product'")
         xl_default_provider.change(update_voice_choices, xl_default_provider, xl_default_voice)
+
+        gr.Markdown("#### ⚙️ Cấu hình render (áp cho TOÀN BỘ Excel)")
+        with gr.Row():
+            xl_model = gr.Radio(["256", "512"], value="256",
+                                label="Model: 256 (nhanh) | 512 (nét/tự nhiên, chậm)")
+            xl_out_res = gr.Radio(choices=list(OUT_RES.keys()), value="720",
+                                  label="Độ phân giải (cạnh ngắn): Gốc | 1080 | 720")
+            xl_enhance = gr.Checkbox(value=True, label="Làm nét miệng (GFPGAN)")
+            xl_region = gr.Radio(["mouth", "face"], value="mouth", label="Vùng làm nét")
+        with gr.Row():
+            xl_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
+            xl_steps = gr.Slider(8, 50, value=20, step=1, label="Inference Steps")
+            xl_seed = gr.Number(value=1247, label="Seed", precision=0)
 
         gr.Markdown("#### Import")
         xl_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
@@ -624,7 +644,10 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             [xl_file, xl_default_video, xl_default_provider, xl_shopee],
             [xl_table, xl_summary, xl_state])
         # Submit: enqueue vào TTS queue (worker tự synth + đẩy render), refresh bảng trạng thái.
-        xl_submit_btn.click(submit_excel, xl_state, [xl_result, status_table, xl_batch_state])
+        xl_submit_btn.click(
+            submit_excel,
+            [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed, xl_region],
+            [xl_result, status_table, xl_batch_state])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)
         timer.tick(tts_status_md, outputs=xl_tts_status)   # 'timer' định nghĩa ở tab Trạng thái queue

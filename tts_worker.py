@@ -8,6 +8,7 @@ Cấu hình (env):
   AUSYNC_THROTTLED_MS     = 3000   (nhịp khi đang bị giãn do 429)
   AUSYNC_MAX_RETRY        = 5      (số lần retry mỗi dòng)
 """
+import json
 import os
 import random
 import signal
@@ -85,10 +86,16 @@ def _process(job):
             _log(f"#{job['id']} FAILED ({kind}) -> dead-letter: {e}")
         return
 
-    # TTS xong -> tạo render job trong hàng đợi GPU
+    # TTS xong -> tạo render job trong hàng đợi GPU (dùng cấu hình render của batch nếu có)
     tts_db.note_success(provider)
     name = xi.build_name_excel(job["product"], job["video_type"], job["question_type"])
-    render_id = db.add_job(name, job["video_path"], audio_path, **xi.RENDER_DEFAULTS)
+    cfg = dict(xi.RENDER_DEFAULTS)
+    if job.get("render_config"):
+        try:
+            cfg.update(json.loads(job["render_config"]))
+        except Exception:
+            pass
+    render_id = db.add_job(name, job["video_path"], audio_path, **cfg)
     tts_db.mark_done(job["id"], audio_path, render_id)
     _log(f"#{job['id']} DONE -> render job #{render_id} ('{name}')")
 

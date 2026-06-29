@@ -59,6 +59,10 @@ def init_db():
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_tts_status_next ON tts_jobs(status, next_attempt_at, id)"
         )
+        # Migrate: cấu hình render (JSON) lưu kèm mỗi job để worker tạo render đúng cấu hình batch.
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(tts_jobs)")}
+        if "render_config" not in cols:
+            con.execute("ALTER TABLE tts_jobs ADD COLUMN render_config TEXT")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS tts_batch (
@@ -118,16 +122,16 @@ def results_for_batch(batch_id):
 # ------------------------------------------------------------------ enqueue / claim
 
 def enqueue(batch_id, excel_row, text, provider, voice_id,
-            product, video_path, video_type, question_type):
+            product, video_path, video_type, question_type, render_config=None):
     with _connect() as con:
         cur = con.execute(
             """
             INSERT INTO tts_jobs (batch_id, excel_row, text, provider, voice_id,
-                                  product, video_path, video_type, question_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  product, video_path, video_type, question_type, render_config)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (batch_id, excel_row, text, provider, voice_id,
-             product, str(video_path), video_type, question_type),
+             product, str(video_path), video_type, question_type, render_config),
         )
         return cur.lastrowid
 

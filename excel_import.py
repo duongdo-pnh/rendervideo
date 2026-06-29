@@ -13,6 +13,7 @@ Render config for Excel jobs is fixed to the UI default: model 256 + GFPGAN (mou
 Output naming keeps the existing convention "<base>__<INTENT>" so Relive Studio still
 matches video <-> product by name.
 """
+import json
 import os
 import re
 import unicodedata
@@ -303,11 +304,14 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
 
 # ----------------------------------------------------------------- enqueue vào TTS queue
 
-def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_path=None):
+def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_path=None,
+                render_config=None):
     """ENQUEUE mỗi dòng vào TTS queue bền vững (tts_jobs). KHÔNG gọi TTS tại chỗ —
     tts_worker.py sẽ synth (rate-limit + retry + adaptive throttle) rồi tạo render job.
 
     excel_path: file Excel gốc của batch -> lưu để sau xuất lại (điền video_done).
+    render_config: dict cấu hình render áp cho TOÀN BỘ batch (model_res/out_res/enhance_mouth/
+        guidance/steps/seed/enhance_region). None -> RENDER_DEFAULTS.
     Trả (enqueued, warnings, batch_id, skipped). Voice chuẩn hoá trước (voice guard).
     """
     db.init_db()
@@ -316,6 +320,9 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:12]
     tts_db.save_batch(batch_id, excel_path)
+    rc = dict(RENDER_DEFAULTS)
+    rc.update({k: v for k, v in (render_config or {}).items() if v is not None})
+    rc_json = json.dumps(rc)
 
     enqueued, warnings, skipped = [], [], []
     dedup = os.getenv("TTS_DEDUP", "1") != "0"      # chống trùng (tắt bằng TTS_DEDUP=0)
@@ -336,7 +343,7 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
                 continue
         tid = tts_db.enqueue(batch_id, row["row"], row["text"], provider, voice,
                              row["product"], row["video_path"], row["video_type"],
-                             row["question_type"])
+                             row["question_type"], render_config=rc_json)
         enqueued.append({"tts_id": tid, "row": row["row"], "text": row["text"][:40]})
         if progress:
             progress(n, len(rows), f"Enqueue {n}/{len(rows)}")
