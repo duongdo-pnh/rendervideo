@@ -313,7 +313,7 @@ def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
 
 
 def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region,
-                 progress=gr.Progress()):
+                 dedup, progress=gr.Progress()):
     if not state or not state.get("rows"):
         raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
     rows = state["rows"]
@@ -327,7 +327,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
 
     enqueued, warnings, batch_id, skipped = excel_import.submit_jobs(
         rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"),
-        render_config=render_config)
+        render_config=render_config, dedup=bool(dedup))
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
              f"⚙️ Cấu hình render: **model {model} · {out_res} · "
              f"{'làm nét '+region if enhance_mouth else 'KHÔNG làm nét'} · guidance {guidance} · {steps} steps**.",
@@ -617,6 +617,9 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             xl_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
             xl_steps = gr.Slider(8, 50, value=20, step=1, label="Inference Steps")
             xl_seed = gr.Number(value=1247, label="Seed", precision=0)
+            xl_dedup = gr.Checkbox(
+                value=False,
+                label="Bỏ qua dòng đang chờ trùng (mặc định TẮT — KHÔNG tự loại tên giống nhau)")
 
         gr.Markdown("#### Import")
         xl_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
@@ -646,7 +649,8 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         # Submit: enqueue vào TTS queue (worker tự synth + đẩy render), refresh bảng trạng thái.
         xl_submit_btn.click(
             submit_excel,
-            [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed, xl_region],
+            [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed,
+             xl_region, xl_dedup],
             [xl_result, status_table, xl_batch_state])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)

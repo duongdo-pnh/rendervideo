@@ -305,7 +305,7 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
 # ----------------------------------------------------------------- enqueue vào TTS queue
 
 def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_path=None,
-                render_config=None):
+                render_config=None, dedup=False):
     """ENQUEUE mỗi dòng vào TTS queue bền vững (tts_jobs). KHÔNG gọi TTS tại chỗ —
     tts_worker.py sẽ synth (rate-limit + retry + adaptive throttle) rồi tạo render job.
 
@@ -325,7 +325,8 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
     rc_json = json.dumps(rc)
 
     enqueued, warnings, skipped = [], [], []
-    dedup = os.getenv("TTS_DEDUP", "1") != "0"      # chống trùng (tắt bằng TTS_DEDUP=0)
+    # dedup MẶC ĐỊNH TẮT: chỉ bỏ qua khi người dùng bật, và chỉ với dòng ĐANG trong hàng đợi
+    # (không chặn tên __ASK_* cố tình trùng, không chặn render lại nội dung đã xong).
     for n, row in enumerate(rows, 1):
         provider = row["tts_provider"] or DEFAULT_PROVIDER
         voice, warn = normalize_voice(provider, row["tts_voice"])
