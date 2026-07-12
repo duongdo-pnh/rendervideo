@@ -88,6 +88,7 @@ temp_*.wav
 *.sqlite3
 API_Shopee.txt
 .gpu.lock
+.queue_worker.lock
 *.env
 secrets*.py
 

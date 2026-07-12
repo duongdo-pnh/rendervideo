@@ -119,7 +119,9 @@ def claim_next_job():
             """
             UPDATE jobs
                SET status = 'rendering',
-                   started_at = datetime('now','localtime')
+                   started_at = datetime('now','localtime'),
+                   finished_at = NULL,
+                   error = NULL
              WHERE id = (
                    SELECT id FROM jobs
                     WHERE status = 'queued'

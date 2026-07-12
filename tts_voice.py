@@ -9,6 +9,7 @@ KHÔNG drop dòng: voice lạ vẫn được thay bằng default rồi chạy ti
 Trả (voice_id_chuẩn, warning|None).
 """
 import json
+import re
 from pathlib import Path
 
 _CONFIG_PATH = Path(__file__).parent / "tts_voice_config.json"
@@ -25,17 +26,32 @@ def _load():
     return _cache
 
 
+def _clean_voice(provider, voice):
+    v = str(voice).strip().strip("​‌‍﻿\xa0").strip() if voice else ""
+    if (provider or "").lower().strip() == "ausynclab":
+        # Excel/dropdown can store "1918847", "#1918847", "1918847.0",
+        # or a display label like "Nữ · Hamsa test · #1918847".
+        if re.fullmatch(r"\d+(\.0+)?", v):
+            return v.split(".", 1)[0]
+        m = re.search(r"#\s*(\d+)", v)
+        if m:
+            return m.group(1)
+    return v
+
+
 def normalize_voice(provider, voice):
     """-> (voice_id, warning). Không raise; provider không có config thì trả nguyên voice."""
-    cfg = _load().get((provider or "").lower().strip())
+    provider = (provider or "").lower().strip()
+    voice = _clean_voice(provider, voice)
+    cfg = _load().get(provider)
     if not cfg:
-        return (str(voice).strip() if voice else None), None
+        return (voice if voice else None), None
 
     default = cfg.get("default_voice_id") or None
     dep = cfg.get("deprecated_voice_map") or {}
     allow = cfg.get("allowed_voice_ids") or []
 
-    v = str(voice).strip() if voice else ""
+    v = voice
     if not v:
         return default, None
     if v in dep:

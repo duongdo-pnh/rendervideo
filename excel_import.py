@@ -32,21 +32,48 @@ TTS_AUDIO_DIR = ROOT / "uploads" / "tts"   # stable dir (uploads/ persists; pipe
 
 
 # Template đầy đủ (header dòng 1) — khớp file mẫu khách dùng. Hệ CHỈ xử lý các cột:
-#   product_name, subText, video_type, question_type, video_path(optional), tts_provider, tts_voice
+#   product_name, keyword, question_text, subText, video_type, question_type,
+#   other_key, video_path(optional), tts_provider, tts_voice
 #   -> render xong ghi ngược 'video_done' (đường dẫn local). Cột khác giữ nguyên, không xử lý.
-COLUMNS = ["product_name", "product_link", "product_info", "subText",
-           "video_type", "question_type", "video_path", "video_url",
+COLUMNS = ["product_name", "product_link", "product_info", "keyword",
+           "question_text", "subText", "video_type", "question_type", "other_key",
+           "video_path", "video_url",
            "video_done", "tts_provider", "tts_voice"]
 
 # Tên cột chấp nhận (alias) khi đọc — tương thích file cũ.
-COL_PRODUCT = ("product_name", "product")
-COL_TEXT = ("subText", "subtext", "text")
+COL_PRODUCT = (
+    "product_name", "product", "Sản phẩm", "San pham", "Tên sản phẩm", "Ten san pham",
+    "Danh sách sản phẩm", "Danh sach san pham", "Sản phẩm liên quan", "San pham lien quan",
+)
+COL_TEXT = ("subText", "subtext", "text", "Câu trả lời", "Cau tra loi", "answer")
+COL_QUESTION_TEXT = ("question_text", "question", "Câu hỏi", "Cau hoi")
+COL_KEYWORD = ("keyword", "Keyword")
+COL_OTHER_KEY = ("other_key", "other", "Other key", "ASK_OTHER key")
+COL_SCOPE = ("Loại", "Loai", "scope")
 
 # Giá trị cho dropdown trong file mẫu (data validation) — khách chọn, khỏi gõ sai.
 VIDEO_TYPE_OPTIONS = ["gioi_thieu", "tra_loi"]
-QUESTION_TYPE_OPTIONS = ["ASK_PRICE", "ASK_QUALITY", "ASK_USAGE", "ASK_STOCK", "ASK_BUY",
-                         "ASK_SHIPPING", "ASK_VOUCHER", "ASK_RETURN", "ASK_PRODUCT"]
-TTS_PROVIDER_OPTIONS = ["vbee", "ausynclab", "local"]
+QUESTION_TYPE_OPTIONS = [
+    "ASK_PRICE", "ASK_QUALITY", "ASK_USAGE", "ASK_STOCK", "ASK_BUY",
+    "ASK_SHIPPING", "ASK_VOUCHER", "ASK_RETURN", "ASK_PRODUCT",
+    "ASK_MATERIAL", "ASK_SIZE_FIT", "ASK_EXPIRY", "ASK_CHILDREN",
+    "ASK_COLOR", "ASK_CHECK", "ASK_OTHER",
+]
+TTS_PROVIDER_OPTIONS = ["vbee", "ausynclab", "autovoice", "local"]
+TTS_PROVIDER_ALIASES = {
+    "vbee": "vbee",
+    "ausynclab": "ausynclab",
+    "audiosynclab": "ausynclab",
+    "audio_sync_lab": "ausynclab",
+    "auto_voice": "autovoice",
+    "autovoice": "autovoice",
+    "voice_he_thong": "autovoice",
+    "voice_hethong": "autovoice",
+    "voice_system": "autovoice",
+    "system_voice": "autovoice",
+    "local": "local",
+    "offline": "local",
+}
 
 
 def _voice_options():
@@ -73,6 +100,16 @@ INTENT_MAP = {
     "voucher": "ASK_VOUCHER", "giam_gia": "ASK_VOUCHER", "khuyen_mai": "ASK_VOUCHER", "discount": "ASK_VOUCHER",
     "doi_tra": "ASK_RETURN", "return": "ASK_RETURN", "bao_hanh": "ASK_RETURN", "warranty": "ASK_RETURN",
     "san_pham": "ASK_PRODUCT", "product": "ASK_PRODUCT", "xem_sp": "ASK_PRODUCT",
+    "vat_lieu": "ASK_MATERIAL", "chat_lieu": "ASK_MATERIAL", "material": "ASK_MATERIAL",
+    "vai": "ASK_MATERIAL", "may_lop": "ASK_MATERIAL", "lop": "ASK_MATERIAL",
+    "quai_deo": "ASK_MATERIAL", "day_deo": "ASK_MATERIAL", "dau_tai": "ASK_MATERIAL",
+    "size_fit": "ASK_SIZE_FIT", "kich_thuoc": "ASK_SIZE_FIT", "can_nang": "ASK_SIZE_FIT",
+    "bao_nhieu_can": "ASK_SIZE_FIT", "form": "ASK_SIZE_FIT",
+    "han_su_dung": "ASK_EXPIRY", "hsd": "ASK_EXPIRY", "expiry": "ASK_EXPIRY",
+    "tre_em": "ASK_CHILDREN", "children": "ASK_CHILDREN", "kids": "ASK_CHILDREN",
+    "mau_sac": "ASK_COLOR", "mau": "ASK_COLOR", "mix_mau": "ASK_COLOR", "color": "ASK_COLOR",
+    "kiem_hang": "ASK_CHECK", "kiem_tra_hang": "ASK_CHECK", "check": "ASK_CHECK",
+    "khac": "ASK_OTHER", "other": "ASK_OTHER",
 }
 
 
@@ -113,19 +150,53 @@ def resolve_intent(question_type):
     return INTENT_MAP.get(key)
 
 
+def infer_intent(keyword=None, question_text=None):
+    """Đoán intent từ keyword/câu hỏi tự do của file khách. Không chắc thì trả None."""
+    question = _ascii(question_text)
+    key_text = _ascii(keyword)
+    rules = [
+        ("ASK_VOUCHER", ("voucher", "khuyen mai", "ma giam", "giam gia", "uu dai")),
+        ("ASK_PRICE", ("gia", "bao nhieu tien", "gia ban")),
+        ("ASK_SHIPPING", ("ship", "freeship", "mien phi ship", "giao hang")),
+        ("ASK_BUY", ("mua", "chot don", "dat hang", "bam gio")),
+        ("ASK_CHECK", ("kiem hang", "kiem tra hang")),
+        ("ASK_RETURN", ("doi tra", "tra hang", "hoan hang", "bao hanh")),
+        ("ASK_EXPIRY", ("han su dung", "hsd", "het han")),
+        ("ASK_CHILDREN", ("tre em", "em be", "cho be")),
+        ("ASK_COLOR", ("mau", "mix mau", "phoi mau")),
+        ("ASK_SIZE_FIT", ("bao nhieu can", "can nang", "form", "size", "kich thuoc", "deo vua")),
+        ("ASK_MATERIAL", ("may lop", "chat vai", "vai", "xu", "ngua", "quai", "day deo", "dau tai", "day tron", "day det")),
+        ("ASK_STOCK", ("con hang", "het hang", "con size")),
+        ("ASK_USAGE", ("cach dung", "su dung", "huong dan")),
+        ("ASK_QUALITY", ("chat luong", "chinh hang", "review", "co tot")),
+        ("ASK_PRODUCT", ("san pham", "thong tin")),
+    ]
+    # Câu hỏi thật cụ thể hơn keyword rộng kiểu "Giá bán & khuyến mãi"; ưu tiên nó trước.
+    for intent, needles in rules:
+        if any(n in question for n in needles):
+            return intent
+    for intent, needles in rules:
+        if any(n in key_text for n in needles):
+            return intent
+    return None
+
+
 # Chú thích từng cột (cell comment trong file mẫu). Chỉ các cột hệ DÙNG mới có hướng dẫn rõ.
 _COL_HELP = {
     "product_name": "TÊN SẢN PHẨM — đặt tên video. Để TRỐNG = câu trả lời CHUNG (tên '__ASK_*').",
     "product_link": "(Không bắt buộc, hệ không xử lý) link sản phẩm.",
     "product_info": "(Không bắt buộc, hệ không xử lý) mô tả sản phẩm.",
+    "keyword": "Nhóm câu hỏi khách/ops tự điền, ví dụ: Giá bán & khuyến mãi, Chất lượng...",
+    "question_text": "Câu hỏi thật khách sẽ hỏi trong live. Dùng để rà soát/map intent, không đem TTS.",
     "subText": "Script cần chuyển thành giọng nói (TTS). BẮT BUỘC.",
     "video_type": "Chọn từ dropdown: gioi_thieu (giới thiệu) hoặc tra_loi (trả lời câu hỏi).",
     "question_type": "CHỈ khi video_type = tra_loi — chọn loại câu hỏi (ASK_*) từ dropdown.",
+    "other_key": "Chỉ điền khi question_type=ASK_OTHER. Ví dụ: khautrang, combo_quatang.",
     "video_path": "Đường dẫn local video avatar (không bắt buộc). TRỐNG = dùng video mặc định.",
     "video_url": "(Hệ không xử lý) — để trống.",
     "video_done": "HỆ TỰ ĐIỀN sau khi render xong (đường dẫn local video). Khách để TRỐNG.",
-    "tts_provider": "Chọn từ dropdown: vbee / ausynclab / local. TRỐNG = mặc định.",
-    "tts_voice": "Chọn giọng từ dropdown. TRỐNG = giọng mặc định của provider.",
+    "tts_provider": "Chọn từ dropdown: vbee / ausynclab / autovoice / local. TRỐNG = mặc định.",
+    "tts_voice": "Chọn giọng từ dropdown hoặc nhập voice_name. TRỐNG = giọng mặc định của provider.",
 }
 
 # Default render config for jobs created from Excel (matches the web UI defaults).
@@ -174,10 +245,15 @@ def make_template(path, max_rows=1000):
     examples = [
         row(product_name="23525384022", subText="Chào cả nhà, hôm nay shop có sản phẩm cực hot!",
             video_type="gioi_thieu", tts_provider="vbee"),
-        row(product_name="23525384022", subText="Dạ giá chỉ 299k ạ, đang sale cực mạnh!",
+        row(product_name="23525384022", keyword="Giá bán & Chương trình khuyến mãi",
+            question_text="Giá của sản phẩm này là bao nhiêu?",
+            subText="Dạ giá chỉ 299k ạ, đang sale cực mạnh!",
             video_type="tra_loi", question_type="ASK_PRICE", tts_provider="vbee"),
-        row(product_name="set kep toc", subText="Bấm giỏ hàng chốt đơn ngay đi ạ!",
-            video_type="tra_loi", question_type="ASK_BUY", tts_provider="local"),
+        row(product_name="khau trang y te", keyword="Thông tin sản phẩm",
+            question_text="Khẩu trang có dùng được khi đi nắng không?",
+            subText="Dạ khẩu trang nhà em dùng thoải mái khi đi ngoài trời hằng ngày ạ.",
+            video_type="tra_loi", question_type="ASK_OTHER", other_key="khautrang",
+            tts_provider="local"),
     ]
     for r in examples:
         ws.append(r)
@@ -217,7 +293,22 @@ def _safe_stem(name):
     return re.sub(r"[^\w.-]+", "_", name) or "job"
 
 
-def build_name_excel(product, video_type, question_type):
+def _slug_key(value):
+    key = _ascii(value).replace(" ", "_").replace("-", "_")
+    key = re.sub(r"[^a-z0-9_]+", "_", key)
+    key = re.sub(r"_+", "_", key).strip("_")
+    return key or None
+
+
+def build_intent_name(question_type, other_key=None):
+    intent = resolve_intent(question_type)
+    if intent == "ASK_OTHER":
+        key = _slug_key(other_key)
+        return f"ASK_OTHER_{key}" if key else "ASK_OTHER"
+    return intent
+
+
+def build_name_excel(product, video_type, question_type, other_key=None, row=None):
     """Khớp 100% web_ui.build_name(): '<sản phẩm>__<ASK_*>' / '<sản phẩm>' / (sản phẩm rỗng) '__<ASK_*>'.
 
     product rỗng + trả lời -> '__ASK_*' = CÂU TRẢ LỜI CHUNG (không gắn sản phẩm cụ thể).
@@ -226,10 +317,11 @@ def build_name_excel(product, video_type, question_type):
     base = str(product).strip() if product else ""
     if is_intro(video_type, question_type):
         return base or "video"
-    intent = resolve_intent(question_type)
+    intent = build_intent_name(question_type, other_key)
     if not intent:
         return base or "video"
-    return f"{base}__{intent}" if base else f"__{intent}"
+    suffix = f"__{int(row):03d}" if row else ""
+    return f"{base}__{intent}{suffix}" if base else f"__{intent}{suffix}"
 
 
 # ----------------------------------------------------------------- read + validate
@@ -240,6 +332,14 @@ def _clean(val):
         return None
     s = str(val).strip()
     return s or None
+
+
+def normalize_provider(value):
+    if not value:
+        return None
+    key = _ascii(value).replace(" ", "_").replace("-", "_")
+    key = re.sub(r"_+", "_", key).strip("_")
+    return TTS_PROVIDER_ALIASES.get(key, str(value).strip())
 
 
 def _get(raw, names):
@@ -268,14 +368,21 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
             if not text:
                 raise ValueError("subText rỗng")
 
-            provider = _clean(raw.get("tts_provider")) or default_provider  # None -> factory default
+            provider = normalize_provider(_clean(raw.get("tts_provider"))) or default_provider  # None -> factory default
             voice = _clean(raw.get("tts_voice"))                            # None -> provider default
-            video_type = _clean(raw.get("video_type")) or "gioi_thieu"
-            question_type = _clean(raw.get("question_type")) or ""
+            keyword = _get(raw, COL_KEYWORD)
+            question_text = _get(raw, COL_QUESTION_TEXT)
+            other_key = _get(raw, COL_OTHER_KEY)
+            scope = _get(raw, COL_SCOPE)
+            question_type = _clean(raw.get("question_type")) or infer_intent(keyword, question_text) or ""
+            video_type = _clean(raw.get("video_type")) or ("tra_loi" if (question_type or question_text) else "gioi_thieu")
 
             # Tên sản phẩm/video: ưu tiên product_name (alias product) của dòng, else Item ID chung.
             # ĐƯỢC PHÉP rỗng -> câu trả lời CHUNG (tên '__ASK_*', không gắn sản phẩm cụ thể).
-            product = _get(raw, COL_PRODUCT) or (str(shopee_item_id).strip() if shopee_item_id else None)
+            is_common = _ascii(scope) in ("chung", "common", "global")
+            product = None if is_common else (
+                _get(raw, COL_PRODUCT) or (str(shopee_item_id).strip() if shopee_item_id else None)
+            )
 
             # Trả lời câu hỏi -> bắt buộc có loại câu hỏi hợp lệ (để dựng <sp>__ASK_*).
             if not is_intro(video_type, question_type):
@@ -284,6 +391,8 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
                 if resolve_intent(question_type) is None:
                     raise ValueError(f"question_type không hợp lệ: {question_type!r} "
                                      f"(dùng gia/mua/ship/... hoặc mã ASK_*).")
+                if resolve_intent(question_type) == "ASK_OTHER" and not _slug_key(other_key):
+                    raise ValueError("question_type='ASK_OTHER' cần điền other_key (vd: khautrang).")
 
             rows.append({
                 "row": excel_row,
@@ -291,6 +400,9 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
                 "video_path": video,
                 "video_type": video_type,
                 "question_type": question_type,
+                "keyword": keyword,
+                "question_text": question_text,
+                "other_key": other_key,
                 "text": text,
                 "tts_provider": provider,
                 "tts_voice": voice,
@@ -333,18 +445,22 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
         if warn:
             warnings.append({"row": row["row"], "warn": warn})
             _log_import_error(row["row"], f"voice guard: {warn}")
-        # Chống trùng: cùng (sản phẩm+loại+text) đã có job đang chờ/đang chạy/đã xong -> bỏ qua.
+        # Chống trùng: cùng (sản phẩm+loại+text) đã có job đang chờ/đang chạy -> bỏ qua.
         if dedup:
             dup = tts_db.find_duplicate(row["product"], row["video_type"],
-                                        row["question_type"], row["text"])
+                                        row["question_type"], row["text"],
+                                        other_key=row.get("other_key"))
             if dup:
                 skipped.append({"row": row["row"], "dup_id": dup,
                                 "name": build_name_excel(row["product"], row["video_type"],
-                                                         row["question_type"])})
+                                                         row["question_type"],
+                                                         row.get("other_key"), row["row"])})
                 continue
         tid = tts_db.enqueue(batch_id, row["row"], row["text"], provider, voice,
                              row["product"], row["video_path"], row["video_type"],
-                             row["question_type"], render_config=rc_json)
+                             row["question_type"], render_config=rc_json,
+                             keyword=row.get("keyword"), question_text=row.get("question_text"),
+                             other_key=row.get("other_key"))
         enqueued.append({"tts_id": tid, "row": row["row"], "text": row["text"][:40]})
         if progress:
             progress(n, len(rows), f"Enqueue {n}/{len(rows)}")
@@ -405,8 +521,12 @@ def export_results(batch_id, out_path=None):
         else:
             # fallback theo tên (dòng dedup-skip hoặc chưa join được)
             product = cell(r, "product_name") or cell(r, "product")
+            scope = cell(r, "Loại") or cell(r, "Loai") or cell(r, "scope")
+            if _ascii(scope) in ("chung", "common", "global"):
+                product = None
             nm = build_name_excel(product, cell(r, "video_type") or "gioi_thieu",
-                                  cell(r, "question_type") or "")
+                                  cell(r, "question_type") or "",
+                                  cell(r, "other_key") or cell(r, "other"), r)
             out = name_out.get(nm)
         if out:
             ws.cell(row=r, column=done_col, value=out)

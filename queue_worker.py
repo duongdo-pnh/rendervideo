@@ -7,6 +7,7 @@ copy result to downloads/ on success, else retry up to MAX_RETRIES then fail.
 The render runs as a subprocess (render_job.py) so a crash there never kills this loop.
 Run with:  conda activate latentsync && python queue_worker.py
 """
+import fcntl
 import os
 import shutil
 import signal
@@ -30,6 +31,7 @@ DOWNLOADS_DIR = db.RENDERS_DIR        # video render xong tự đổ ra Desktop 
 WORK_DIR = ROOT / "work"
 LOGS_DIR = ROOT / "logs"
 BACKUP_DIR = ROOT / "backups"
+WORKER_LOCK_PATH = ROOT / ".queue_worker.lock"
 
 POLL_SECONDS = 5            # idle poll interval when the queue is empty
 BACKUP_INTERVAL = 6 * 3600  # SQLite backup cadence
@@ -38,6 +40,7 @@ GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claimi
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
 
 _RUNNING = True
+_WORKER_LOCK_FILE = None
 
 
 def _log(msg):
@@ -47,6 +50,34 @@ def _log(msg):
 def _ensure_dirs():
     for d in (DOWNLOADS_DIR, WORK_DIR, LOGS_DIR, BACKUP_DIR):
         d.mkdir(parents=True, exist_ok=True)
+
+
+def _acquire_worker_lock():
+    """Allow exactly one queue worker for this project.
+
+    SQLite makes claiming a job atomic, but it intentionally does not limit the number of
+    consumers. Multiple workers therefore claim different jobs and launch render subprocesses
+    that wait on the same GPU lock. That wait used to count against each render timeout, which is
+    especially harmful for slower 512 jobs. Keep the lock file descriptor open for the lifetime
+    of this process; the OS releases the lock automatically if the worker exits or crashes.
+    """
+    global _WORKER_LOCK_FILE
+    lock_file = open(WORKER_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        _log(f"another queue worker is already running (pid={owner}); exiting")
+        return False
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    _WORKER_LOCK_FILE = lock_file
+    return True
 
 
 # ---------------------------------------------------------------- GPU health
@@ -114,17 +145,6 @@ def normalize_audio(src, work_dir):
     return dst
 
 
-def render_timeout(video_path, audio_path=None):
-    """Dynamic ceiling. The renderer extends the carrier to AUDIO length and (with mouth
-    enhancement) runs GFPGAN per frame, so the work scales with the LONGER of video/audio,
-    not the (possibly shorter, pre-extension) normalized video. Budget ~12x realtime plus a
-    fixed ~20min headroom for model load + scenedetect + normalize. 30-min clip -> ~6.3h."""
-    dur = _ffprobe_duration(video_path)
-    if audio_path:
-        dur = max(dur, _ffprobe_duration(audio_path))
-    return int(max(3600, dur * 12) + 1200)
-
-
 def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
     """If the carrier video is LONGER than the audio, stream-copy trim it to ~audio length BEFORE
     NVENC normalize, so we never re-encode (here + downscale + scenedetect downstream) the tail the
@@ -181,7 +201,19 @@ def _safe_name(name):
     # NFC: gộp dấu tổ hợp tiếng Việt (NFD) -> ký tự dựng sẵn, để isalnum() GIỮ được chữ có dấu
     # (không thì 'ả' = 'a'+dấu rời, dấu bị thay '_' -> tên nát kiểu 'Cha_o_chô_ng').
     name = unicodedata.normalize("NFC", name or "job")
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in name)[:60] or "job"
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in name)
+    if len(safe) <= 140:
+        return safe or "job"
+    if "__ASK_" in safe:
+        head, tail = safe.split("__ASK_", 1)
+        suffix = f"__ASK_{tail}"
+        keep_head = max(20, 140 - len(suffix))
+        return f"{head[:keep_head]}{suffix}"[:140] or "job"
+    if "__" in safe:
+        head, tail = safe.rsplit("__", 1)
+        keep_head = max(20, 140 - len(tail) - 2)
+        return f"{head[:keep_head]}__{tail}"[:140] or "job"
+    return safe[:140] or "job"
 
 
 def process_job(job):
@@ -197,8 +229,10 @@ def process_job(job):
     nv = normalize_video(src_video, work)
     na = normalize_audio(job["audio_path"], work)
     out_path = work / "out.mp4"
-    timeout = render_timeout(nv, na)
-    _log(f"job #{job_id} normalized; rendering (timeout {timeout//60}min) -> {log_path.name}")
+    # Do not impose a wall-clock limit. Long 512 renders can legitimately take many hours;
+    # killing a healthy subprocess because it crossed an estimate loses all completed work.
+    # A real crash still returns non-zero and is handled by the normal retry path.
+    _log(f"job #{job_id} normalized; rendering (no time limit) -> {log_path.name}")
 
     cmd = [
         sys.executable, str(ROOT / "render_job.py"),
@@ -209,7 +243,7 @@ def process_job(job):
         "--enhance_region", job["enhance_region"], "--out_res", job["out_res"],
     ]
     with open(log_path, "w") as lf:
-        proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, timeout=timeout)
+        proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
 
     if proc.returncode != 0 or not out_path.exists():
         tail = _tail(log_path)
@@ -243,8 +277,11 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    db.init_db()
     _ensure_dirs()
+    if not _acquire_worker_lock():
+        return
+
+    db.init_db()
     n = db.reset_stuck_jobs()
     if n:
         _log(f"requeued {n} stuck 'rendering' job(s) from a previous run")

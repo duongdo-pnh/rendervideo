@@ -32,6 +32,25 @@ _DONE_STATES = ("SUCCEED", "SUCCESS", "COMPLETED", "DONE", "COMPLETE")
 _FAIL_STATES = ("FAILED", "ERROR", "FAIL")
 
 
+def _float_value(value, default):
+    value = default if value is None or str(value).strip() == "" else value
+    return float(value)
+
+
+def _speed_value(value):
+    speed = _float_value(value, 1.2)
+    # AusyncLab docs define speed as 0.75-1.25. Keep bad env values from
+    # reaching the API and producing stretched/glitched audio.
+    return max(0.75, min(1.25, speed))
+
+
+def _api_speed_value(display_speed):
+    # The AusyncLab web UI displays 1.2x for fast speech, but the speech API
+    # records that same result when the request payload carries 0.8. Convert
+    # the operator-facing speed to the API-facing value.
+    return max(0.75, min(1.25, 2.0 - float(display_speed)))
+
+
 def _dig(obj, keys):
     if isinstance(obj, dict):
         for k in keys:
@@ -69,14 +88,20 @@ class AusynclabTTS(TTSProvider):
         self.get_path = os.getenv("AUSYNCLAB_GET_PATH", "/speech/{id}")
         self.voices_path = os.getenv("AUSYNCLAB_VOICES_PATH", "/voices/list")   # đúng theo docs
         self.language = language or os.getenv("AUSYNCLAB_LANGUAGE", "vi")
-        self.model = os.getenv("AUSYNCLAB_MODEL", "")                            # myna-1 / myna-1-turbo / myna-2
+        # Match AusyncLab web UI's "Myna v1 Pro Fast" model unless explicitly changed.
+        self.model = os.getenv("AUSYNCLAB_MODEL", "myna-1-turbo") or "myna-1-turbo"
         # callback_url BẮT BUỘC theo doc (ta poll, không dùng webhook) -> placeholder.
         self.callback_url = os.getenv("AUSYNCLAB_CALLBACK_URL", "https://example.com/ausynclab-callback")
-        self.speed = float(speed if speed is not None else os.getenv("AUSYNCLAB_SPEED", "1.0") or 1.0)
+        # Operator-facing speed follows TTS_SPEED unless AUSYNCLAB_SPEED is set.
+        # The API-facing value is inverted below to match AusyncLab web UI output.
+        self.speed = _speed_value(speed if speed is not None else (
+            os.getenv("AUSYNCLAB_SPEED") or os.getenv("TTS_SPEED")
+        ))
+        self.api_speed = _api_speed_value(self.speed)
         self.output_format = os.getenv("AUSYNCLAB_OUTPUT_FORMAT", "wav")         # audio_url trả WAV trực tiếp
-        self.timeout = float(timeout if timeout is not None else os.getenv("AUSYNCLAB_TIMEOUT", "60"))
-        self.poll_interval = float(os.getenv("AUSYNCLAB_POLL_INTERVAL", "1.0"))
-        self.req_timeout = float(os.getenv("AUSYNCLAB_REQUEST_TIMEOUT", "60"))   # per-HTTP-call timeout
+        self.timeout = _float_value(timeout if timeout is not None else os.getenv("AUSYNCLAB_TIMEOUT"), 180)
+        self.poll_interval = _float_value(os.getenv("AUSYNCLAB_POLL_INTERVAL"), 1.0)
+        self.req_timeout = _float_value(os.getenv("AUSYNCLAB_REQUEST_TIMEOUT"), 90)   # per-HTTP-call timeout
 
     def _headers(self, json_body=False):
         if not self.api_key:
@@ -143,7 +168,7 @@ class AusynclabTTS(TTSProvider):
             "text": text,
             "voice_id": self._coerce_voice(voice),
             "callback_url": self.callback_url,
-            "speed": self.speed,
+            "speed": self.api_speed,
             "language": self.language,
         }
         if self.model:
@@ -178,7 +203,7 @@ class AusynclabTTS(TTSProvider):
             if state in _FAIL_STATES:
                 raise AusynclabError(f"AusyncLab TTS thất bại: {str(res)[:200]}")
             time.sleep(self.poll_interval)
-        raise AusynclabError("AusyncLab TTS quá thời gian chờ.")
+        raise AusynclabError(f"AusyncLab TTS quá thời gian chờ ({int(self.timeout)}s, audio_id={audio_id}).")
 
     def _save_audio(self, content, output_path):
         want_wav = output_path.lower().endswith(".wav")

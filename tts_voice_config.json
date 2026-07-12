@@ -16,5 +16,10 @@
       "n_hanoi_male_thangchuyennghiep_advertise_vc",
       "n_hanoi_male_quangquangcao_advertise_vc"
     ]
+  },
+  "autovoice": {
+    "default_voice_id": "",
+    "deprecated_voice_map": {},
+    "allowed_voice_ids": []
   }
 }

@@ -12,20 +12,36 @@ import json
 import os
 import random
 import signal
+import subprocess
+import sys
 import time
 import uuid
+
+# Ensure ffprobe/ffmpeg from the current conda env are visible even when the
+# worker is launched directly by absolute python path.
+_envbin = os.path.dirname(sys.executable)
+if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
 import tts_db
 import tts_errors
 import database as db
 import excel_import as xi
-from latentsync.tts.factory import synthesize, DEFAULT_PROVIDER
+from latentsync.tts import factory
 
 POLL_SECONDS = 2.0
-MAX_CONCURRENT = int(os.getenv("AUSYNC_MAX_CONCURRENT", "1"))          # giữ 1: rate-limit an toàn
-MIN_INTERVAL = float(os.getenv("AUSYNC_MIN_INTERVAL_MS", "1300")) / 1000.0
-THROTTLED_INTERVAL = float(os.getenv("AUSYNC_THROTTLED_MS", "3000")) / 1000.0
-MAX_RETRY = int(os.getenv("AUSYNC_MAX_RETRY", "5"))
+
+
+def _num_env(name, default, cast=float):
+    value = os.getenv(name)
+    value = default if value is None or str(value).strip() == "" else value
+    return cast(value)
+
+
+MAX_CONCURRENT = _num_env("AUSYNC_MAX_CONCURRENT", 1, int)          # giữ 1: rate-limit an toàn
+MIN_INTERVAL = _num_env("AUSYNC_MIN_INTERVAL_MS", 1300) / 1000.0
+THROTTLED_INTERVAL = _num_env("AUSYNC_THROTTLED_MS", 3000) / 1000.0
+MAX_RETRY = _num_env("AUSYNC_MAX_RETRY", 5, int)
 BACKOFF = [2, 5, 10, 20, 30]      # giây theo lần retry (attempt_count); + jitter 0–1.5s
 
 _RUNNING = True
@@ -56,8 +72,38 @@ def _backoff_delay(attempt):
     return base + random.uniform(0, 1.5)     # jitter tránh nhiều dòng "tỉnh" cùng lúc
 
 
+def _audio_duration(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float((out.stdout or "").strip() or 0)
+    except Exception:
+        return 0.0
+
+
+def _validate_tts_audio(job, audio_path):
+    duration = _audio_duration(audio_path)
+    if duration <= 0:
+        raise RuntimeError("TTS tạo audio nhưng không đọc được duration.")
+
+    # Guard against provider glitches: a short live sentence should not become
+    # a 2-minute audio with long gaps. Keep the threshold loose for normal long scripts.
+    text_len = len(job["text"] or "")
+    max_expected = max(45.0, text_len / 4.0)
+    if duration > max_expected:
+        raise RuntimeError(
+            f"TTS audio bất thường: dài {duration:.1f}s cho {text_len} ký tự "
+            f"(ngưỡng {max_expected:.1f}s). Không đẩy qua render."
+        )
+    return duration
+
+
 def _process(job):
-    provider = job["provider"] or DEFAULT_PROVIDER
+    factory.reload_config()
+    provider = job["provider"] or factory.DEFAULT_PROVIDER
     attempt = job["attempt_count"]
 
     if not _gate(provider):
@@ -67,10 +113,11 @@ def _process(job):
 
     audio_path = str(xi.TTS_AUDIO_DIR / f"tts_{job['id']}_{uuid.uuid4().hex[:8]}.wav")
     try:
-        synthesize(text=job["text"], output_path=audio_path,
-                   provider=provider, voice=job["voice_id"])
+        factory.synthesize(text=job["text"], output_path=audio_path,
+                           provider=provider, voice=job["voice_id"])
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             raise RuntimeError("TTS không tạo được file audio.")
+        duration = _validate_tts_audio(job, audio_path)
     except Exception as e:
         retryable = tts_errors.is_retryable(e)
         if tts_errors.parse_status(e) == 429:
@@ -88,7 +135,8 @@ def _process(job):
 
     # TTS xong -> tạo render job trong hàng đợi GPU (dùng cấu hình render của batch nếu có)
     tts_db.note_success(provider)
-    name = xi.build_name_excel(job["product"], job["video_type"], job["question_type"])
+    name = xi.build_name_excel(job["product"], job["video_type"], job["question_type"],
+                               job.get("other_key"), job.get("excel_row"))
     cfg = dict(xi.RENDER_DEFAULTS)
     if job.get("render_config"):
         try:
@@ -97,7 +145,7 @@ def _process(job):
             pass
     render_id = db.add_job(name, job["video_path"], audio_path, **cfg)
     tts_db.mark_done(job["id"], audio_path, render_id)
-    _log(f"#{job['id']} DONE -> render job #{render_id} ('{name}')")
+    _log(f"#{job['id']} DONE ({duration:.1f}s) -> render job #{render_id} ('{name}')")
 
 
 def main():

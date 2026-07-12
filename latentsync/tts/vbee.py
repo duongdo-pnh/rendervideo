@@ -29,6 +29,11 @@ VOICES_URL = "https://vbee.vn/api/public/v1/voices"
 OWNERSHIPS = ("VBEE", "PERSONAL", "COMMUNITY")
 
 
+def _float_value(value, default):
+    value = default if value is None or str(value).strip() == "" else value
+    return float(value)
+
+
 class VbeeError(RuntimeError):
     def __init__(self, message, status_code=None, retry_after=None):
         super().__init__(message)
@@ -57,10 +62,12 @@ class VbeeTTS(TTSProvider):
         # webhookUrl BẮT BUỘC & phải khác rỗng. Nếu .env lưu rỗng -> rơi về placeholder.
         self.webhook_url = (webhook_url or (os.getenv("VBEE_WEBHOOK_URL") or "").strip()
                             or "https://example.com/vbee-callback")
-        self.speed = float(speed if speed is not None else os.getenv("VBEE_SPEED", "1.0") or 1.0)
+        self.speed = _float_value(speed if speed is not None else (
+            os.getenv("VBEE_SPEED") or os.getenv("TTS_SPEED")
+        ), 1.2)
         self.output_format = os.getenv("VBEE_OUTPUT_FORMAT", "mp3")
-        self.timeout = float(timeout if timeout is not None else os.getenv("VBEE_TIMEOUT", "60"))
-        self.poll_interval = float(os.getenv("VBEE_POLL_INTERVAL", "1.0"))
+        self.timeout = _float_value(timeout if timeout is not None else os.getenv("VBEE_TIMEOUT"), 60)
+        self.poll_interval = _float_value(os.getenv("VBEE_POLL_INTERVAL"), 1.0)
         self.tts_url = os.getenv("VBEE_API_URL", TTS_URL)
         self.status_url = os.getenv("VBEE_STATUS_URL", STATUS_URL)
         self.voices_url = os.getenv("VBEE_VOICES_URL", VOICES_URL)

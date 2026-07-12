@@ -69,28 +69,56 @@ INTENT_CHOICES = [
     ("Voucher / giảm giá", "ASK_VOUCHER"),
     ("Đổi trả / bảo hành", "ASK_RETURN"),
     ("Xem sản phẩm", "ASK_PRODUCT"),
+    ("Chất liệu / lớp / quai đeo", "ASK_MATERIAL"),
+    ("Size / form / cân nặng", "ASK_SIZE_FIT"),
+    ("Hạn sử dụng", "ASK_EXPIRY"),
+    ("Dành cho trẻ em", "ASK_CHILDREN"),
+    ("Màu sắc / mix màu", "ASK_COLOR"),
+    ("Kiểm hàng", "ASK_CHECK"),
+    ("Khác (other_key)", "ASK_OTHER"),
 ]
 
 
-def build_name(product, kind, intent):
+def _slug_key(value):
+    key = excel_import._ascii(value).replace(" ", "_").replace("-", "_")
+    key = re.sub(r"[^a-z0-9_]+", "_", key)
+    key = re.sub(r"_+", "_", key).strip("_")
+    return key or None
+
+
+def _manual_intent(intent, other_key=None):
+    if intent == "ASK_OTHER":
+        key = _slug_key(other_key)
+        return f"ASK_OTHER_{key}" if key else "ASK_OTHER"
+    return intent
+
+
+def build_name(product, kind, intent, other_key=None):
     """Dựng tên chuẩn từ ô nhập: '<sản phẩm>__<INTENT>' (Trả lời) hoặc '<sản phẩm>' (Giới thiệu)."""
     product = (product or "").strip()
     if kind == KIND_ANSWER and intent:
+        intent = _manual_intent(intent, other_key)
         return f"{product}__{intent}" if product else f"__{intent}"
     return product or "video"
 
 
-def name_preview(product, kind, intent):
-    return f"📄 Tên file xuất: **{_safe_stem(build_name(product, kind, intent))}.mp4**"
+def name_preview(product, kind, intent, other_key=None):
+    return f"📄 Tên file xuất: **{_safe_stem(build_name(product, kind, intent, other_key))}.mp4**"
+
+
+def other_key_visibility(kind, intent):
+    return gr.update(visible=(kind == KIND_ANSWER and intent == "ASK_OTHER"))
 
 
 # ---------------------------------------------------------------- Thêm vào queue
 
-def add_to_queue(video_path, audio_path, product, kind, intent, model_res, guidance, steps, seed,
+def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model_res, guidance, steps, seed,
                  enhance_mouth, enhance_region, out_res):
     if not video_path or not audio_path:
         raise gr.Error("Cần cả video và audio.")
-    name = build_name(product, kind, intent)   # tên chuẩn <sp>__<INTENT>
+    if kind == KIND_ANSWER and intent == "ASK_OTHER" and not _slug_key(other_key):
+        raise gr.Error("Chọn ASK_OTHER thì cần điền other_key, ví dụ: khautrang.")
+    name = build_name(product, kind, intent, other_key)   # tên chuẩn <sp>__<INTENT>
     job_dir = UPLOADS_DIR / uuid.uuid4().hex[:12]
     job_dir.mkdir(parents=True, exist_ok=True)
     # Copy uploads tới chỗ ổn định (file temp của Gradio bị dọn khi thoát).
@@ -198,7 +226,12 @@ def _cleanup_job_files(row):
     """Best-effort: dọn file input đã upload của job (GIỮ lại video kết quả trên Desktop)."""
     try:
         vp = Path(row.get("video_path") or "")
-        if vp.exists() and UPLOADS_DIR in vp.parents:   # uploads/<hex>/video.ext -> xóa cả thư mục tạm
+        if (
+            vp.exists()
+            and UPLOADS_DIR in vp.parents
+            and vp.parent.parent == UPLOADS_DIR
+            and vp.parent.name not in {"videos", "tts"}
+        ):   # uploads/<hex>/video.ext -> xóa cả thư mục tạm; không xóa uploads/videos hoặc uploads/tts
             shutil.rmtree(vp.parent, ignore_errors=True)
     except Exception:
         pass
@@ -258,11 +291,15 @@ def update_voice_choices(provider):
 def _preview_rows_table(rows, errors, shopee_item_id=None):
     table = []
     for r in rows:
-        out_name = excel_import.build_name_excel(r["product"], r["video_type"], r["question_type"])
-        table.append([r["row"], r["product"] or "(chung)", Path(r["video_path"]).name, r["video_type"],
-                      out_name + ".mp4", r["tts_provider"] or "(mặc định)", "✅ Ready"])
+        out_name = excel_import.build_name_excel(
+            r["product"], r["video_type"], r["question_type"], r.get("other_key"), r["row"])
+        table.append([r["row"], r["product"] or "(chung)",
+                      r.get("keyword") or "", r["question_type"] or "",
+                      r.get("other_key") or "", r.get("question_text") or "",
+                      Path(r["video_path"]).name, out_name + ".mp4",
+                      r["tts_provider"] or "(mặc định)", "✅ Ready"])
     for e in errors:
-        table.append([e["row"], "—", "—", "—", "—", "—", f"❌ {e['error']}"])
+        table.append([e["row"], "—", "—", "—", "—", "—", "—", "—", "—", f"❌ {e['error']}"])
     return table
 
 
@@ -334,7 +371,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
     if skipped:
-        lines.append(f"\n⏭ **Bỏ qua {len(skipped)} dòng TRÙNG** (đã có job chờ/đang chạy/đã xong — "
+        lines.append(f"\n⏭ **Bỏ qua {len(skipped)} dòng TRÙNG** (đã có job chờ/đang chạy — "
                      "tránh render lại cùng nội dung):")
         for s in skipped[:15]:
             lines.append(f"- dòng {s['row']}: '{s['name']}' (trùng tts#{s['dup_id']})")
@@ -393,14 +430,30 @@ def requeue_dead_letter():
 # ---------------------------------------------------------------- Tab Cấu hình TTS
 
 def save_tts_config(default_provider, *vals):
-    """Lưu cấu hình 4 provider vào .env + áp dụng ngay (reset factory). Outputs: [status_md, provider_dropdowns...]."""
+    """Lưu cấu hình TTS vào .env + áp dụng ngay (reset factory). Outputs: [status_md, provider_dropdowns...]."""
     values = dict(zip(tts_config.ALL_KEYS, vals))
     providers = tts_config.save_config(values, default_provider)
     md = "### ✅ Đã lưu cấu hình TTS\n\n" + tts_config.status_markdown(providers)
     # Cập nhật lại dropdown provider mặc định ở tab Import (nhãn (chưa cấu hình) có thể đổi).
     choices = [(f"{p['label']}{'' if p['enabled'] else ' (chưa cấu hình)'}", p["name"]) for p in providers]
+    fresh = tts_config.current_values()
+    input_updates = [
+        gr.update(value=fresh.get(k, "") or ("1.2" if k == "TTS_SPEED" else ""))
+        for k in tts_config.ALL_KEYS
+    ]
     gr.Info("Đã lưu .env và áp dụng cấu hình TTS.")
-    return md, gr.update(choices=choices, value=default_provider)
+    return md, gr.update(choices=choices, value=default_provider), gr.update(value=default_provider), *input_updates
+
+
+def load_tts_config_form():
+    """Refresh config form values from .env on browser load/reload."""
+    fresh = tts_config.current_values()
+    default_provider = tts_config.current_default_provider()
+    input_updates = [
+        gr.update(value=fresh.get(k, "") or ("1.2" if k == "TTS_SPEED" else ""))
+        for k in tts_config.ALL_KEYS
+    ]
+    return gr.update(value=default_provider), *input_updates, tts_config.status_markdown()
 
 
 def vbee_connect(app_id, token):
@@ -458,6 +511,37 @@ def ausynclab_test(api_key, voice, text):
     return out
 
 
+def autovoice_connect(api_key, url, voices_url):
+    """Tai danh sach voice he thong neu endpoint /voices san sang."""
+    from latentsync.tts.autovoice import AutoVoiceTTS
+    try:
+        voices = AutoVoiceTTS(api_key=api_key, url=url or None, voices_url=voices_url or None).fetch_voices()
+    except Exception as e:
+        raise gr.Error(f"Kết nối Voice hệ thống lỗi: {e}")
+    choices = []
+    for v in voices:
+        if not v.get("code"):
+            continue
+        meta = " · ".join(x for x in (v.get("language"), v.get("gender")) if x)
+        label = f"{v.get('name') or 'voice'}" + (f" ({meta})" if meta else "") + f" · #{v['code']}"
+        choices.append((label, v["code"]))
+    gr.Info(f"Đã tải {len(choices)} voice hệ thống.")
+    return gr.update(choices=choices, value=(choices[0][1] if choices else None)), f"✅ Tải **{len(choices)}** voice."
+
+
+def autovoice_test(api_key, voice, url, speed, text):
+    from latentsync.tts.autovoice import AutoVoiceTTS
+    if not (text or "").strip():
+        raise gr.Error("Nhập câu cần đọc thử.")
+    out = str(UPLOADS_DIR / "autovoice_test.wav")
+    try:
+        AutoVoiceTTS(api_key=api_key, default_voice=voice or None,
+                     url=url or None, speed=(speed or None)).synthesize(text, out, voice or None)
+    except Exception as e:
+        raise gr.Error(f"Nghe thử lỗi: {e}")
+    return out
+
+
 CSS = """
 #name-box {
   border: 2px solid #f59e0b;
@@ -492,7 +576,11 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                                            label="Loại video", scale=2)
                         intent_in = gr.Dropdown(choices=INTENT_CHOICES, label="Câu hỏi (khi Trả lời)",
                                                 visible=False, scale=2)
-                    name_preview_md = gr.Markdown(name_preview("", KIND_INTRO, None),
+                    other_key_in = gr.Textbox(
+                        label="Other key (khi chọn ASK_OTHER)",
+                        placeholder="vd: khautrang, combo_quatang",
+                        visible=False)
+                    name_preview_md = gr.Markdown(name_preview("", KIND_INTRO, None, None),
                                                   elem_id="name-preview")
 
                 with gr.Row():
@@ -529,15 +617,18 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                 result_dl = gr.File(label="Tải về", value=_path0)
                 result_refresh = gr.Button("🔄 Cập nhật danh sách (hiện video mới render xong)")
 
-        cfg_inputs = [video_in, audio_in, product_in, kind_in, intent_in, model_in, guidance_in,
+        cfg_inputs = [video_in, audio_in, product_in, kind_in, intent_in, other_key_in, model_in, guidance_in,
                       steps_in, seed_in, enhance_mouth_in, region_in, out_res_in]
         # Hiện ô câu hỏi chỉ khi chọn "Trả lời".
         kind_in.change(lambda k: gr.update(visible=(k == KIND_ANSWER)), kind_in, intent_in)
+        kind_in.change(other_key_visibility, [kind_in, intent_in], other_key_in)
+        intent_in.change(other_key_visibility, [kind_in, intent_in], other_key_in)
         # Preview tên file xuất cập nhật TRỰC TIẾP khi gõ tên / đổi loại / đổi câu hỏi.
-        _name_inputs = [product_in, kind_in, intent_in]
+        _name_inputs = [product_in, kind_in, intent_in, other_key_in]
         product_in.input(name_preview, _name_inputs, name_preview_md)
         kind_in.change(name_preview, _name_inputs, name_preview_md)
         intent_in.change(name_preview, _name_inputs, name_preview_md)
+        other_key_in.input(name_preview, _name_inputs, name_preview_md)
         # Cả HAI nút đều ĐẨY VÀO HÀNG ĐỢI (worker render nền, tuần tự — không còn render in-process
         # nên không tranh GPU). Báo NGAY "đang thêm" rồi mới copy file + thêm DB (kèm toast).
         render_btn.click(lambda: "⏳ Đang thêm vào hàng đợi…", None, msg).then(add_to_queue, cfg_inputs, msg)
@@ -618,8 +709,8 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             xl_steps = gr.Slider(8, 50, value=20, step=1, label="Inference Steps")
             xl_seed = gr.Number(value=1247, label="Seed", precision=0)
             xl_dedup = gr.Checkbox(
-                value=False,
-                label="Bỏ qua dòng đang chờ trùng (mặc định TẮT — KHÔNG tự loại tên giống nhau)")
+                value=True,
+                label="Bỏ qua dòng đang chờ trùng (chống bấm Submit/import lặp)")
 
         gr.Markdown("#### Import")
         xl_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
@@ -628,8 +719,9 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             xl_submit_btn = gr.Button("🚀 Submit các job sẵn sàng", variant="primary")
         xl_summary = gr.Markdown()
         xl_table = gr.Dataframe(
-            headers=["Row", "Sản phẩm", "Video", "Type", "Tên xuất (.mp4)", "Provider", "Status"],
-            datatype=["number", "str", "str", "str", "str", "str", "str"],
+            headers=["Row", "Sản phẩm", "Keyword", "ASK", "Other key", "Câu hỏi",
+                     "Video", "Tên xuất (.mp4)", "Provider", "Status"],
+            datatype=["number", "str", "str", "str", "str", "str", "str", "str", "str", "str"],
             interactive=False, wrap=True)
         xl_state = gr.State()
         xl_batch_state = gr.State()          # batch_id của lần submit gần nhất (để xuất kết quả)
@@ -658,9 +750,9 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
-            "### Cấu hình 4 loại TTS\n"
+            "### Cấu hình TTS\n"
             "Điền API key / URL / giọng cho từng provider rồi **Lưu** — ghi vào `.env` và "
-            "áp dụng ngay (không cần restart). Provider 'local' chạy offline, không cần key.")
+            "áp dụng ngay (không cần restart). Tốc độ đọc chung mặc định là **1.2**.")
         cfg_status = gr.Markdown(tts_config.status_markdown())
 
         cfg_default = gr.Dropdown(
@@ -671,6 +763,17 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         _cur = tts_config.current_values()
         cfg_inputs = []          # giữ ĐÚNG THỨ TỰ tts_config.ALL_KEYS để map khi lưu
         cfg_comp = {}            # key -> component, để wire nút Vbee
+
+        with gr.Accordion("⚙️ Cấu hình chung", open=True):
+            with gr.Row():
+                for key, label, secret in tts_config.COMMON_FIELDS:
+                    box = gr.Textbox(
+                        label=label, value=_cur.get(key, "") or ("1.2" if key == "TTS_SPEED" else ""),
+                        type=("password" if secret else "text"),
+                        placeholder=key)
+                    cfg_inputs.append(box)
+                    cfg_comp[key] = box
+
         for prov, fields in tts_config.PROVIDER_FIELDS.items():
             with gr.Accordion(f"🔊 {tts_config.PROVIDER_LABELS[prov]}", open=(prov in ("vbee", "ausynclab"))):
                 with gr.Row():
@@ -715,17 +818,46 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                                        [cfg_comp["AUSYNCLAB_API_KEY"],
                                         cfg_comp["AUSYNCLAB_DEFAULT_VOICE"], aus_test_text],
                                        aus_test_audio)
+                # Voice he thong: co the tai danh sach voice neu endpoint ho tro, hoac nhap tay voice_name.
+                if prov == "autovoice":
+                    with gr.Row():
+                        autovoice_load_btn = gr.Button("🔌 Kết nối & tải giọng")
+                        autovoice_status = gr.Markdown()
+                    autovoice_voices_dd = gr.Dropdown(
+                        label="Voice hệ thống (chọn hoặc nhập voice_name)",
+                        choices=[],
+                        value=_cur.get("AUTOVOICE_DEFAULT_VOICE", ""),
+                        allow_custom_value=True)
+                    with gr.Row():
+                        autovoice_test_text = gr.Textbox(label="Nghe thử câu nói",
+                                                         value="Xin chào, đây là giọng đọc thử.")
+                        autovoice_test_btn = gr.Button("▶ Nghe thử")
+                    autovoice_test_audio = gr.Audio(label="Kết quả nghe thử", type="filepath")
+                    autovoice_load_btn.click(
+                        autovoice_connect,
+                        [cfg_comp["AUTOVOICE_API_KEY"], cfg_comp["AUTOVOICE_URL"],
+                         cfg_comp["AUTOVOICE_VOICES_URL"]],
+                        [autovoice_voices_dd, autovoice_status])
+                    autovoice_voices_dd.change(lambda v: gr.update(value=v),
+                                               autovoice_voices_dd,
+                                               cfg_comp["AUTOVOICE_DEFAULT_VOICE"])
+                    autovoice_test_btn.click(
+                        autovoice_test,
+                        [cfg_comp["AUTOVOICE_API_KEY"], cfg_comp["AUTOVOICE_DEFAULT_VOICE"],
+                         cfg_comp["AUTOVOICE_URL"], cfg_comp["AUTOVOICE_SPEED"],
+                         autovoice_test_text],
+                        autovoice_test_audio)
         cfg_save = gr.Button("💾 Lưu cấu hình TTS", variant="primary")
         # Lưu: ghi .env + reset factory; cập nhật bảng trạng thái + dropdown provider ở tab Import.
         cfg_save.click(save_tts_config, [cfg_default, *cfg_inputs],
-                       [cfg_status, xl_default_provider])
+                       [cfg_status, xl_default_provider, cfg_default, *cfg_inputs])
 
     # Khi mở/refresh trang: nạp bảng + danh sách video; khu Tab 1 tự hiện video mới nhất.
     demo.load(refresh_status, outputs=[status_table, done_dd])
     demo.load(load_video_area, outputs=[result_dd, result_video, result_dl])
     demo.load(tts_status_md, outputs=xl_tts_status)
-    # Trạng thái cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
-    demo.load(lambda: tts_config.status_markdown(), outputs=cfg_status)
+    # Form cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
+    demo.load(load_tts_config_form, outputs=[cfg_default, *cfg_inputs, cfg_status])
 
 
 if __name__ == "__main__":

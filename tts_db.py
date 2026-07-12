@@ -59,10 +59,11 @@ def init_db():
         con.execute(
             "CREATE INDEX IF NOT EXISTS idx_tts_status_next ON tts_jobs(status, next_attempt_at, id)"
         )
-        # Migrate: cấu hình render (JSON) lưu kèm mỗi job để worker tạo render đúng cấu hình batch.
+        # Migrate: cấu hình render + metadata FAQ lưu kèm mỗi job.
         cols = {r["name"] for r in con.execute("PRAGMA table_info(tts_jobs)")}
-        if "render_config" not in cols:
-            con.execute("ALTER TABLE tts_jobs ADD COLUMN render_config TEXT")
+        for col in ("render_config", "keyword", "question_text", "other_key"):
+            if col not in cols:
+                con.execute(f"ALTER TABLE tts_jobs ADD COLUMN {col} TEXT")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS tts_batch (
@@ -122,27 +123,31 @@ def results_for_batch(batch_id):
 # ------------------------------------------------------------------ enqueue / claim
 
 def enqueue(batch_id, excel_row, text, provider, voice_id,
-            product, video_path, video_type, question_type, render_config=None):
+            product, video_path, video_type, question_type, render_config=None,
+            keyword=None, question_text=None, other_key=None):
     with _connect() as con:
         cur = con.execute(
             """
             INSERT INTO tts_jobs (batch_id, excel_row, text, provider, voice_id,
-                                  product, video_path, video_type, question_type, render_config)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  product, video_path, video_type, question_type, render_config,
+                                  keyword, question_text, other_key)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (batch_id, excel_row, text, provider, voice_id,
-             product, str(video_path), video_type, question_type, render_config),
+             product, str(video_path), video_type, question_type, render_config,
+             keyword, question_text, other_key),
         )
         return cur.lastrowid
 
 
-# Chỉ chống "bấm trùng / re-import khi job CŨ CÒN TRONG HÀNG ĐỢI" — KHÔNG chặn render lại
-# nội dung đã 'done' (cho phép cố tình làm lại). Bỏ failed_* để import lại dòng từng lỗi.
+# Chống "bấm trùng / re-import" khi job cùng nội dung vẫn đang trong hàng đợi.
+# Không chặn job đã done để người dùng vẫn có thể cố tình render lại khi tắt dedup.
+# Bỏ failed_* để import lại dòng từng lỗi.
 DEDUP_STATUSES = ("pending", "submitting", "retry_wait")
 
 
-def find_duplicate(product, video_type, question_type, text, statuses=DEDUP_STATUSES):
-    """Trả id tts_job trùng (cùng sản phẩm + loại + text) ĐANG trong hàng đợi, else None."""
+def find_duplicate(product, video_type, question_type, text, statuses=DEDUP_STATUSES, other_key=None):
+    """Trả id tts_job trùng (cùng sản phẩm + loại + other_key + text) ĐANG trong hàng đợi."""
     ph = ",".join("?" * len(statuses))
     with _connect() as con:
         r = con.execute(
@@ -150,9 +155,10 @@ def find_duplicate(product, video_type, question_type, text, statuses=DEDUP_STAT
                  WHERE COALESCE(product,'')=COALESCE(?,'')
                    AND COALESCE(video_type,'')=COALESCE(?,'')
                    AND COALESCE(question_type,'')=COALESCE(?,'')
+                   AND COALESCE(other_key,'')=COALESCE(?,'')
                    AND text=? AND status IN ({ph})
                  LIMIT 1""",
-            (product, video_type, question_type, text, *statuses),
+            (product, video_type, question_type, other_key, text, *statuses),
         ).fetchone()
         return r["id"] if r else None
 
