@@ -38,6 +38,8 @@ BACKUP_INTERVAL = 6 * 3600  # SQLite backup cadence
 BACKUP_KEEP = 8             # keep this many most-recent backups
 GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claiming a job
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
+RENDER_IDLE_TIMEOUT = 20 * 60  # no new log output this long means the renderer is genuinely stuck
+RENDER_POLL_SECONDS = 5
 
 _RUNNING = True
 _WORKER_LOCK_FILE = None
@@ -145,6 +147,57 @@ def normalize_audio(src, work_dir):
     return dst
 
 
+def _stop_process_tree(proc):
+    """Stop the render process group, including ffmpeg children, without leaving GPU users."""
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        proc.wait()
+    except ProcessLookupError:
+        pass
+
+
+def _run_render(cmd, log_path, idle_timeout=RENDER_IDLE_TIMEOUT):
+    """Run a render while distinguishing slow-but-progressing work from a real stall."""
+    last_progress = time.monotonic()
+    last_size = -1
+
+    with open(log_path, "w") as lf:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=lf,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            while True:
+                returncode = proc.poll()
+                if returncode is not None:
+                    return returncode
+
+                now = time.monotonic()
+                try:
+                    size = log_path.stat().st_size
+                except OSError:
+                    size = 0
+                if size != last_size:
+                    last_size = size
+                    last_progress = now
+
+                if now - last_progress > idle_timeout:
+                    raise RuntimeError(
+                        f"render stalled: no log progress for {idle_timeout // 60} minutes"
+                    )
+                time.sleep(RENDER_POLL_SECONDS)
+        except BaseException:
+            _stop_process_tree(proc)
+            raise
+
+
 def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
     """If the carrier video is LONGER than the audio, stream-copy trim it to ~audio length BEFORE
     NVENC normalize, so we never re-encode (here + downscale + scenedetect downstream) the tail the
@@ -231,8 +284,11 @@ def process_job(job):
     out_path = work / "out.mp4"
     # Do not impose a wall-clock limit. Long 512 renders can legitimately take many hours;
     # killing a healthy subprocess because it crossed an estimate loses all completed work.
-    # A real crash still returns non-zero and is handled by the normal retry path.
-    _log(f"job #{job_id} normalized; rendering (no time limit) -> {log_path.name}")
+    # A stalled subprocess is still stopped if it stops writing logs for too long.
+    _log(
+        f"job #{job_id} normalized; rendering "
+        f"(no time limit, stall {RENDER_IDLE_TIMEOUT//60}min) -> {log_path.name}"
+    )
 
     cmd = [
         sys.executable, str(ROOT / "render_job.py"),
@@ -241,13 +297,13 @@ def process_job(job):
         "--guidance", str(job["guidance"]), "--steps", str(job["steps"]),
         "--seed", str(job["seed"]), "--enhance_mouth", str(job["enhance_mouth"]),
         "--enhance_region", job["enhance_region"], "--out_res", job["out_res"],
+        "--input_type", job.get("input_type", "real"),
     ]
-    with open(log_path, "w") as lf:
-        proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT)
+    returncode = _run_render(cmd, log_path)
 
-    if proc.returncode != 0 or not out_path.exists():
+    if returncode != 0 or not out_path.exists():
         tail = _tail(log_path)
-        raise RuntimeError(f"render rc={proc.returncode}; log tail:\n{tail}")
+        raise RuntimeError(f"render rc={returncode}; log tail:\n{tail}")
 
     # Point 4: download ra ĐÚNG TÊN nhập (tên này = khóa match khi import sang hệ live).
     dst = DOWNLOADS_DIR / f"{_safe_name(job['name'])}.mp4"

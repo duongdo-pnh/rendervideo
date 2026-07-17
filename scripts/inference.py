@@ -105,6 +105,7 @@ def main(config, args):
         height=config.data.resolution,
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
+        chunk_overlap=int(config.run.get("chunk_overlap", 4)),
     )
 
 

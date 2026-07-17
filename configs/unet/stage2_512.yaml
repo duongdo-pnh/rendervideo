@@ -30,6 +30,7 @@ run:
   guidance_scale: 1.5 # [1.0 - 3.0]
   trepa_loss_weight: 10
   inference_steps: 20
+  chunk_overlap: 4 # overlap adjacent 16-frame windows and cosine-blend their predictions
   trainable_modules:
     - motion_modules.
     - attentions.

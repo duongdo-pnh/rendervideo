@@ -1,0 +1,16 @@
+[Unit]
+Description=LatentSync Render Queue Worker
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/byscom/Latentsync/rendervideo
+ExecStart=/home/byscom/Latentsync/rendervideo/venv/bin/python /home/byscom/Latentsync/rendervideo/queue_worker.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+TimeoutStopSec=120
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

@@ -184,7 +184,7 @@ def color_correct_mouth(rendered, carrier, out, feather=25, curve_smooth=0.6,
          "-s", f"{W}x{H}", "-framerate", f"{fps}", "-i", "-",
          "-i", rendered, "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-crf", "16",
          "-preset", "slow", "-pix_fmt", "yuv420p", "-color_primaries", "bt709",
-         "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "copy", "-shortest", out],
+         "-color_trc", "bt709", "-colorspace", "bt709", "-c:a", "copy", out],
         stdin=subprocess.PIPE,
     )
     buf_corr, buf_rf = {}, {}
@@ -230,6 +230,89 @@ def color_correct_mouth(rendered, carrier, out, feather=25, curve_smooth=0.6,
     if rc != 0:
         raise RuntimeError(f"[color_correct] ffmpeg encode failed (exit {rc})")
     print(f"[color_correct] wrote {out} (n={written}, mouth=({cx},{cy}) ax={ax} ay={ay}, {len(seams)} seam)")
+    return out
+
+
+def composite_ai_mouth(rendered, carrier, out, alpha=1.0, margin_x=1.12,
+                       margin_y=1.18, feather=9, smooth=0.65, detail_strength=0.42):
+    """Sharpen an AI mouth locally without compositing a second mouth geometry.
+
+    LatentSync already pastes untouched surrounding pixels back. Mixing the carrier mouth again
+    creates a dark/double edge whenever its expression differs, so this pass uses the rendered
+    frame on both sides of the mask and sharpens luma only inside it.
+    """
+    rcap = cv2.VideoCapture(rendered)
+    fps = rcap.get(cv2.CAP_PROP_FPS) or 25.0
+    nr = int(rcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    ok, first_frame = rcap.read()
+    if not ok:
+        rcap.release(); raise RuntimeError(f"no frames from {rendered}")
+    H, W = first_frame.shape[:2]
+    rcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    fd, fm = _make_mediapipe()
+    raw, valid = [], []
+    while True:
+        ok, frame = rcap.read()
+        if not ok:
+            break
+        center, hw, hh = _ellipse_one(fd, fm, frame, W, H)
+        good = center is not None
+        valid.append(good)
+        raw.append((center[0], center[1], hw, hh) if good else None)
+    rcap.release(); fd.close(); fm.close()
+    if not any(valid):
+        raise RuntimeError("no face for AI mouth composite")
+
+    first = valid.index(True)
+    specs = [None] * len(raw)
+    last = np.asarray(raw[first], np.float32)
+    for i in range(first + 1):
+        specs[i] = last.copy()
+    for i in range(first + 1, len(raw)):
+        if valid[i]:
+            cur = np.asarray(raw[i], np.float32)
+            last = smooth * cur + (1.0 - smooth) * last
+        specs[i] = last.copy()
+
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+           "-s", f"{W}x{H}", "-framerate", f"{fps}", "-i", "-", "-i", rendered,
+           "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-crf", "16", "-preset", "medium",
+           "-pix_fmt", "yuv420p", "-c:a", "copy", out]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    rcap, ccap = cv2.VideoCapture(rendered), cv2.VideoCapture(carrier)
+    written = 0
+    while written < min(nr, len(specs)):
+        okr, rf = rcap.read(); okc, cf = ccap.read()
+        if not (okr and okc):
+            break
+        if cf.shape[:2] != (H, W):
+            cf = cv2.resize(cf, (W, H), interpolation=cv2.INTER_LANCZOS4)
+        cx, cy, hw, hh = specs[written]
+        ax, ay = max(2, int(hw * margin_x)), max(2, int(hh * margin_y))
+        k = max(3, int(feather) | 1)
+        pad = k + 2
+        x0, y0 = max(0, int(cx)-ax-pad), max(0, int(cy)-ay-pad)
+        x1, y1 = min(W, int(cx)+ax+pad+1), min(H, int(cy)+ay+pad+1)
+        # Work only in a small mouth ROI: faster and guarantees the rest is bit-for-bit carrier.
+        m = np.zeros((y1-y0, x1-x0), np.float32)
+        cv2.ellipse(m, (int(cx)-x0, int(cy)-y0), (ax, ay), 0, 0, 360, 1.0, -1)
+        m = cv2.GaussianBlur(m, (k, k), max(0.8, k * 0.22))[..., None]
+        rr = rf[y0:y1, x0:x1].astype(np.float32)
+        ycc = cv2.cvtColor(np.clip(rr, 0, 255).astype(np.uint8), cv2.COLOR_BGR2YCrCb).astype(np.float32)
+        y = ycc[..., 0]
+        ycc[..., 0] = np.clip(y + detail_strength * (y - cv2.GaussianBlur(y, (0, 0), 1.0)), 0, 255)
+        core = cv2.cvtColor(ycc.astype(np.uint8), cv2.COLOR_YCrCb2BGR).astype(np.float32)
+        outf = rf.copy()
+        outf[y0:y1, x0:x1] = np.clip(rr * (1.0 - m) + core * m, 0, 255).astype(np.uint8)
+        proc.stdin.write(np.ascontiguousarray(outf).tobytes())
+        written += 1
+    rcap.release(); ccap.release(); proc.stdin.close()
+    rc = proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"AI mouth composite ffmpeg failed (exit {rc})")
+    print(f"[ai_composite] wrote {out} ({written} frames, core={alpha}, margin={margin_x}x{margin_y}, "
+          f"feather={feather}, detail={detail_strength})")
     return out
 
 

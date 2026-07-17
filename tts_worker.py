@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 
 # Ensure ffprobe/ffmpeg from the current conda env are visible even when the
 # worker is launched directly by absolute python path.
@@ -42,6 +43,7 @@ MAX_CONCURRENT = _num_env("AUSYNC_MAX_CONCURRENT", 1, int)          # giữ 1: r
 MIN_INTERVAL = _num_env("AUSYNC_MIN_INTERVAL_MS", 1300) / 1000.0
 THROTTLED_INTERVAL = _num_env("AUSYNC_THROTTLED_MS", 3000) / 1000.0
 MAX_RETRY = _num_env("AUSYNC_MAX_RETRY", 5, int)
+JOB_TIMEOUT = _num_env("TTS_JOB_TIMEOUT", 600)                         # hard cap mỗi dòng, tránh request treo mãi
 BACKOFF = [2, 5, 10, 20, 30]      # giây theo lần retry (attempt_count); + jitter 0–1.5s
 
 _RUNNING = True
@@ -101,6 +103,31 @@ def _validate_tts_audio(job, audio_path):
     return duration
 
 
+@contextmanager
+def _hard_timeout(seconds, label):
+    """Cắt một job TTS nếu thư viện HTTP/provider bị treo quá lâu.
+
+    requests đã có timeout từng call, nhưng thực tế kết nối/CDN đôi khi giữ socket lâu hơn
+    kỳ vọng. SIGALRM giúp worker không bị kẹt ở trạng thái submitting vô hạn.
+    """
+    if not seconds or seconds <= 0:
+        yield
+        return
+
+    old_handler = signal.getsignal(signal.SIGALRM)
+
+    def _raise_timeout(_signum, _frame):
+        raise TimeoutError(f"{label} quá thời gian chờ hard-timeout {int(seconds)}s")
+
+    signal.signal(signal.SIGALRM, _raise_timeout)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
+
+
 def _process(job):
     factory.reload_config()
     provider = job["provider"] or factory.DEFAULT_PROVIDER
@@ -113,8 +140,9 @@ def _process(job):
 
     audio_path = str(xi.TTS_AUDIO_DIR / f"tts_{job['id']}_{uuid.uuid4().hex[:8]}.wav")
     try:
-        factory.synthesize(text=job["text"], output_path=audio_path,
-                           provider=provider, voice=job["voice_id"])
+        with _hard_timeout(JOB_TIMEOUT, f"TTS job #{job['id']}"):
+            factory.synthesize(text=job["text"], output_path=audio_path,
+                               provider=provider, voice=job["voice_id"])
         if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
             raise RuntimeError("TTS không tạo được file audio.")
         duration = _validate_tts_audio(job, audio_path)

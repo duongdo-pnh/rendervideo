@@ -57,6 +57,7 @@ from omegaconf import OmegaConf
 from scripts.inference import main as inference_main
 from extend_video import prepare_carrier
 from restore_mouth_gfpgan import restore_mouth
+from color_correct_mouth import color_correct_mouth, composite_ai_mouth
 
 # Output resolution presets (target SHORTER side). None = keep source.
 OUT_RES = {"Gốc": None, "1080": 1080, "720": 720}
@@ -154,7 +155,8 @@ def _build_args(video_path, audio_path, output_path, checkpoint, steps, guidance
 
 
 def render(video_path, audio_path, output_path, config_path, checkpoint,
-           guidance, steps, seed, enhance_mouth, enhance_region, out_res):
+           guidance, steps, seed, enhance_mouth, enhance_region, out_res, color_correct=True,
+           input_type="real"):
     work_dir = Path(output_path).parent
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -179,9 +181,25 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         print(f"[render_job] prepare_carrier failed ({e}); using original video", flush=True)
         seams = []
 
-    print(f"[render_job] config={config_path} ckpt={checkpoint} gfpgan={enhance_mouth}", flush=True)
+    ai_mode = input_type == "ai"
+    if ai_mode:
+        guidance = min(float(guidance), 1.3)
+        steps = max(int(steps), 28)
+        print(f"[render_job] AI preset: guidance={guidance}, steps={steps}, narrow mouth composite, GFPGAN=off", flush=True)
+    else:
+        guidance = min(float(guidance), 1.5)
+        steps = max(int(steps), 24)
+        print(f"[render_job] REAL preset: guidance={guidance}, steps={steps}, overlap=4, "
+              f"GFPGAN={bool(enhance_mouth)}", flush=True)
+    print(f"[render_job] config={config_path} ckpt={checkpoint} gfpgan={enhance_mouth and not ai_mode}", flush=True)
     config = OmegaConf.load(config_path)
     config["run"].update({"guidance_scale": guidance, "inference_steps": steps})
+    if ai_mode:
+        # Overlap blends two independently generated mouths. On fast synthetic head motion their
+        # geometry differs slightly, producing a visible soft/double mouth. Prefer crisp windows.
+        config["run"]["chunk_overlap"] = 0
+    else:
+        config["run"]["chunk_overlap"] = 4
 
     # Per-render temp dir (the pipeline WIPES temp_dir at start) — unique so a concurrent
     # render in another process can't clobber our temp/synced.mp4. Stem carries a timestamp
@@ -195,14 +213,26 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         inference_main(config=config, args=args)
         print("[render_job] diffusion done", flush=True)
 
-        if enhance_mouth:
+        if ai_mode:
+            print("[render_job] AI conservative mouth composite", flush=True)
+            composite_ai_mouth(raw_out, video_path, output_path, alpha=1.0,
+                               margin_x=1.12, margin_y=1.18, feather=9, smooth=0.65,
+                               detail_strength=0.42)
+        elif enhance_mouth:
             try:
                 torch.cuda.empty_cache()
             except Exception:
                 pass
             print(f"[render_job] GFPGAN enhance (region={enhance_region}, {len(seams)} seam(s))", flush=True)
-            restore_mouth(raw_out, output_path, region=enhance_region, seams=seams,
-                          gfpgan_alpha=0.7, sharpen=0.0)
+            restored_out = str(work_dir / "_mouth_restored.mp4") if color_correct else output_path
+            restore_mouth(raw_out, restored_out, region=enhance_region, seams=seams,
+                          gfpgan_alpha=0.5, sharpen=0.0, single_detect=False)
+            if color_correct and enhance_region == "mouth":
+                print("[render_job] color-correct mouth against carrier", flush=True)
+                color_correct_mouth(restored_out, video_path, output_path, feather=25,
+                                    curve_smooth=0.6, sharpen=0.0, temporal=0.7, seams=seams)
+            elif restored_out != output_path:
+                os.replace(restored_out, output_path)
         else:
             # Fast mode: raw diffusion output, no GFPGAN.
             os.replace(raw_out, output_path)
@@ -225,10 +255,12 @@ def main():
     ap.add_argument("--enhance_mouth", type=int, default=1, help="1=GFPGAN on (default), 0=raw diffusion")
     ap.add_argument("--enhance_region", default="mouth", choices=["mouth", "face"])
     ap.add_argument("--out_res", default="720", choices=list(OUT_RES.keys()))
+    ap.add_argument("--color_correct", type=int, default=1, help="1=match mouth tone to carrier after GFPGAN")
+    ap.add_argument("--input_type", choices=["real", "ai"], default="real")
     a = ap.parse_args()
     try:
         render(a.video, a.audio, a.output, a.config, a.checkpoint, a.guidance, a.steps,
-               a.seed, bool(a.enhance_mouth), a.enhance_region, a.out_res)
+               a.seed, bool(a.enhance_mouth), a.enhance_region, a.out_res, bool(a.color_correct), a.input_type)
     except Exception as e:
         print(f"[render_job] ERROR: {e}", file=sys.stderr, flush=True)
         sys.exit(1)

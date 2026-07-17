@@ -7,6 +7,7 @@ Tab 2 — Trạng thái queue: bảng auto-refresh 10s + xem/tải video đã re
 
 Run with:  conda activate latentsync && python web_ui.py
 """
+import os
 import re
 import shutil
 import unicodedata
@@ -110,10 +111,17 @@ def other_key_visibility(kind, intent):
     return gr.update(visible=(kind == KIND_ANSWER and intent == "ASK_OTHER"))
 
 
+def input_type_preset(input_type):
+    """Keep visible controls honest; render_job enforces the same safe bounds."""
+    if input_type == "ai":
+        return gr.update(value=1.3), gr.update(value=28), gr.update(value=False)
+    return gr.update(value=1.5), gr.update(value=24), gr.update(value=True)
+
+
 # ---------------------------------------------------------------- Thêm vào queue
 
 def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model_res, guidance, steps, seed,
-                 enhance_mouth, enhance_region, out_res):
+                 enhance_mouth, enhance_region, out_res, input_type):
     if not video_path or not audio_path:
         raise gr.Error("Cần cả video và audio.")
     if kind == KIND_ANSWER and intent == "ASK_OTHER" and not _slug_key(other_key):
@@ -127,7 +135,7 @@ def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model
     shutil.copy(video_path, v_dst)
     shutil.copy(audio_path, a_dst)
     job_id = db.add_job(name, v_dst, a_dst, model_res, guidance, steps, seed,
-                        int(bool(enhance_mouth)), enhance_region, out_res)
+                        int(bool(enhance_mouth)), enhance_region, out_res, input_type)
     gr.Info(f"✅ Đã thêm job #{job_id} vào queue.")   # toast thông báo
     return f"✅ Đã thêm **job #{job_id}** ('{name}', model {model_res}) vào queue."
 
@@ -349,7 +357,7 @@ def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
     return table, summary, state
 
 
-def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region,
+def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region, input_type,
                  dedup, progress=gr.Progress()):
     if not state or not state.get("rows"):
         raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
@@ -357,7 +365,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
     shopee = state.get("shopee")
     render_config = dict(model_res=str(model), out_res=str(out_res),
                          enhance_mouth=int(bool(enhance_mouth)), enhance_region=region,
-                         guidance=float(guidance), steps=int(steps), seed=int(seed))
+                         guidance=float(guidance), steps=int(steps), seed=int(seed), input_type=input_type)
 
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
@@ -583,9 +591,12 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                     name_preview_md = gr.Markdown(name_preview("", KIND_INTRO, None, None),
                                                   elem_id="name-preview")
 
+                input_type_in = gr.Radio(
+                    choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
+                    label="Loại input (Video AI dùng mask môi hẹp, không GFPGAN)")
                 with gr.Row():
                     model_in = gr.Radio(
-                        choices=["256", "512"], value="256",
+                        choices=["256", "512"], value="512",
                         label="Model: 256 (nhanh ~2×) | 512 (nét/tự nhiên, chậm)",
                     )
                     out_res_in = gr.Radio(
@@ -594,11 +605,14 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                     )
                 with gr.Row():
                     guidance_in = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
-                    steps_in = gr.Slider(8, 50, value=20, step=1, label="Inference Steps")
+                    steps_in = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
                 with gr.Row():
                     seed_in = gr.Number(value=1247, label="Seed", precision=0)
                     enhance_mouth_in = gr.Checkbox(value=True, label="Làm nét miệng (GFPGAN)")
                     region_in = gr.Radio(["mouth", "face"], value="mouth", label="Vùng làm nét")
+                input_type_in.change(
+                    input_type_preset, input_type_in,
+                    [guidance_in, steps_in, enhance_mouth_in])
 
                 with gr.Row():
                     render_btn = gr.Button("▶ Render (vào hàng đợi)", variant="primary")
@@ -618,7 +632,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                 result_refresh = gr.Button("🔄 Cập nhật danh sách (hiện video mới render xong)")
 
         cfg_inputs = [video_in, audio_in, product_in, kind_in, intent_in, other_key_in, model_in, guidance_in,
-                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in]
+                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in, input_type_in]
         # Hiện ô câu hỏi chỉ khi chọn "Trả lời".
         kind_in.change(lambda k: gr.update(visible=(k == KIND_ANSWER)), kind_in, intent_in)
         kind_in.change(other_key_visibility, [kind_in, intent_in], other_key_in)
@@ -697,8 +711,11 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_default_provider.change(update_voice_choices, xl_default_provider, xl_default_voice)
 
         gr.Markdown("#### ⚙️ Cấu hình render (áp cho TOÀN BỘ Excel)")
+        xl_input_type = gr.Radio(
+            choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
+            label="Loại input")
         with gr.Row():
-            xl_model = gr.Radio(["256", "512"], value="256",
+            xl_model = gr.Radio(["256", "512"], value="512",
                                 label="Model: 256 (nhanh) | 512 (nét/tự nhiên, chậm)")
             xl_out_res = gr.Radio(choices=list(OUT_RES.keys()), value="720",
                                   label="Độ phân giải (cạnh ngắn): Gốc | 1080 | 720")
@@ -706,11 +723,14 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
             xl_region = gr.Radio(["mouth", "face"], value="mouth", label="Vùng làm nét")
         with gr.Row():
             xl_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
-            xl_steps = gr.Slider(8, 50, value=20, step=1, label="Inference Steps")
+            xl_steps = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
             xl_seed = gr.Number(value=1247, label="Seed", precision=0)
             xl_dedup = gr.Checkbox(
                 value=True,
                 label="Bỏ qua dòng đang chờ trùng (chống bấm Submit/import lặp)")
+        xl_input_type.change(
+            input_type_preset, xl_input_type,
+            [xl_guidance, xl_steps, xl_enhance])
 
         gr.Markdown("#### Import")
         xl_file = gr.File(label="Upload file Excel (.xlsx)", file_types=[".xlsx"])
@@ -742,7 +762,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_submit_btn.click(
             submit_excel,
             [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed,
-             xl_region, xl_dedup],
+             xl_region, xl_input_type, xl_dedup],
             [xl_result, status_table, xl_batch_state])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)
@@ -863,4 +883,11 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 if __name__ == "__main__":
     demo.queue()  # cho render đồng bộ chạy tuần tự, không nghẽn server
     # allowed_paths: cho phép Gradio phục vụ video kết quả nằm ngoài thư mục app (trên Desktop).
-    demo.launch(inbrowser=True, share=True, allowed_paths=[str(db.RENDERS_DIR)])
+    # Local-only by default. Public sharing must be explicitly opted into with GRADIO_SHARE=1.
+    demo.launch(
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
+        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
+        inbrowser=False,
+        share=os.environ.get("GRADIO_SHARE", "0") == "1",
+        allowed_paths=[str(db.RENDERS_DIR)],
+    )

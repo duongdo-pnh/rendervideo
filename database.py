@@ -42,11 +42,12 @@ def _connect():
 # init_db() ALTERs them in for older DBs so upgrades never lose existing jobs.
 _CONFIG_COLUMNS = {
     "guidance":       "REAL    NOT NULL DEFAULT 1.5",
-    "steps":          "INTEGER NOT NULL DEFAULT 20",
+    "steps":          "INTEGER NOT NULL DEFAULT 24",
     "seed":           "INTEGER NOT NULL DEFAULT 1247",
     "enhance_mouth":  "INTEGER NOT NULL DEFAULT 1",
     "enhance_region": "TEXT    NOT NULL DEFAULT 'mouth'",
     "out_res":        "TEXT    NOT NULL DEFAULT '720'",
+    "input_type":     "TEXT    NOT NULL DEFAULT 'real'",
 }
 
 
@@ -84,8 +85,8 @@ def init_db():
         )
 
 
-def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=20, seed=1247,
-            enhance_mouth=1, enhance_region="mouth", out_res="720"):
+def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
+            enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real"):
     """Insert a new queued job with its full render config. Resolves model_res -> config/checkpoint."""
     model_res = str(model_res)
     if model_res not in MODELS:
@@ -95,12 +96,12 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=20, see
         cur = con.execute(
             """
             INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path,
-                              guidance, steps, seed, enhance_mouth, enhance_region, out_res)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path,
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
-             str(enhance_region), str(out_res)),
+             str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real"),
         )
         return cur.lastrowid
 

@@ -365,6 +365,7 @@ class LipsyncPipeline(DiffusionPipeline):
         precomputed_faces=None,
         precomputed_boxes=None,
         precomputed_affine_matrices=None,
+        chunk_overlap: int = 4,
         **kwargs,
     ):
         is_train = self.unet.training
@@ -419,7 +420,10 @@ class LipsyncPipeline(DiffusionPipeline):
         base_noise = torch.randn(noise_shape, generator=generator, device=rand_device, dtype=weight_dtype).to(device)
         init_noise_sigma = self.scheduler.init_noise_sigma
 
-        num_inferences = math.ceil(num_audio_frames / num_frames)
+        chunk_overlap = max(0, min(int(chunk_overlap), num_frames // 2))
+        chunk_stride = num_frames - chunk_overlap
+        chunk_starts = list(range(0, num_audio_frames, chunk_stride))
+        print(f"Temporal chunks: {num_frames} frames, overlap={chunk_overlap}, stride={chunk_stride}")
 
         # --- decide TRIM vs LOOP, and set up the per-chunk frame/face source ---------------------
         # The original frames (for restore) always come from the 25fps-normalized input. Written to
@@ -445,8 +449,47 @@ class LipsyncPipeline(DiffusionPipeline):
         # streaming frame reader for TRIM mode (sequential, constant RAM). precomputed faces cover
         # the video 1:1 (avatar cache, bounded) and are sliced per chunk below.
         chunk_reader = None
+        cache_frames = None
+        cache_faces = None
+        cache_boxes = []
+        cache_affines = []
+        cache_start = 0
         if not loop_mode:
             chunk_reader = read_video_chunks(normalized_path, chunk_size=num_frames)
+
+        def _trim_source_window(global_start, chunk_len):
+            """Return a sequential source window while retaining only the overlap in RAM."""
+            nonlocal cache_frames, cache_faces, cache_boxes, cache_affines, cache_start
+            wanted_end = global_start + chunk_len
+            while cache_start + (0 if cache_frames is None else len(cache_frames)) < wanted_end:
+                new_frames = next(chunk_reader)
+                if precomputed:
+                    new_start = cache_start + (0 if cache_frames is None else len(cache_frames))
+                    new_end = new_start + len(new_frames)
+                    new_faces = precomputed_faces[new_start:new_end]
+                    new_boxes = list(precomputed_boxes[new_start:new_end])
+                    new_affines = list(precomputed_affine_matrices[new_start:new_end])
+                else:
+                    fl, new_boxes, new_affines = [], [], []
+                    for frame in new_frames:
+                        face, box, affine = self.image_processor.affine_transform(frame)
+                        fl.append(face); new_boxes.append(box); new_affines.append(affine)
+                    new_faces = torch.stack(fl)
+                cache_frames = new_frames if cache_frames is None else np.concatenate([cache_frames, new_frames])
+                cache_faces = new_faces if cache_faces is None else torch.cat([cache_faces, new_faces])
+                cache_boxes.extend(new_boxes); cache_affines.extend(new_affines)
+            off = global_start - cache_start
+            end = off + chunk_len
+            result = (cache_frames[off:end], cache_faces[off:end],
+                      cache_boxes[off:end], cache_affines[off:end])
+            # Frames before this window can never be requested again.
+            if off > 0:
+                cache_frames = cache_frames[off:]
+                cache_faces = cache_faces[off:]
+                cache_boxes = cache_boxes[off:]
+                cache_affines = cache_affines[off:]
+                cache_start = global_start
+            return result
 
         def _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, global_start, chunk_len):
             """Run diffusion + restore on one chunk; return restored RGB frames (np, chunk_len)."""
@@ -518,11 +561,11 @@ class LipsyncPipeline(DiffusionPipeline):
         )
 
         total_written = 0
+        pending = None
         try:
-            for i in tqdm.tqdm(range(num_inferences), desc="Doing inference..."):
+            for global_start in tqdm.tqdm(chunk_starts, desc="Doing inference..."):
                 if CANCEL.is_set():
                     raise LatentSyncCancelled("cancelled by user")
-                global_start = i * num_frames
                 chunk_len = min(num_frames, num_audio_frames - global_start)
 
                 if loop_mode:
@@ -532,30 +575,39 @@ class LipsyncPipeline(DiffusionPipeline):
                     faces_chunk = base_faces[idxs]
                     boxes_chunk = [base_boxes[j] for j in idxs]
                     affines_chunk = [base_affines[j] for j in idxs]
-                elif precomputed:
-                    frames_chunk = next(chunk_reader)[:chunk_len]
-                    faces_chunk = precomputed_faces[global_start : global_start + chunk_len]
-                    boxes_chunk = list(precomputed_boxes[global_start : global_start + chunk_len])
-                    affines_chunk = list(precomputed_affine_matrices[global_start : global_start + chunk_len])
                 else:
-                    frames_chunk = next(chunk_reader)[:chunk_len]
-                    faces_list, boxes_chunk, affines_chunk = [], [], []
-                    for frame in frames_chunk:
-                        face, box, affine_matrix = self.image_processor.affine_transform(frame)
-                        faces_list.append(face)
-                        boxes_chunk.append(box)
-                        affines_chunk.append(affine_matrix)
-                    faces_chunk = torch.stack(faces_list)
+                    frames_chunk, faces_chunk, boxes_chunk, affines_chunk = _trim_source_window(
+                        global_start, chunk_len
+                    )
 
                 restored = _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, global_start, chunk_len)
-                for frame in restored:
-                    writer.append_data(frame)
-                total_written += len(restored)
+                if pending is None:
+                    pending = restored
+                else:
+                    ov = min(chunk_overlap, len(pending), len(restored))
+                    if ov:
+                        for frame in pending[:-ov]:
+                            writer.append_data(frame)
+                        total_written += len(pending) - ov
+                        # Cosine crossfade hides the independent diffusion-window boundary.
+                        phase = np.arange(1, ov + 1, dtype=np.float32) / (ov + 1)
+                        w = (0.5 - 0.5 * np.cos(np.pi * phase))[:, None, None, None]
+                        blended = np.clip(pending[-ov:] * (1.0 - w) + restored[:ov] * w, 0, 255).astype(np.uint8)
+                        pending = np.concatenate([blended, restored[ov:]], axis=0)
+                    else:
+                        for frame in pending:
+                            writer.append_data(frame)
+                        total_written += len(pending)
+                        pending = restored
                 # Drop references so the caching allocator REUSES these blocks next chunk (every
                 # chunk allocates identical shapes => VRAM stabilizes after chunk 1, stays bounded).
                 # NOT torch.cuda.empty_cache() per chunk: that returns blocks to the driver and forces
                 # a re-allocation + sync each chunk — ~4x slowdown for no memory benefit here.
                 del restored, faces_chunk, frames_chunk
+            if pending is not None:
+                for frame in pending:
+                    writer.append_data(frame)
+                total_written += len(pending)
         except Exception:
             writer.close()
             if os.path.exists(synced_path):

@@ -186,15 +186,33 @@ def _gfpgan_restore_batched(restorer, frames, landmarks5, batch_size=GFPGAN_BATC
     return results
 
 
+def _fill_and_smooth(values, valid, alpha=0.65):
+    """Fill failed detections from the nearest valid sample, then apply a causal EMA."""
+    if not values or not any(valid):
+        return values
+    first = valid.index(True)
+    out = [None] * len(values)
+    last = np.asarray(values[first], dtype=np.float32)
+    for i in range(first, -1, -1):
+        out[i] = last.copy()
+    for i in range(first + 1, len(values)):
+        if valid[i]:
+            cur = np.asarray(values[i], dtype=np.float32)
+            last = alpha * cur + (1.0 - alpha) * last
+        out[i] = last.copy()
+    return out
+
+
 def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, margin=1.6, seams=None,
-                  precomputed_mouth=None, feather_scale=0.6, sharpen=0.0, single_detect=True):
+                  precomputed_mouth=None, feather_scale=0.6, sharpen=0.0, single_detect=False,
+                  landmark_smooth=0.65):
     """GFPGAN-restore the mouth (or whole face) of video `inp` and write to `out`.
 
     `seams` is a list of frame indices (loop wraps + scene cuts) where the temporal smooth
     must NOT blend across — at a seam the 3-tap degrades to a 2-/1-tap so it never ghosts
     two unrelated poses together.
 
-    `single_detect=True` (default): run MediaPipe ONCE on the first frame that has a face and reuse
+    `single_detect=True`: run MediaPipe ONCE on the first frame that has a face and reuse
     that mouth ellipse + 5-point landmarks for every frame. This is the big speed win for fixed-camera
     talking-head/avatar clips (the per-frame MediaPipe loop was ~593x on CPU ≈ 4 min). For strongly
     moving heads pass single_detect=False to detect per frame (slower, more accurate GFPGAN alignment).
@@ -243,41 +261,52 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
             raise RuntimeError("no face found for mouth detection")
         print(f"[restore] single-frame detect: found face on frame {scanned-1}")
     else:
-        # Per-frame detection (accurate for moving heads): global-median ellipse + per-frame landmarks.
+        # Per-frame detection. Failed frames inherit the nearest valid detection and all
+        # coordinates are EMA-smoothed, preventing both a stationary mask and landmark jitter.
         if precomputed_mouth is not None:
             print(f"[restore] cached mouth len {len(precomputed_mouth[4])} != ~{n_probe} frames -> detecting")
         fd, fm = _make_mediapipe()
-        centers, hws, hhs, landmarks5 = [], [], [], []
+        raw_centers, raw_sizes, landmarks5, valid = [], [], [], []
         cap = cv2.VideoCapture(inp)
         while True:
             ok, f = cap.read()
             if not ok:
                 break
             center, w, h, lm5 = _detect_mouth_one(fd, fm, f, W, H)
-            landmarks5.append(lm5)
-            if center is not None:
-                centers.append(center); hws.append(w); hhs.append(h)
+            ok_det = center is not None and lm5 is not None
+            valid.append(ok_det)
+            raw_centers.append(center if ok_det else None)
+            raw_sizes.append((w, h) if ok_det else None)
+            landmarks5.append(lm5 if ok_det else None)
         cap.release()
         fd.close(); fm.close()
-        if not centers:
+        if not any(valid):
             raise RuntimeError("no face found for mouth detection")
-        c = np.array(centers)
-        cx, cy = int(np.median(c[:, 0])), int(np.median(c[:, 1]))
-        hw, hh = int(np.median(hws)), int(np.median(hhs))
+        centers = _fill_and_smooth(raw_centers, valid, landmark_smooth)
+        sizes = _fill_and_smooth(raw_sizes, valid, landmark_smooth)
+        landmarks5 = _fill_and_smooth(landmarks5, valid, landmark_smooth)
+        cx, cy = map(int, np.median(np.asarray(centers), axis=0))
+        hw, hh = map(int, np.median(np.asarray(sizes), axis=0))
     print(f"[restore] Pass 1 (detect) took {time.time()-t_p1:.2f}s")
 
+    mouth_specs = None
     if region == "mouth":
-        ax, ay = int(hw*margin), int(hh*margin)
-        print(f"[restore] mouth ellipse center=({cx},{cy}) axes=({ax},{ay})")
-        m = np.zeros((H, W), np.float32)
-        cv2.ellipse(m, (cx, cy), (ax, ay), 0, 0, 360, 1.0, -1)
-        k = int(max(ax, ay)*feather_scale) | 1   # feather width ∝ mouth size; lower = tighter viền
-        mask = cv2.GaussianBlur(m, (k, k), k*0.35)[..., None]
+        if landmarks5 is not None and not single_detect and precomputed_mouth is None:
+            mouth_specs = [(int(c[0]), int(c[1]), max(1, int(s[0]*margin)), max(1, int(s[1]*margin)))
+                           for c, s in zip(centers, sizes)]
+        else:
+            mouth_specs = [(cx, cy, max(1, int(hw*margin)), max(1, int(hh*margin)))] * n_probe
+        print(f"[restore] dynamic mouth masks={len(mouth_specs)} smooth={landmark_smooth:.2f}")
+        bounds = []
+        for mx, my, ax, ay in mouth_specs:
+            k = max(3, int(max(ax, ay)*feather_scale) | 1)
+            pad = k + 8
+            bounds.append((max(0, mx-ax-pad), max(0, my-ay-pad),
+                           min(W, mx+ax+pad), min(H, my+ay+pad)))
         # bbox enclosing the FEATHERED ellipse (pad >= the gaussian's reach). The restored face is
         # inverse-warped back into just this box; outside it the mask is ~0 so the original shows through.
-        pad = k + 8
-        x0, y0 = max(0, cx-ax-pad), max(0, cy-ay-pad)
-        x1, y1 = min(W, cx+ax+pad), min(H, cy+ay+pad)
+        x0 = min(b[0] for b in bounds); y0 = min(b[1] for b in bounds)
+        x1 = max(b[2] for b in bounds); y1 = max(b[3] for b in bounds)
         bbox = (x0, y0, x1, y1)
         print(f"[restore] mouth bbox {x1-x0}x{y1-y0} ({(x1-x0)*(y1-y0)/(W*H)*100:.1f}% of frame)")
     else:
@@ -298,7 +327,7 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
         "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-framerate", f"{fps}", "-i", "-",
         "-i", inp, "-map", "0:v", "-map", "1:a?", "-c:v", "libx264", "-crf", "16", "-preset", "medium",
         "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
-        "-c:a", "copy", "-shortest", out,
+        "-c:a", "copy", out,
     ]
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
 
@@ -307,7 +336,18 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
     # keep a rolling window of `blended` (and original frames for the mouth composite) just large
     # enough to emit frame t once frame t+1 exists — bit-identical to the old full-array smooth but
     # holding ~3 frames instead of the whole video.
-    mb = mask[bbox[1]:bbox[3], bbox[0]:bbox[2]] if bbox is not None else None
+    mask_cache = {}
+
+    def _mask_crop(idx):
+        """Build dynamic masks lazily so RAM stays bounded for long videos."""
+        if idx not in mask_cache:
+            mx, my, ax, ay = mouth_specs[min(idx, len(mouth_specs) - 1)]
+            bh, bw = bbox[3] - bbox[1], bbox[2] - bbox[0]
+            m = np.zeros((bh, bw), np.float32)
+            cv2.ellipse(m, (mx - bbox[0], my - bbox[1]), (ax, ay), 0, 0, 360, 1.0, -1)
+            k = max(3, int(max(ax, ay)*feather_scale) | 1)
+            mask_cache[idx] = cv2.GaussianBlur(m, (k, k), k*0.35)[..., None]
+        return mask_cache[idx]
     buf_b = {}   # idx -> blended (bbox-region float for mouth, full float for face)
     buf_f = {}   # idx -> original full frame (mouth path only)
     produced = 0
@@ -324,6 +364,7 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
             sm = (prev + 2*buf_b[t] + nxt) / 4.0
             res = temporal*buf_b[t] + (1-temporal)*sm
             if bbox is not None:
+                mb = _mask_crop(t)
                 res = buf_b[t]*(1-mb) + res*mb
                 out_f = buf_f[t].copy()
                 out_f[bbox[1]:bbox[3], bbox[0]:bbox[2]] = np.clip(res, 0, 255).astype(np.uint8)
@@ -331,6 +372,7 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
             else:
                 proc.stdin.write(np.ascontiguousarray(np.clip(res, 0, 255).astype(np.uint8)).tobytes())
             buf_b.pop(t-1, None); buf_f.pop(t-1, None)   # t-1 no longer needed by any later frame
+            mask_cache.pop(t, None)
             written += 1
 
     t_p2 = time.time()
@@ -353,6 +395,7 @@ def restore_mouth(inp, out, region="mouth", gfpgan_alpha=1.0, temporal=0.5, marg
             for j, fr in enumerate(batch):
                 idx = base_idx + j
                 if bbox is not None:
+                    mb = _mask_crop(idx)
                     ob = fr[bbox[1]:bbox[3], bbox[0]:bbox[2]].astype(np.float32)
                     g = gfpgan_alpha * restored[j][bbox[1]:bbox[3], bbox[0]:bbox[2]].astype(np.float32) + (1 - gfpgan_alpha) * ob
                     g = _luma_sharpen(g)
@@ -389,6 +432,8 @@ def main():
     ap.add_argument("--margin", type=float, default=1.6)
     ap.add_argument("--feather_scale", type=float, default=0.6)
     ap.add_argument("--sharpen", type=float, default=0.0)
+    ap.add_argument("--single_detect", action="store_true", help="reuse one mouth detection (fixed-head videos only)")
+    ap.add_argument("--landmark_smooth", type=float, default=0.65)
     ap.add_argument("--seams_json", type=str, default=None, help="json file: {\"seams\": [...]}")
     a = ap.parse_args()
     seams = None
@@ -397,7 +442,8 @@ def main():
         seams = json.load(open(a.seams_json)).get("seams")
     restore_mouth(a.inp, a.out, region=a.region, gfpgan_alpha=a.gfpgan_alpha,
                   temporal=a.temporal, margin=a.margin, seams=seams,
-                  feather_scale=a.feather_scale, sharpen=a.sharpen)
+                  feather_scale=a.feather_scale, sharpen=a.sharpen,
+                  single_detect=a.single_detect, landmark_smooth=a.landmark_smooth)
 
 
 if __name__ == "__main__":

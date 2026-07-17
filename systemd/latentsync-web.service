@@ -1,0 +1,16 @@
+[Unit]
+Description=LatentSync Render Web UI
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/byscom/Latentsync/rendervideo
+ExecStart=/home/byscom/Latentsync/rendervideo/venv/bin/python /home/byscom/Latentsync/rendervideo/web_ui.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target
