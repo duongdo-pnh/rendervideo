@@ -1,9 +1,9 @@
 {
-  "_help": "Voice guard cho từng provider. empty->default_voice_id; trong deprecated_voice_map->map sang mới; ngoài allowed_voice_ids (nếu danh sách khác rỗng)->thay bằng default + cảnh báo (KHÔNG drop dòng). allowed rỗng = không kiểm tra.",
+  "_help": "Voice guard cho từng provider. empty->default_voice_id; trong deprecated_voice_map->map sang mới; ngoài allowed_voice_ids (nếu danh sách khác rỗng)->thay bằng default + cảnh báo (KHÔNG drop dòng). allowed rỗng = chấp nhận mọi voice ID nhập từ Excel; danh sách dropdown được quản lý riêng bởi CURATED_VOICES.",
   "ausynclab": {
     "default_voice_id": "508363",
     "deprecated_voice_map": {},
-    "allowed_voice_ids": ["508363", "1918847", "319657", "213055"]
+    "allowed_voice_ids": []
   },
   "vbee": {
     "default_voice_id": "n_hanoi_female_quangcao02_advertise_vc",
