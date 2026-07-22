@@ -320,31 +320,34 @@ def process_job(job):
     shutil.copy(out_path, dst)
     db.mark_done(job_id, str(dst))
     _log(f"job #{job_id} DONE -> {dst}")
-    _start_drive_upload(job_id, dst)
+    _start_drive_upload(job_id, dst, job.get("drive_folder"))
 
 
 # ---------------------------------------------------------------- Google Drive
 
-def _start_drive_upload(job_id, path):
+def _start_drive_upload(job_id, path, subfolder=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
-    Upload hỏng chỉ ghi drive_error vào DB (job vẫn done, file vẫn nằm ở downloads/);
-    upload lại tay: python google_drive_upload.py <file>. Thread là daemon nên tắt worker
-    giữa chừng thì upload dở bị bỏ — chấp nhận, vì file gốc không mất.
+    subfolder (cột drive_folder — job import Excel = tên file Excel): upload vào thư mục con
+    đó trong folder Drive chính, tự tạo nếu chưa có. Upload hỏng chỉ ghi drive_error vào DB
+    (job vẫn done, file vẫn nằm ở downloads/); upload lại tay:
+    python google_drive_upload.py <file> [--subfolder "<tên>"]. Thread là daemon nên tắt
+    worker giữa chừng thì upload dở bị bỏ — chấp nhận, vì file gốc không mất.
     """
     if gdrive is None:
         _log(f"job #{job_id} skip Drive upload (google libs missing: {_GDRIVE_IMPORT_ERROR})")
         return
     if not gdrive.drive_enabled():
         return
-    threading.Thread(target=_drive_upload, args=(job_id, path), daemon=True).start()
+    threading.Thread(target=_drive_upload, args=(job_id, path, subfolder), daemon=True).start()
 
 
-def _drive_upload(job_id, path):
+def _drive_upload(job_id, path, subfolder=None):
     try:
-        info = gdrive.upload_file(path)
+        info = gdrive.upload_file(path, subfolder=subfolder)
         db.set_drive_result(job_id, link=info.get("webViewLink"))
-        _log(f"job #{job_id} Drive upload OK -> {info.get('webViewLink')}")
+        where = f" [{subfolder}]" if subfolder else ""
+        _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")
     except Exception as e:
         db.set_drive_result(job_id, error=e)
         _log(f"job #{job_id} Drive upload FAILED: {e}")

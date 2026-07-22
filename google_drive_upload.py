@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -121,8 +122,47 @@ def get_service():
 
 # ---------------------------------------------------------------- upload
 
-def upload_file(path, folder_id=None, name=None):
+# find-or-create thư mục con: cache + lock để nhiều thread upload song song
+# (queue_worker đẩy nền từng job) không tạo trùng 2 thư mục cùng tên trên Drive.
+_folder_cache = {}
+_folder_lock = threading.Lock()
+
+
+def _escape_query(value):
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def ensure_folder(service, name, parent_id):
+    """Trả về ID thư mục con `name` trong `parent_id` — tìm thấy thì dùng lại, chưa có thì tạo."""
+    key = (parent_id, name)
+    with _folder_lock:
+        if key in _folder_cache:
+            return _folder_cache[key]
+        q = (
+            f"name = '{_escape_query(name)}' and '{_escape_query(parent_id)}' in parents "
+            "and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        )
+        found = service.files().list(
+            q=q, fields="files(id)", pageSize=1,
+            supportsAllDrives=True, includeItemsFromAllDrives=True,
+        ).execute(num_retries=3).get("files")
+        if found:
+            fid = found[0]["id"]
+        else:
+            fid = service.files().create(
+                body={"name": name, "parents": [parent_id],
+                      "mimeType": "application/vnd.google-apps.folder"},
+                fields="id", supportsAllDrives=True,
+            ).execute(num_retries=3)["id"]
+        _folder_cache[key] = fid
+        return fid
+
+
+def upload_file(path, folder_id=None, name=None, subfolder=None):
     """Upload 1 file vào thư mục Drive. Trả về {'id', 'name', 'webViewLink'}.
+
+    subfolder: tên thư mục con trong folder đích (job import Excel = tên file Excel) —
+    tự tìm-hoặc-tạo. None/rỗng = upload thẳng vào folder đích.
 
     Raise DriveConfigError (thiếu config) hoặc lỗi API — caller tự try/except
     (queue_worker bọc sẵn, upload hỏng không được làm chết worker).
@@ -137,6 +177,8 @@ def upload_file(path, folder_id=None, name=None):
         raise DriveConfigError("Chưa điền GOOGLE_DRIVE_FOLDER_ID trong .env")
 
     service = get_service()
+    if subfolder and str(subfolder).strip():
+        folder_id = ensure_folder(service, str(subfolder).strip(), folder_id)
     media = MediaFileUpload(str(path), resumable=True, chunksize=10 * 1024 * 1024)
     body = {"name": name or path.name, "parents": [folder_id]}
     info = (
@@ -255,6 +297,7 @@ def main():
     ap = argparse.ArgumentParser(description="Upload file lên Google Drive (thư mục mặc định từ .env)")
     ap.add_argument("file", nargs="?", help="file cần upload (test tay / upload lại job lỗi)")
     ap.add_argument("--folder", help="ID thư mục đích (mặc định: GOOGLE_DRIVE_FOLDER_ID)")
+    ap.add_argument("--subfolder", help="tên thư mục con trong thư mục đích (tự tạo nếu chưa có)")
     ap.add_argument("--extract", metavar="JSON", help="bóc secret từ file JSON của Google vào .env")
     ap.add_argument("--auth", action="store_true", help="OAuth: lấy refresh token 1 lần qua trình duyệt")
     ap.add_argument("--check", action="store_true", help="kiểm tra credentials + quyền vào thư mục")
@@ -267,7 +310,7 @@ def main():
     elif args.check:
         cmd_check()
     elif args.file:
-        info = upload_file(args.file, folder_id=args.folder)
+        info = upload_file(args.file, folder_id=args.folder, subfolder=args.subfolder)
         print(f"Uploaded '{info['name']}' -> {info.get('webViewLink')}")
     else:
         ap.print_help()
