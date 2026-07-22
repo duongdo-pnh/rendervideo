@@ -48,6 +48,9 @@ _CONFIG_COLUMNS = {
     "enhance_region": "TEXT    NOT NULL DEFAULT 'mouth'",
     "out_res":        "TEXT    NOT NULL DEFAULT '720'",
     "input_type":     "TEXT    NOT NULL DEFAULT 'real'",
+    # Google Drive auto-upload (queue_worker đẩy lên sau khi job done)
+    "drive_link":     "TEXT",
+    "drive_error":    "TEXT",
 }
 
 
@@ -156,6 +159,15 @@ def mark_failed(job_id, error):
             "UPDATE jobs SET status='failed', error=?, "
             "finished_at=datetime('now','localtime') WHERE id=?",
             (str(error)[:2000], job_id),
+        )
+
+
+def set_drive_result(job_id, link=None, error=None):
+    """Ghi kết quả upload Google Drive của 1 job done: link khi thành công, error khi hỏng."""
+    with _connect() as con:
+        con.execute(
+            "UPDATE jobs SET drive_link=?, drive_error=? WHERE id=?",
+            (link, str(error)[:2000] if error else None, job_id),
         )
 
 
