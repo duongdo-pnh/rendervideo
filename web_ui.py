@@ -328,15 +328,18 @@ def _stabilize_video(path):
 
 
 def _stabilize_excel(path):
-    """Copy file Excel tải lên (Gradio temp) -> uploads/imports/ để sau xuất kết quả còn đọc được."""
+    """Copy file Excel tải lên (Gradio temp) -> uploads/imports/ để sau xuất kết quả còn đọc được.
+
+    GIỮ NGUYÊN tên file gốc (chống trùng bằng thư mục con uuid) — basename này chính là
+    tên thư mục con trên Google Drive của batch (drive_folder), đổi thành uuid là sai tên."""
     if not path:
         return None
     p = Path(path)
     if not p.exists():
         return str(p)
-    d = UPLOADS_DIR / "imports"
+    d = UPLOADS_DIR / "imports" / uuid.uuid4().hex[:12]
     d.mkdir(parents=True, exist_ok=True)
-    dst = d / (uuid.uuid4().hex[:12] + (p.suffix or ".xlsx"))
+    dst = d / (p.name or "import.xlsx")
     shutil.copy(p, dst)
     return str(dst)
 

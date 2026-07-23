@@ -1,0 +1,17 @@
+[Unit]
+Description=LatentSync TTS Queue Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/byscom/Latentsync/rendervideo
+ExecStart=/home/byscom/Latentsync/rendervideo/venv/bin/python /home/byscom/Latentsync/rendervideo/tts_worker.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+KillSignal=SIGTERM
+
+[Install]
+WantedBy=default.target

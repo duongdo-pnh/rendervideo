@@ -13,6 +13,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 from datetime import datetime
@@ -25,6 +26,13 @@ if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
 import database as db
+
+# Google Drive auto-upload là tùy chọn: thiếu thư viện google-* thì worker vẫn chạy bình thường.
+try:
+    import google_drive_upload as gdrive
+except Exception as _gdrive_err:
+    gdrive = None
+    _GDRIVE_IMPORT_ERROR = _gdrive_err
 
 ROOT = Path(__file__).parent
 DOWNLOADS_DIR = db.RENDERS_DIR        # video render xong tự đổ ra Desktop cho dễ nhìn
@@ -312,6 +320,41 @@ def process_job(job):
     shutil.copy(out_path, dst)
     db.mark_done(job_id, str(dst))
     _log(f"job #{job_id} DONE -> {dst}")
+    _start_drive_upload(job_id, dst, job.get("drive_folder"))
+
+
+# ---------------------------------------------------------------- Google Drive
+
+def _start_drive_upload(job_id, path, subfolder=None):
+    """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
+
+    Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
+      - job import Excel: tên file Excel (cột drive_folder);
+      - job render tay (không có drive_folder): gom theo ngày render 'dd-mm-yyyy'
+        — không thả thẳng vào folder gốc cho đỡ loạn.
+    Upload hỏng chỉ ghi drive_error vào DB (job vẫn done, file vẫn nằm ở downloads/);
+    upload lại tay: python google_drive_upload.py <file> [--subfolder "<tên>"]. Thread là
+    daemon nên tắt worker giữa chừng thì upload dở bị bỏ — chấp nhận, vì file gốc không mất.
+    """
+    if gdrive is None:
+        _log(f"job #{job_id} skip Drive upload (google libs missing: {_GDRIVE_IMPORT_ERROR})")
+        return
+    if not gdrive.drive_enabled():
+        return
+    if not subfolder:
+        subfolder = datetime.now().strftime("%d-%m-%Y")
+    threading.Thread(target=_drive_upload, args=(job_id, path, subfolder), daemon=True).start()
+
+
+def _drive_upload(job_id, path, subfolder=None):
+    try:
+        info = gdrive.upload_file(path, subfolder=subfolder)
+        db.set_drive_result(job_id, link=info.get("webViewLink"))
+        where = f" [{subfolder}]" if subfolder else ""
+        _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")
+    except Exception as e:
+        db.set_drive_result(job_id, error=e)
+        _log(f"job #{job_id} Drive upload FAILED: {e}")
 
 
 def _tail(path, n=15):

@@ -171,7 +171,13 @@ def _process(job):
             cfg.update(json.loads(job["render_config"]))
         except Exception:
             pass
-    render_id = db.add_job(name, job["video_path"], audio_path, **cfg)
+    # Job từ Excel: video lên Drive vào thư mục con mang tên file Excel của batch.
+    drive_folder = None
+    if job.get("batch_id"):
+        excel_path = tts_db.get_batch_excel(job["batch_id"])
+        if excel_path:
+            drive_folder = os.path.splitext(os.path.basename(excel_path))[0].strip() or None
+    render_id = db.add_job(name, job["video_path"], audio_path, drive_folder=drive_folder, **cfg)
     tts_db.mark_done(job["id"], audio_path, render_id)
     _log(f"#{job['id']} DONE ({duration:.1f}s) -> render job #{render_id} ('{name}')")
 

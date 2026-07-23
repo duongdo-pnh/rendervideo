@@ -48,6 +48,10 @@ _CONFIG_COLUMNS = {
     "enhance_region": "TEXT    NOT NULL DEFAULT 'mouth'",
     "out_res":        "TEXT    NOT NULL DEFAULT '720'",
     "input_type":     "TEXT    NOT NULL DEFAULT 'real'",
+    # Google Drive auto-upload (queue_worker đẩy lên sau khi job done)
+    "drive_link":     "TEXT",
+    "drive_error":    "TEXT",
+    "drive_folder":   "TEXT",   # tên thư mục con trong folder Drive chính (job từ Excel = tên file Excel); NULL = lên thẳng folder chính
 }
 
 
@@ -86,7 +90,8 @@ def init_db():
 
 
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
-            enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real"):
+            enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
+            drive_folder=None):
     """Insert a new queued job with its full render config. Resolves model_res -> config/checkpoint."""
     model_res = str(model_res)
     if model_res not in MODELS:
@@ -96,12 +101,14 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
         cur = con.execute(
             """
             INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path,
-                              guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
+                              drive_folder)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path,
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
-             str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real"),
+             str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real",
+             str(drive_folder) if drive_folder else None),
         )
         return cur.lastrowid
 
@@ -156,6 +163,15 @@ def mark_failed(job_id, error):
             "UPDATE jobs SET status='failed', error=?, "
             "finished_at=datetime('now','localtime') WHERE id=?",
             (str(error)[:2000], job_id),
+        )
+
+
+def set_drive_result(job_id, link=None, error=None):
+    """Ghi kết quả upload Google Drive của 1 job done: link khi thành công, error khi hỏng."""
+    with _connect() as con:
+        con.execute(
+            "UPDATE jobs SET drive_link=?, drive_error=? WHERE id=?",
+            (link, str(error)[:2000] if error else None, job_id),
         )
 
 
