@@ -343,7 +343,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 break
         return n
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         video_path: str,
