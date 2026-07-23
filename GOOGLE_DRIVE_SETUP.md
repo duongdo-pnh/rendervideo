@@ -58,19 +58,23 @@ python google_drive_upload.py video_test.mp4   # test upload thật, in ra link
 
 Xong. Restart `queue_worker.py` là các job render xong sẽ tự lên Drive.
 
-## Job import từ Excel → thư mục con theo tên file Excel
+## Tổ chức thư mục trên Drive
 
-Job tạo qua **import Excel** sẽ upload vào thư mục con mang **tên file Excel** (bỏ đuôi `.xlsx`) bên trong thư mục Drive chính — tự tạo nếu chưa có, các batch sau cùng file Excel thì dùng lại đúng thư mục đó:
+Không có video nào nằm thẳng ở thư mục gốc — tất cả gom vào thư mục con (tự tạo nếu chưa có):
+
+- Job **import Excel** → thư mục con mang **tên file Excel** (bỏ đuôi `.xlsx`); các batch sau cùng file Excel dùng lại đúng thư mục đó.
+- Job **render tay** (không qua Excel) → thư mục con theo **ngày render** dạng `dd-mm-yyyy`.
 
 ```
 Thư mục Drive chính/
 ├── Đơn hàng tháng 7/        ← import từ "Đơn hàng tháng 7.xlsx"
 │   ├── video_1.mp4
 │   └── video_2.mp4
-└── video_render_tay.mp4     ← job không qua Excel: lên thẳng thư mục chính
+└── 23-07-2026/              ← video render tay trong ngày 23/07
+    └── video_render_tay.mp4
 ```
 
-Tên thư mục lưu ở cột `drive_folder` trong `jobs.db` (chốt tại thời điểm tạo job). Upload tay vào thư mục con: `python google_drive_upload.py video.mp4 --subfolder "Đơn hàng tháng 7"`.
+Tên thư mục Excel lưu ở cột `drive_folder` trong `jobs.db` (chốt tại thời điểm tạo job); ngày thì lấy lúc render xong. Upload tay vào thư mục con bất kỳ: `python google_drive_upload.py video.mp4 --subfolder "Đơn hàng tháng 7"`.
 
 ## Vận hành
 

@@ -328,17 +328,21 @@ def process_job(job):
 def _start_drive_upload(job_id, path, subfolder=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
-    subfolder (cột drive_folder — job import Excel = tên file Excel): upload vào thư mục con
-    đó trong folder Drive chính, tự tạo nếu chưa có. Upload hỏng chỉ ghi drive_error vào DB
-    (job vẫn done, file vẫn nằm ở downloads/); upload lại tay:
-    python google_drive_upload.py <file> [--subfolder "<tên>"]. Thread là daemon nên tắt
-    worker giữa chừng thì upload dở bị bỏ — chấp nhận, vì file gốc không mất.
+    Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
+      - job import Excel: tên file Excel (cột drive_folder);
+      - job render tay (không có drive_folder): gom theo ngày render 'dd-mm-yyyy'
+        — không thả thẳng vào folder gốc cho đỡ loạn.
+    Upload hỏng chỉ ghi drive_error vào DB (job vẫn done, file vẫn nằm ở downloads/);
+    upload lại tay: python google_drive_upload.py <file> [--subfolder "<tên>"]. Thread là
+    daemon nên tắt worker giữa chừng thì upload dở bị bỏ — chấp nhận, vì file gốc không mất.
     """
     if gdrive is None:
         _log(f"job #{job_id} skip Drive upload (google libs missing: {_GDRIVE_IMPORT_ERROR})")
         return
     if not gdrive.drive_enabled():
         return
+    if not subfolder:
+        subfolder = datetime.now().strftime("%d-%m-%Y")
     threading.Thread(target=_drive_upload, args=(job_id, path, subfolder), daemon=True).start()
 
 
