@@ -16,10 +16,10 @@ _envbin = os.path.dirname(sys.executable)
 if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
-# LƯU Ý (đã kiểm chứng 2026-06-15): KHÔNG ép insightface/onnxruntime chạy CUDAExecutionProvider.
-# Diffusion nhanh hơn ~43% (5.55->3.22 s/it) NHƯNG output bị HỎNG — vẽ ô ĐEN lên mặt (mediapipe
-# dò mặt 0/98 frame). insightface PHẢI chạy CPUExecutionProvider để kết quả dò mặt đúng. Đừng
-# preload các lib CUDA (libnvrtc/cudnn…) để "sửa" cảnh báo onnxruntime — đó là fallback ĐÚNG.
+# RTX 5090 profile (2026-07-23): keep Torch cu128/sm_120 and DO NOT enable xformers unless
+# a wheel explicitly supports Blackwell. Face detect/align should use ONNXRuntime GPU; verify with:
+#   import onnxruntime as ort; print(ort.get_available_providers())
+# Expected providers include CUDAExecutionProvider. Keep protobuf<5 for mediapipe/GFPGAN restore.
 
 import argparse
 import contextlib
