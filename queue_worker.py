@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -127,18 +128,28 @@ def _ffprobe_duration(path):
         return 0.0
 
 
-def normalize_video(src, work_dir):
+def normalize_video(src, work_dir, out_res=None):
     """Re-encode to 25fps via NVENC (GPU). Falls back to libx264 if NVENC fails."""
     dst = str(Path(work_dir) / "norm_video.mp4")
+    target = {"1080": 1080, "720": 720, "480 Nhanh": 480}.get(out_res)
+    vf = []
+    if target:
+        vf.append(
+            f"scale=\x27if(gt(iw,ih),-2,min(iw,{target}))\x27:"
+            f"\x27if(gt(iw,ih),min(ih,{target}),-2)\x27"
+        )
+    vf.append("fps=25")
+    video_filter = ",".join(vf)
     nvenc = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-             "-r", "25", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19",
+             "-vf", video_filter, "-c:v", "h264_nvenc", "-preset", "p1",
+             "-tune", "ll", "-cq", "19",
              "-pix_fmt", "yuv420p", "-an", dst]
     r = subprocess.run(nvenc, capture_output=True, text=True)
     if r.returncode == 0:
         return dst
     _log(f"NVENC failed ({r.stderr.strip()[:200]}); falling back to libx264")
     x264 = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-            "-r", "25", "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-vf", video_filter, "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-an", dst]
     subprocess.run(x264, check=True)
     return dst
@@ -204,6 +215,20 @@ def _run_render(cmd, log_path, idle_timeout=RENDER_IDLE_TIMEOUT):
         except BaseException:
             _stop_process_tree(proc)
             raise
+
+
+def trim_video_for_musetalk(video_path, work_dir, seconds=30):
+    """Create a stable, audio-independent avatar carrier for MuseTalk caching."""
+    if _ffprobe_duration(video_path) <= seconds:
+        return str(video_path)
+    out = str(Path(work_dir) / "musetalk_carrier.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", str(video_path),
+                        "-t", str(seconds), "-c", "copy", "-an", out], check=True)
+        return out
+    except Exception as e:
+        _log(f"MuseTalk fixed carrier trim failed ({e}); using full video")
+        return str(video_path)
 
 
 def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
@@ -284,10 +309,12 @@ def process_job(job):
     work.mkdir(parents=True, exist_ok=True)
     log_path = LOGS_DIR / f"job_{job_id}.log"
 
-    # Trim a too-long carrier to ~audio length first (cheap) so NVENC normalize + the renderer's
-    # downscale/scenedetect don't churn through video that gets discarded. Short videos pass through.
-    src_video = trim_video_to_audio(job["video_path"], job["audio_path"], work)
-    nv = normalize_video(src_video, work)
+    # Keep MuseTalk video stable across different audio lengths so its avatar cache is reusable.
+    if job.get("engine", "musetalk") == "musetalk":
+        src_video = trim_video_for_musetalk(job["video_path"], work)
+    else:
+        src_video = trim_video_to_audio(job["video_path"], job["audio_path"], work)
+    nv = normalize_video(src_video, work, job["out_res"])
     na = normalize_audio(job["audio_path"], work)
     out_path = work / "out.mp4"
     # Do not impose a wall-clock limit. Long 512 renders can legitimately take many hours;
@@ -306,6 +333,7 @@ def process_job(job):
         "--seed", str(job["seed"]), "--enhance_mouth", str(job["enhance_mouth"]),
         "--enhance_region", job["enhance_region"], "--out_res", job["out_res"],
         "--input_type", job.get("input_type", "real"),
+        "--engine", job.get("engine", "musetalk"),
     ]
     returncode = _run_render(cmd, log_path)
 
@@ -364,6 +392,21 @@ def _tail(path, n=15):
         return "(no log)"
 
 
+def _process_claimed_job(job):
+    try:
+        process_job(job)
+    except Exception as exc:
+        job_id = job["id"]
+        retries = job["retries"]
+        if retries < db.MAX_RETRIES:
+            db.requeue_for_retry(job_id, exc)
+            _log("job #{} failed (retry {}/{}): {}".format(
+                job_id, retries + 1, db.MAX_RETRIES, exc))
+        else:
+            db.mark_failed(job_id, exc)
+            _log("job #{} FAILED permanently: {}".format(job_id, exc))
+
+
 # ---------------------------------------------------------------- main loop
 
 def _stop(*_):
@@ -402,15 +445,14 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            try:
-                process_job(job)
-            except Exception as e:
-                if job["retries"] < db.MAX_RETRIES:
-                    db.requeue_for_retry(job["id"], e)
-                    _log(f"job #{job['id']} failed (retry {job['retries']+1}/{db.MAX_RETRIES}): {e}")
-                else:
-                    db.mark_failed(job["id"], e)
-                    _log(f"job #{job['id']} FAILED permanently: {e}")
+            jobs = [job] + db.claim_matching_jobs(job, limit=2)
+            if len(jobs) > 1:
+                _log(f"batch avatar: running {len(jobs)} jobs concurrently: " +
+                     ", ".join(f"#{item['id']}" for item in jobs))
+            with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                futures = [pool.submit(_process_claimed_job, item) for item in jobs]
+                for future in as_completed(futures):
+                    future.result()
         except Exception as loop_err:
             # Never let the loop die — log and keep going.
             _log(f"loop error (continuing): {loop_err}")
