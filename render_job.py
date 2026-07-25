@@ -167,7 +167,12 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     # Carrier longer than audio? Trim to ~audio length FIRST (cheap stream-copy) so the heavy
     # downscale / normalize / scenedetect below process ~audio-length, not the full clip. Shorter
     # videos pass through untouched -> prepare_carrier forward-loops + cuts them to audio length.
-    video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
+    # Keep the complete carrier when avatar caching is enabled. Trimming by audio duration
+    # would produce a different cache key for every voice and prevent safe reuse. The pipeline
+    # already renders only the audio-driven frame count, so this does not increase UNet work.
+    avatar_cache_enabled = os.environ.get("LATENTSYNC_AVATAR_CACHE", "1").lower() not in ("0", "false", "off")
+    if not avatar_cache_enabled:
+        video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
 
     # Output resolution: downscale input to chosen shorter side (output res = input res).
     video_path = _maybe_downscale(video_path, OUT_RES.get(out_res), str(work_dir))
@@ -208,8 +213,21 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     temp_dir = str(work_dir / f"temp_{Path(output_path).stem}")
     args = _build_args(video_path, audio_path, raw_out, checkpoint, steps, guidance, seed, temp_dir)
 
-    # Serialize the GPU-heavy section across processes (diffusion + GFPGAN).
+    # Serialize cache creation and GPU-heavy inference. The first job computes the avatar-only
+    # data; later jobs with the same processed carrier load it and skip face detect/align.
     with gpu_lock():
+        if avatar_cache_enabled:
+            from avatar_cache_lib import cache_dir_for, cache_is_complete, precompute_avatar
+            cache_root = str(Path(__file__).parent / "avatar_cache")
+            cache_dir = cache_dir_for(video_path, cache_root)
+            if cache_is_complete(cache_dir):
+                print(f"[avatar-cache] reuse {cache_dir}", flush=True)
+            else:
+                print(f"[avatar-cache] MISS; building {cache_dir}", flush=True)
+                precompute_avatar(video_path, cache_root=cache_root, resolution=int(config.data.resolution))
+            args.avatar_cache = cache_dir
+        else:
+            args.avatar_cache = None
         inference_main(config=config, args=args)
         print("[render_job] diffusion done", flush=True)
 

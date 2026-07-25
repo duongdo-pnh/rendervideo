@@ -218,7 +218,11 @@ def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
     adur = _ffprobe_duration(audio_path)
     if not vdur or not adur or vdur <= adur + margin:
         return str(video_path)
-    keep = adur + margin
+    # Stable duration buckets make the normalized carrier identical for different voices
+    # of similar length, so face/align data can safely share one cache entry.
+    required = adur + margin
+    bucket = max(10, int(os.environ.get("LATENTSYNC_CACHE_BUCKET_SECONDS", "30")))
+    keep = min(vdur, ((int(required) + bucket - 1) // bucket) * bucket)
     out = str(Path(work_dir) / "trim_video.mp4")
     try:
         subprocess.run(
@@ -231,7 +235,8 @@ def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
         return str(video_path)
     if _ffprobe_duration(out) < adur:            # keyframe cut landed too short -> unsafe, skip
         return str(video_path)
-    _log(f"trim carrier {vdur:.0f}s -> ~{keep:.0f}s (audio {adur:.0f}s) before normalize")
+    _log(f"trim carrier {vdur:.0f}s -> cache bucket ~{keep:.0f}s "
+         f"(audio {adur:.0f}s, bucket={bucket}s) before normalize")
     return out
 
 

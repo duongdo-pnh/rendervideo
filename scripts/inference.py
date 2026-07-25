@@ -93,6 +93,22 @@ def main(config, args):
 
     print(f"Initial seed: {torch.initial_seed()}")
 
+    cache_kwargs = {}
+    avatar_cache = getattr(args, "avatar_cache", None)
+    if avatar_cache:
+        from avatar_cache_lib import cache_is_complete, load_cache
+        if not cache_is_complete(avatar_cache):
+            raise RuntimeError(f"Incomplete avatar cache: {avatar_cache}")
+        cached = load_cache(avatar_cache)
+        if int(cached["meta"].get("resolution", config.data.resolution)) != int(config.data.resolution):
+            raise RuntimeError("Avatar cache resolution does not match inference config")
+        cache_kwargs = {
+            "precomputed_faces": cached["faces"],
+            "precomputed_boxes": cached["boxes"],
+            "precomputed_affine_matrices": cached["affine"],
+        }
+        print(f"[avatar-cache] HIT {avatar_cache} ({len(cached['faces'])} frames)", flush=True)
+
     pipeline(
         video_path=args.video_path,
         audio_path=args.audio_path,
@@ -106,6 +122,7 @@ def main(config, args):
         mask_image_path=config.data.mask_image_path,
         temp_dir=args.temp_dir,
         chunk_overlap=int(config.run.get("chunk_overlap", 4)),
+        **cache_kwargs,
     )
 
 
@@ -121,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--temp_dir", type=str, default="temp")
     parser.add_argument("--seed", type=int, default=1247)
     parser.add_argument("--enable_deepcache", action="store_true")
+    parser.add_argument("--avatar_cache", default=None)
     args = parser.parse_args()
 
     config = OmegaConf.load(args.unet_config_path)
