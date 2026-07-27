@@ -149,6 +149,18 @@ def claim_next_job():
         con.close()
 
 
+def has_completed_matching_avatar(anchor):
+    """True after one successful MuseTalk render has warmed this avatar/resolution."""
+    if anchor.get("engine") != "musetalk":
+        return False
+    with _connect() as con:
+        return con.execute(
+            "SELECT 1 FROM jobs WHERE status='done' AND engine='musetalk' "
+            "AND video_path=? AND out_res=? LIMIT 1",
+            (anchor["video_path"], anchor["out_res"]),
+        ).fetchone() is not None
+
+
 def claim_matching_jobs(anchor, limit=2):
     """Atomically claim queued MuseTalk jobs that can share the anchor avatar."""
     if limit <= 0 or anchor.get("engine") != "musetalk":

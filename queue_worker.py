@@ -49,6 +49,8 @@ GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claimi
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
 RENDER_IDLE_TIMEOUT = 20 * 60  # no new log output this long means the renderer is genuinely stuck
 RENDER_POLL_SECONDS = 5
+MUSETALK_BATCH_COLLECT_SECONDS = 10
+MUSETALK_BATCH_POLL_SECONDS = 0.5
 
 _RUNNING = True
 _WORKER_LOCK_FILE = None
@@ -406,6 +408,22 @@ def _process_claimed_job(job):
             db.mark_failed(job_id, exc)
             _log("job #{} FAILED permanently: {}".format(job_id, exc))
 
+def _collect_musetalk_pair(anchor):
+    """Wait briefly for a second matching job created asynchronously by Excel/TTS."""
+    if anchor.get("engine") != "musetalk" or not db.has_completed_matching_avatar(anchor):
+        return []
+    deadline = time.monotonic() + MUSETALK_BATCH_COLLECT_SECONDS
+    while _RUNNING:
+        matches = db.claim_matching_jobs(anchor, limit=1)
+        if matches:
+            waited = MUSETALK_BATCH_COLLECT_SECONDS - max(0.0, deadline - time.monotonic())
+            _log(f"batch avatar: collected #{matches[0]['id']} after {waited:.1f}s")
+            return matches
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+        time.sleep(min(MUSETALK_BATCH_POLL_SECONDS, remaining))
+
 
 # ---------------------------------------------------------------- main loop
 
@@ -445,7 +463,10 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            jobs = [job] + db.claim_matching_jobs(job, limit=2)
+            # Warm a new avatar with one job first. Once warm, briefly collect a matching
+            # partner that Excel/TTS may still be creating asynchronously.
+            jobs = [job]
+            jobs += _collect_musetalk_pair(job)
             if len(jobs) > 1:
                 _log(f"batch avatar: running {len(jobs)} jobs concurrently: " +
                      ", ".join(f"#{item['id']}" for item in jobs))
