@@ -146,9 +146,23 @@ def _infer_group(avatar, reqs):
 
 
 def _encode_job(avatar, req, frames, run_dir):
-    tmp_dir = run_dir / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
     fps = int(req.get("fps", 25))
+    silent_video = run_dir / "silent.mp4"
+    output_path = Path(req["output_path"]).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pipe = None
+    tmp_dir = run_dir / "tmp"
+    if req.get("realtime"):
+        height, width = avatar.frame_list_cycle[0].shape[:2]
+        pipe = subprocess.Popen([
+            "ffmpeg", "-y", "-v", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+            "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
+            "-an", "-vcodec", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-pix_fmt", "yuv420p", "-crf", "20", str(silent_video),
+        ], stdin=subprocess.PIPE)
+    else:
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+
     for idx, result in enumerate(frames):
         cycle_idx = idx % len(avatar.frame_list_cycle)
         bbox = avatar.coord_list_cycle[cycle_idx]
@@ -156,24 +170,27 @@ def _encode_job(avatar, req, frames, run_dir):
         resized = cv2.resize(result.astype("uint8"), (x2 - x1, y2 - y1))
         original = avatar.frame_list_cycle[cycle_idx].copy()
         blended = get_image_blending(
-            original, resized, bbox,
-            avatar.mask_list_cycle[cycle_idx],
+            original, resized, bbox, avatar.mask_list_cycle[cycle_idx],
             avatar.mask_coords_list_cycle[cycle_idx],
         )
-        if not cv2.imwrite(str(tmp_dir / f"{idx:08d}.png"), blended):
+        if pipe:
+            pipe.stdin.write(blended.tobytes())
+        elif not cv2.imwrite(str(tmp_dir / f"{idx:08d}.png"), blended):
             raise RuntimeError(f"failed to save blended frame {idx}")
 
-    silent_video = run_dir / "silent.mp4"
-    output_path = Path(req["output_path"]).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if pipe:
+        pipe.stdin.close()
+        if pipe.wait() != 0:
+            raise RuntimeError("ffmpeg raw-video encoder failed")
+    else:
+        subprocess.run([
+            "ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
+            "-i", str(tmp_dir / "%08d.png"), "-vcodec", "libx264",
+            "-vf", "format=yuv420p", "-crf", "18", str(silent_video),
+        ], check=True)
     subprocess.run([
-        "ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
-        "-i", str(tmp_dir / "%08d.png"), "-vcodec", "libx264",
-        "-vf", "format=yuv420p", "-crf", "18", str(silent_video),
-    ], check=True)
-    subprocess.run([
-        "ffmpeg", "-y", "-v", "warning", "-i", req["audio_path"],
-        "-i", str(silent_video), str(output_path),
+        "ffmpeg", "-y", "-v", "error", "-i", req["audio_path"],
+        "-i", str(silent_video), "-c:v", "copy", "-c:a", "aac", "-shortest", str(output_path),
     ], check=True)
     if not output_path.is_file():
         raise RuntimeError(f"server output missing: {output_path}")
@@ -207,7 +224,7 @@ def _batch_loop():
     while True:
         first = deferred.pop(0) if deferred else REQUESTS.get()
         group = [first]
-        deadline = time.monotonic() + COALESCE_SECONDS
+        deadline = time.monotonic() + (0.0 if first["req"].get("realtime") else COALESCE_SECONDS)
         while len(group) < MAX_GROUP_SIZE:
             timeout = deadline - time.monotonic()
             if timeout <= 0:
