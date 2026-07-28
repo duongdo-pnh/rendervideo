@@ -52,6 +52,7 @@ _CONFIG_COLUMNS = {
     "drive_link":     "TEXT",
     "drive_error":    "TEXT",
     "drive_folder":   "TEXT",   # tên thư mục con trong folder Drive chính (job từ Excel = tên file Excel); NULL = lên thẳng folder chính
+    "drive_name":     "TEXT",   # tên file riêng khi upload Drive; NULL = giữ tên file local
 }
 
 
@@ -91,7 +92,7 @@ def init_db():
 
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
             enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
-            drive_folder=None):
+            drive_folder=None, drive_name=None):
     """Insert a new queued job with its full render config. Resolves model_res -> config/checkpoint."""
     model_res = str(model_res)
     if model_res not in MODELS:
@@ -102,13 +103,14 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
             """
             INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path,
                               guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
-                              drive_folder)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              drive_folder, drive_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path,
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
              str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real",
-             str(drive_folder) if drive_folder else None),
+             str(drive_folder) if drive_folder else None,
+             str(drive_name) if drive_name else None),
         )
         return cur.lastrowid
 

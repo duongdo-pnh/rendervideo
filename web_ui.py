@@ -847,7 +847,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                         autovoice_load_btn = gr.Button("🔌 Kết nối & tải giọng")
                         autovoice_status = gr.Markdown()
                     autovoice_voices_dd = gr.Dropdown(
-                        label="Voice hệ thống (chọn hoặc nhập voice_name)",
+                        label="Voice hệ thống (chọn hoặc nhập voiceId)",
                         choices=[],
                         value=_cur.get("AUTOVOICE_DEFAULT_VOICE", ""),
                         allow_custom_value=True)

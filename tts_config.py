@@ -34,7 +34,7 @@ PROVIDER_FIELDS = {
     ],
     "autovoice": [
         ("AUTOVOICE_API_KEY", "API Key Voice hệ thống (X-API-Key)", True),
-        ("AUTOVOICE_DEFAULT_VOICE", "Mã giọng (voice_name)", False),
+        ("AUTOVOICE_DEFAULT_VOICE", "Mã giọng (voiceId)", False),
         ("AUTOVOICE_URL", "Endpoint TTS", False),
         ("AUTOVOICE_VOICES_URL", "Endpoint danh sách giọng (tuỳ chọn)", False),
         ("AUTOVOICE_SPEED", "Tốc độ riêng Voice hệ thống (trống = dùng TTS_SPEED)", False),

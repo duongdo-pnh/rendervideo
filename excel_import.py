@@ -324,6 +324,23 @@ def build_name_excel(product, video_type, question_type, other_key=None, row=Non
     return f"{base}__{intent}{suffix}" if base else f"__{intent}{suffix}"
 
 
+def build_drive_name(product, video_type, question_type, other_key=None):
+    """Tên file Drive cho job Excel: product_video_type_question_type.
+
+    ASK_OTHER giữ thêm other_key để các loại câu hỏi tùy chỉnh không trùng tên.
+    Phần question_type rỗng của video giới thiệu được ghi là ``intro``.
+    Đuôi .mp4 được thêm ở queue worker sau khi chuẩn hóa ký tự tên file.
+    """
+    product_part = str(product).strip() if product else "video"
+    video_type_part = str(video_type).strip() if video_type else "gioi_thieu"
+    question_part = build_intent_name(question_type, other_key) or "intro"
+    suffix = f"_{video_type_part}_{question_part}"
+    # queue_worker chuẩn hóa tên Drive với giới hạn 140 ký tự; rút gọn riêng phần
+    # sản phẩm để video_type + question_type luôn còn nguyên ở cuối tên.
+    product_part = product_part[:max(1, 140 - len(suffix))]
+    return f"{product_part}{suffix}"
+
+
 # ----------------------------------------------------------------- read + validate
 
 def _clean(val):

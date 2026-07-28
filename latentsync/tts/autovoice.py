@@ -1,8 +1,8 @@
-"""Voice he thong (voice.autovideo.vn) TTS provider.
+"""Voice he thong (autovoice.vn) TTS provider.
 
 API shape, ported from lives.git:
   POST {AUTOVOICE_URL} with X-API-Key and JSON
-  {"text": "...", "voice_name": "...", "speed": 1.2}
+  {"text": "...", "voiceId": "...", "speed": 1.0}
 
 The response can be audio bytes, JSON with an audio URL, or JSON with base64 audio.
 This provider always writes to the requested output_path, transcoding to WAV when needed.
@@ -16,7 +16,7 @@ import requests
 
 from .base import TTSProvider
 
-DEFAULT_URL = "https://voice.autovideo.vn/v1/tts"
+DEFAULT_URL = "https://autovoice.vn/rest/tts/synthesize"
 MAX_CHARS = 2000
 
 
@@ -117,7 +117,7 @@ class AutoVoiceTTS(TTSProvider):
     def synthesize(self, text, output_path, voice=None):
         voice = (voice or self.default_voice or "").strip()
         if not voice:
-            raise AutoVoiceError("Chua nhap ma giong AUTOVOICE_DEFAULT_VOICE / voice_name.")
+            raise AutoVoiceError("Chua nhap ma giong AUTOVOICE_DEFAULT_VOICE / voiceId.")
         text = (text or "").strip()
         if not text:
             raise AutoVoiceError("Text rong.")
@@ -125,7 +125,7 @@ class AutoVoiceTTS(TTSProvider):
             text = text[:MAX_CHARS].rsplit(" ", 1)[0] or text[:MAX_CHARS]
 
         self._ensure_parent(output_path)
-        payload = {"text": text, "voice_name": voice, "speed": self.speed}
+        payload = {"text": text, "voiceId": voice, "speed": self.speed}
         try:
             r = requests.post(self.url, headers=self._headers(), json=payload, timeout=self.timeout)
         except Exception as e:
@@ -210,8 +210,10 @@ class AutoVoiceTTS(TTSProvider):
                 if isinstance(v, str):
                     code, name, gender, lang = v, v, "", ""
                 elif isinstance(v, dict):
-                    code = v.get("voice_name") or v.get("code") or v.get("id") or v.get("name")
-                    name = v.get("name") or v.get("title") or v.get("display_name") or code
+                    code = (v.get("voiceId") or v.get("voice_id") or v.get("voice_name")
+                            or v.get("code") or v.get("id") or v.get("name"))
+                    name = (v.get("displayName") or v.get("display_name") or v.get("name")
+                            or v.get("title") or code)
                     gender = v.get("gender") or ""
                     lang = v.get("language") or v.get("lang") or v.get("language_code") or ""
                 else:

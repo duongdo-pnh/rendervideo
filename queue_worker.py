@@ -320,12 +320,12 @@ def process_job(job):
     shutil.copy(out_path, dst)
     db.mark_done(job_id, str(dst))
     _log(f"job #{job_id} DONE -> {dst}")
-    _start_drive_upload(job_id, dst, job.get("drive_folder"))
+    _start_drive_upload(job_id, dst, job.get("drive_folder"), job.get("drive_name"))
 
 
 # ---------------------------------------------------------------- Google Drive
 
-def _start_drive_upload(job_id, path, subfolder=None):
+def _start_drive_upload(job_id, path, subfolder=None, drive_name=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
     Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
@@ -343,12 +343,17 @@ def _start_drive_upload(job_id, path, subfolder=None):
         return
     if not subfolder:
         subfolder = datetime.now().strftime("%d-%m-%Y")
-    threading.Thread(target=_drive_upload, args=(job_id, path, subfolder), daemon=True).start()
+    upload_name = f"{_safe_name(drive_name)}{Path(path).suffix}" if drive_name else None
+    threading.Thread(
+        target=_drive_upload,
+        args=(job_id, path, subfolder, upload_name),
+        daemon=True,
+    ).start()
 
 
-def _drive_upload(job_id, path, subfolder=None):
+def _drive_upload(job_id, path, subfolder=None, upload_name=None):
     try:
-        info = gdrive.upload_file(path, subfolder=subfolder)
+        info = gdrive.upload_file(path, name=upload_name, subfolder=subfolder)
         db.set_drive_result(job_id, link=info.get("webViewLink"))
         where = f" [{subfolder}]" if subfolder else ""
         _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")
