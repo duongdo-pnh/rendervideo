@@ -53,6 +53,7 @@ _CONFIG_COLUMNS = {
     "drive_error":    "TEXT",
     "drive_folder":   "TEXT",   # tên thư mục con trong folder Drive chính (job từ Excel = tên file Excel); NULL = lên thẳng folder chính
     "drive_name":     "TEXT",   # tên file riêng khi upload Drive; NULL = giữ tên file local
+    "priority":       "INTEGER NOT NULL DEFAULT 0",  # lớn hơn = chạy trước
 }
 
 
@@ -84,9 +85,9 @@ def init_db():
         for col, decl in _CONFIG_COLUMNS.items():
             if col not in existing:
                 con.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
-        # Speeds up the claim_next_job lookup (status filter + creation order).
+        # Speeds up claim_next_job: trạng thái + ưu tiên giảm dần + thứ tự tạo.
         con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at, id)"
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, priority DESC, created_at, id)"
         )
 
 
@@ -135,7 +136,7 @@ def claim_next_job():
              WHERE id = (
                    SELECT id FROM jobs
                     WHERE status = 'queued'
-                    ORDER BY created_at, id
+                    ORDER BY priority DESC, created_at, id
                     LIMIT 1
              )
             RETURNING *
@@ -185,6 +186,56 @@ def requeue_for_retry(job_id, error):
             "started_at=NULL WHERE id=?",
             (str(error)[:2000], job_id),
         )
+
+
+def prioritize_job(job_id):
+    """Đưa một job đang chờ lên đầu queue. Job đang render hoặc đã xong bị từ chối."""
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Không thấy job #{job_id}.")
+        if row["status"] != STATUS_QUEUED:
+            raise ValueError(
+                f"Job #{job_id} không ở trạng thái chờ (hiện tại: {row['status']})."
+            )
+        next_priority = con.execute(
+            "SELECT COALESCE(MAX(priority), 0) + 1 FROM jobs WHERE status=?",
+            (STATUS_QUEUED,),
+        ).fetchone()[0]
+        con.execute("UPDATE jobs SET priority=? WHERE id=?", (next_priority, job_id))
+        return {**dict(row), "priority": next_priority}
+
+
+def prioritize_jobs(job_ids):
+    """Xếp nhiều job queued theo thứ tự truyền vào; phần tử đầu chạy trước."""
+    ordered_ids = list(dict.fromkeys(int(job_id) for job_id in (job_ids or [])))
+    if not ordered_ids:
+        raise ValueError("Hãy chọn ít nhất một job đang chờ.")
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in ordered_ids)
+        rows = con.execute(
+            f"SELECT id, status FROM jobs WHERE id IN ({placeholders})", ordered_ids
+        ).fetchall()
+        found = {row["id"]: row["status"] for row in rows}
+        missing = [job_id for job_id in ordered_ids if job_id not in found]
+        if missing:
+            raise ValueError(f"Không thấy job: {missing}.")
+        invalid = [job_id for job_id in ordered_ids if found[job_id] != STATUS_QUEUED]
+        if invalid:
+            raise ValueError(f"Job không còn ở trạng thái chờ: {invalid}.")
+        base = con.execute(
+            "SELECT COALESCE(MAX(priority), 0) FROM jobs WHERE status=?",
+            (STATUS_QUEUED,),
+        ).fetchone()[0]
+        total = len(ordered_ids)
+        for position, job_id in enumerate(ordered_ids):
+            con.execute(
+                "UPDATE jobs SET priority=? WHERE id=?",
+                (base + total - position, job_id),
+            )
+    return ordered_ids
 
 
 def get_job(job_id):

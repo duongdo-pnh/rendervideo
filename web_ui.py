@@ -179,17 +179,33 @@ def _job_duration(j):
     return ""
 
 
-def _table_rows():
+def _table_rows(prioritized_id=None):
     rows = []
-    for j in db.list_jobs(limit=200):
+    jobs = db.list_jobs(limit=200)
+    rendering = [j for j in jobs if j["status"] == db.STATUS_RENDERING]
+    queued = sorted(
+        (j for j in jobs if j["status"] == db.STATUS_QUEUED),
+        key=lambda j: (-int(j.get("priority") or 0), j.get("created_at") or "", j["id"]),
+    )
+    history = [j for j in jobs if j["status"] not in (db.STATUS_RENDERING, db.STATUS_QUEUED)]
+    for j in [*rendering, *queued, *history]:
         rows.append([
             j["id"], j["name"], j["model_res"],
             STATUS_LABEL.get(j["status"], j["status"]),
-            _job_duration(j),
+            int(j.get("priority") or 0), _job_duration(j),
             j["retries"], j["created_at"] or "",
             (j["error"] or "")[:80],
+            ("✅ Đã ưu tiên" if j["id"] == prioritized_id else "⚡ Ưu tiên")
+            if j["status"] == db.STATUS_QUEUED else "",
         ])
     return rows
+
+
+def _priority_choices():
+    """Các job đang chờ theo đúng thứ tự queue hiện tại."""
+    jobs = [j for j in db.list_jobs(limit=200) if j["status"] == db.STATUS_QUEUED]
+    jobs.sort(key=lambda j: (-int(j.get("priority") or 0), j.get("created_at") or "", j["id"]))
+    return [(f"#{j['id']} · {j['name']}", str(j["id"])) for j in jobs]
 
 
 def _video_choices():
@@ -243,6 +259,67 @@ def _cleanup_job_files(row):
             shutil.rmtree(vp.parent, ignore_errors=True)
     except Exception:
         pass
+
+
+def prioritize_from_table(table_data, evt: gr.SelectData):
+    """Bấm ô thao tác ở dòng queued để ưu tiên ngay, không cần nhập ID."""
+    try:
+        index = evt.index if isinstance(evt.index, (list, tuple)) else ()
+        row_index = int(index[0]) if len(index) > 1 else None
+        col = int(index[1]) if len(index) > 1 else None
+        if col != 9 or evt.value != "⚡ Ưu tiên":
+            return gr.update(), gr.update()
+
+        # Gradio 5 không cung cấp row_value cho Dataframe.select; đọc ID từ
+        # chính dữ liệu bảng theo chỉ số dòng mà sự kiện gửi về.
+        if row_index is None:
+            raise ValueError("Không xác định được dòng job.")
+        if hasattr(table_data, "iloc"):
+            job_id = table_data.iloc[row_index, 0]
+        elif isinstance(table_data, dict):
+            job_id = table_data.get("data", [])[row_index][0]
+        else:
+            job_id = table_data[row_index][0]
+        row = db.prioritize_job(int(job_id))
+    except (TypeError, ValueError, IndexError, KeyError) as e:
+        gr.Warning(str(e))
+        return gr.update(), f"⚠ Không thể ưu tiên job: {e}"
+    gr.Info(f"✅ Đã ưu tiên job #{row['id']}.")
+    return gr.update(value=_table_rows(prioritized_id=row["id"])), (
+        f"### ✅ Đã ưu tiên job #{row['id']}\n"
+        "Job này đã được đưa lên đầu hàng chờ và sẽ chạy ngay sau job đang render."
+    )
+
+
+def apply_priority_list(job_ids):
+    """Áp dụng thứ tự ưu tiên đã chọn. Outputs: bảng, thông báo, dropdown."""
+    try:
+        ordered_ids = db.prioritize_jobs(job_ids)
+    except (TypeError, ValueError) as e:
+        gr.Warning(str(e))
+        return gr.update(), f"⚠ {e}", gr.update(choices=_priority_choices())
+    order_text = " → ".join(f"#{job_id}" for job_id in ordered_ids)
+    gr.Info("✅ Đã lưu danh sách ưu tiên.")
+    return (
+        gr.update(value=_table_rows(prioritized_id=ordered_ids[0])),
+        f"### ✅ Đã lưu danh sách ưu tiên\nThứ tự chạy: **{order_text}**",
+        gr.update(choices=_priority_choices(), value=[str(job_id) for job_id in ordered_ids]),
+    )
+
+
+def do_prioritize_job(job_id):
+    """Đưa job queued lên đầu hàng đợi. Outputs: [status_table, done_dd, message]."""
+    if not job_id:
+        gr.Warning("Nhập ID job cần ưu tiên.")
+        return gr.update(), gr.update(), "⚠ Nhập ID job cần ưu tiên."
+    try:
+        row = db.prioritize_job(int(job_id))
+    except (TypeError, ValueError) as e:
+        gr.Warning(str(e))
+        return gr.update(), gr.update(), f"⚠ {e}"
+    gr.Info(f"⚡ Job #{row['id']} sẽ được render kế tiếp.")
+    table, dd = refresh_status()
+    return table, dd, f"⚡ Đã đưa job #{row['id']} ('{row['name']}') lên đầu queue."
 
 
 def do_delete_job(job_id):
@@ -563,6 +640,53 @@ CSS = """
 }
 #name-box label { font-weight: 600; }
 #name-preview { font-size: 1.1rem; }
+#priority-list {
+  margin: 8px 0 14px;
+  padding: 14px;
+  border: 1px solid rgba(37, 99, 235, 0.35);
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.06);
+}
+#priority-feedback:not(:empty) {
+  margin: 8px 0 12px;
+  padding: 12px 16px;
+  border: 1px solid #16a34a;
+  border-radius: 10px;
+  background: rgba(22, 163, 74, 0.12);
+  color: #15803d;
+}
+#queue-table table tbody tr td:last-child {
+  text-align: center;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#queue-table table tbody tr td:last-child span:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 92px;
+  padding: 6px 12px;
+  color: #9a3412;
+  background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
+  border: 1px solid #fdba74;
+  border-radius: 999px;
+  font-size: 0.84rem;
+  font-weight: 700;
+  line-height: 1.2;
+  box-shadow: 0 1px 2px rgba(154, 52, 18, 0.10);
+  transition: all 140ms ease;
+}
+#queue-table table tbody tr td:last-child:hover span:not(:empty) {
+  color: #ffffff;
+  background: linear-gradient(180deg, #f97316 0%, #ea580c 100%);
+  border-color: #ea580c;
+  box-shadow: 0 4px 10px rgba(234, 88, 12, 0.25);
+  transform: translateY(-1px);
+}
+#queue-table table tbody tr td:last-child:active span:not(:empty) {
+  box-shadow: 0 1px 3px rgba(234, 88, 12, 0.20);
+  transform: translateY(0) scale(0.98);
+}
 """
 
 with gr.Blocks(title="Render Queue", css=CSS) as demo:
@@ -656,10 +780,22 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 
     with gr.Tab("📊 Trạng thái queue"):
         gr.Markdown("Tự refresh mỗi 10 giây.")
+        with gr.Group(elem_id="priority-list"):
+            gr.Markdown("#### 📌 Tạo danh sách ưu tiên\nChọn các job theo thứ tự muốn chạy — job chọn đầu tiên sẽ chạy trước.")
+            priority_list = gr.Dropdown(
+                label="Thứ tự job ưu tiên", choices=_priority_choices(),
+                multiselect=True, info="Có thể chọn nhiều job đang chờ.",
+            )
+            with gr.Row():
+                priority_apply = gr.Button("✅ Áp dụng danh sách", variant="primary")
+                priority_reload = gr.Button("🔄 Cập nhật job đang chờ")
+        priority_msg = gr.Markdown(elem_id="priority-feedback")
+
         status_table = gr.Dataframe(
-            headers=["ID", "Tên", "Model", "Trạng thái", "⏱ Thời gian render", "Retry", "Tạo lúc", "Lỗi"],
-            datatype=["number", "str", "str", "str", "str", "number", "str", "str"],
+            headers=["ID", "Tên", "Model", "Trạng thái", "⚡ Ưu tiên", "⏱ Thời gian render", "Retry", "Tạo lúc", "Lỗi", "Thao tác"],
+            datatype=["number", "str", "str", "str", "number", "str", "number", "str", "str", "str"],
             value=_table_rows(), interactive=False, wrap=True,
+            elem_id="queue-table",
         )
         with gr.Row():
             done_dd = gr.Dropdown(label="Video đã render (xem / tải)",
@@ -669,6 +805,14 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         # .input (not .change): chỉ kích hoạt khi NGƯỜI DÙNG chọn, tránh trigger rỗng
         # khi timer/load cập nhật lại choices (gây lỗi "got: 0").
         done_dd.input(pick_done, done_dd, [done_video, download_file])
+
+        status_table.select(prioritize_from_table, status_table, [status_table, priority_msg])
+        priority_apply.click(
+            apply_priority_list, priority_list, [status_table, priority_msg, priority_list]
+        )
+        priority_reload.click(
+            lambda: gr.update(choices=_priority_choices()), None, priority_list
+        )
 
         gr.Markdown("#### 🗑 Thao tác — xóa job")
         with gr.Row():
@@ -684,6 +828,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 
         timer = gr.Timer(10)
         timer.tick(refresh_status, outputs=[status_table, done_dd])
+        timer.tick(lambda: gr.update(choices=_priority_choices()), None, priority_list)
         # Cập nhật danh sách video ở khu xem lại Tab 1 (chỉ choices -> không cắt ngang video đang phát).
         timer.tick(lambda: gr.update(choices=list(_video_choices().keys())), None, result_dd)
 
