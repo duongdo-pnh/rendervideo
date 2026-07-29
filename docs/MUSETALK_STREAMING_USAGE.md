@@ -70,3 +70,31 @@ Unit test cần `numpy` và `opencv-python`. GPU acceptance/benchmark cần sour
 virtualenv và model MuseTalk trong `engines/MuseTalk`; các artifact này không có
 trong working tree hiện tại nên không thể xác nhận FPS, AV drift thực tế hoặc soak
 test RTMP chỉ từ checkout này.
+
+## Gửi file audio trực tiếp bằng Postman
+
+Backend phải có session đang chạy trước (mặc định `facebook-live`). Trong Postman:
+
+1. Chọn `POST http://127.0.0.1:8091/api/streams/facebook-live/enqueue-file`.
+2. Mở **Body → form-data**.
+3. Thêm `audio`, đổi kiểu từ Text sang **File**, rồi chọn file audio.
+4. Thêm `request_id` dạng Text, ví dụ `postman-001`.
+5. Có thể thêm `priority=0` và `interrupt=false`.
+6. Bấm **Send**. HTTP `202` nghĩa là audio đã vào hàng đợi.
+
+Hỗ trợ WAV, MP3, M4A, AAC, FLAC, OGG và OPUS; tối đa 100 MB. File upload được xóa tự động sau khi render, interrupt hoặc dừng session.
+
+```bash
+curl -X POST http://127.0.0.1:8091/api/streams/facebook-live/enqueue-file \
+  -F "audio=@/duong/dan/audio.wav" \
+  -F "request_id=postman-001" \
+  -F "priority=0" \
+  -F "interrupt=false"
+```
+
+Theo dõi tiến trình:
+
+```bash
+curl http://127.0.0.1:8091/api/streams/facebook-live
+```
+

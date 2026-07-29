@@ -40,6 +40,31 @@ class StreamingTests(unittest.TestCase):
             self.assertTrue(np.all(normalized[4:12] == 255))
             self.assertTrue(np.all(normalized[12:] == 0))
 
+    def test_uploaded_audio_is_deleted_after_render(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "upload.wav"
+            audio_path.write_bytes(b"temporary audio")
+            config = StreamConfig(
+                "s", "a", "/tmp/avatar.mp4", "rtmp://host/live/key",
+                width=16, height=16, warmup_frames=1, video_queue_frames=4,
+            )
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+
+            def producer(request, emit, cancel):
+                request.total_frames = 1
+                emit(frame, np.ones(640, dtype=np.int16))
+
+            session = StreamSession(
+                config, FileStreamOutput(Path(directory) / "output"), [frame], producer
+            )
+            session.start()
+            session.enqueue("upload", str(audio_path), delete_after_use=True)
+            deadline = time.monotonic() + 2
+            while audio_path.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            session.stop()
+            self.assertFalse(audio_path.exists())
+
     def test_file_playout_keeps_av_clock_aligned(self):
         with tempfile.TemporaryDirectory() as directory:
             config = StreamConfig(

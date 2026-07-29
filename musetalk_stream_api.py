@@ -6,6 +6,7 @@ Run with the MuseTalk virtualenv:
 from __future__ import annotations
 
 import argparse
+import cgi
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -53,6 +55,9 @@ AVATAR_LOCK = threading.Lock()
 AVATARS = {}
 MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "20")))
 BLEND_WORKERS = max(1, int(os.getenv("MUSETALK_BLEND_WORKERS", "4")))
+AUDIO_UPLOAD_DIR = APP_ROOT / "uploads" / "stream_audio"
+MAX_AUDIO_UPLOAD_BYTES = int(os.getenv("MUSETALK_MAX_AUDIO_UPLOAD_MB", "100")) * 1024 * 1024
+ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
 
 
 def load_runtime() -> None:
@@ -266,6 +271,55 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         return json.loads(self.rfile.read(length) or b"{}")
 
+    def _multipart_audio(self) -> dict:
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("Content-Type must be multipart/form-data")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise ValueError("empty multipart request")
+        if length > MAX_AUDIO_UPLOAD_BYTES:
+            raise ValueError(
+                f"audio upload exceeds {MAX_AUDIO_UPLOAD_BYTES // (1024 * 1024)} MB"
+            )
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": str(length),
+            },
+            keep_blank_values=True,
+        )
+        if "audio" not in form:
+            raise ValueError("multipart field audio is required")
+        item = form["audio"]
+        if isinstance(item, list):
+            item = item[0]
+        if not getattr(item, "filename", None) or item.file is None:
+            raise ValueError("audio must be a file")
+        suffix = Path(item.filename).suffix.lower()
+        if suffix not in ALLOWED_AUDIO_SUFFIXES:
+            raise ValueError(
+                "unsupported audio format; use wav, mp3, m4a, aac, flac, ogg or opus"
+            )
+        AUDIO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        destination = AUDIO_UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+        try:
+            with open(destination, "wb") as output:
+                shutil.copyfileobj(item.file, output, length=1024 * 1024)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        return {
+            "audio_path": str(destination),
+            "request_id": form.getfirst("request_id") or f"postman-{int(time.time())}",
+            "priority": int(form.getfirst("priority") or 0),
+            "interrupt": str(form.getfirst("interrupt") or "false").lower()
+            in {"1", "true", "yes", "on"},
+        }
+
     def _route(self) -> tuple[str | None, str | None]:
         parts = [p for p in urlparse(self.path).path.split("/") if p]
         if parts[:2] != ["api", "streams"]:
@@ -275,14 +329,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         session_id, action = self._route()
+        uploaded_path = None
         try:
-            body = self._body()
             if session_id is None:
-                result = start_session(body)
+                result = start_session(self._body())
                 self._json(201, result)
                 return
             session = MANAGER.get(session_id)
-            if action == "enqueue":
+            if action == "enqueue-file":
+                body = self._multipart_audio()
+                uploaded_path = body["audio_path"]
+                session.enqueue(
+                    str(body["request_id"]), uploaded_path,
+                    int(body.get("priority", 0)), bool(body.get("interrupt", False)),
+                    delete_after_use=True,
+                )
+                uploaded_path = None  # ownership transferred to the session
+            elif action == "enqueue":
+                body = self._body()
                 audio_path = str(Path(body["audio_path"]).resolve())
                 if not Path(audio_path).is_file():
                     raise ValueError("audio_path does not exist")
@@ -291,16 +355,23 @@ class Handler(BaseHTTPRequestHandler):
                     bool(body.get("interrupt", False)),
                 )
             elif action == "interrupt":
+                self._body()
                 session.interrupt()
             else:
                 self._json(404, {"error": "not found"})
                 return
             self._json(202, session.get_status())
         except (KeyError, ValueError) as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
             self._json(400, {"error": str(exc)})
         except RuntimeError as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
             self._json(409, {"error": str(exc)})
         except Exception as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
             traceback.print_exc()
             self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
 

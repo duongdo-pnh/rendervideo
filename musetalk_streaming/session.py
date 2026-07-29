@@ -25,6 +25,7 @@ class SentenceRequest:
     sequence: int = field(compare=False)
     request_id: str = field(compare=False)
     audio_path: str = field(compare=False)
+    delete_after_use: bool = field(default=False, compare=False)
     queued_at: float = field(default_factory=time.monotonic, compare=False)
     total_frames: int = field(default=0, compare=False)
     rendered_frames: int = field(default=0, compare=False)
@@ -142,6 +143,7 @@ class StreamSession:
 
     def enqueue(
         self, request_id: str, audio_path: str, priority: int = 0, interrupt: bool = False,
+        delete_after_use: bool = False,
     ) -> None:
         if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
             raise RuntimeError("session is not accepting requests")
@@ -157,11 +159,20 @@ class StreamSession:
             request = SentenceRequest(
                 priority=int(priority), sequence=next(self._sequence),
                 request_id=request_id, audio_path=audio_path,
+                delete_after_use=bool(delete_after_use),
             )
             heapq.heappush(self._sentence_heap, request)
             self._sentence_ids.add(request_id)
             self._sentence_cv.notify()
         self._event_callback(request_id, "queued", {})
+
+    @staticmethod
+    def _cleanup_request(request: SentenceRequest) -> None:
+        if request.delete_after_use:
+            try:
+                os.unlink(request.audio_path)
+            except FileNotFoundError:
+                pass
 
     def interrupt(self) -> None:
         with self._sentence_cv:
@@ -173,6 +184,7 @@ class StreamSession:
             self._discard_packets()
             self._sentence_cv.notify_all()
         for request in pending:
+            self._cleanup_request(request)
             self._event_callback(request.request_id, "interrupted", {"pending": True})
 
     def _discard_packets(self) -> None:
@@ -253,6 +265,7 @@ class StreamSession:
                 elapsed = time.monotonic() - started
                 self.metrics.update(inference_seconds=self.metrics.inference_seconds + elapsed)
                 self._render_complete.set()
+                self._cleanup_request(request)
                 while self._packets.qsize() and not self._stop.is_set():
                     time.sleep(0.02)
                 self._current = None
@@ -380,7 +393,12 @@ class StreamSession:
         self._stop.set()
         self._cancel_current.set()
         with self._sentence_cv:
+            pending = list(self._sentence_heap)
+            self._sentence_heap.clear()
+            self._sentence_ids.clear()
             self._sentence_cv.notify_all()
+        for request in pending:
+            self._cleanup_request(request)
         for thread in (self._render_thread, self._playout_thread):
             if thread is not None and thread is not threading.current_thread():
                 thread.join(timeout=5)

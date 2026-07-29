@@ -146,37 +146,58 @@ def _infer_group(avatar, reqs):
 
 
 def _encode_job(avatar, req, frames, run_dir):
-    tmp_dir = run_dir / "tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    if not frames:
+        raise RuntimeError("MuseTalk produced no frames")
     fps = int(req.get("fps", 25))
-    for idx, result in enumerate(frames):
+    output_path = Path(req["output_path"]).resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = avatar.frame_list_cycle[0].shape[:2]
+    blend_workers = max(1, int(os.environ.get("MUSETALK_ENCODE_WORKERS", "4")))
+
+    def blend_one(item):
+        idx, result = item
         cycle_idx = idx % len(avatar.frame_list_cycle)
         bbox = avatar.coord_list_cycle[cycle_idx]
         x1, y1, x2, y2 = bbox
         resized = cv2.resize(result.astype("uint8"), (x2 - x1, y2 - y1))
-        original = avatar.frame_list_cycle[cycle_idx].copy()
-        blended = get_image_blending(
-            original, resized, bbox,
+        return get_image_blending(
+            avatar.frame_list_cycle[cycle_idx], resized, bbox,
             avatar.mask_list_cycle[cycle_idx],
             avatar.mask_coords_list_cycle[cycle_idx],
         )
-        if not cv2.imwrite(str(tmp_dir / f"{idx:08d}.png"), blended):
-            raise RuntimeError(f"failed to save blended frame {idx}")
 
-    silent_video = run_dir / "silent.mp4"
-    output_path = Path(req["output_path"]).resolve()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run([
-        "ffmpeg", "-y", "-v", "warning", "-r", str(fps), "-f", "image2",
-        "-i", str(tmp_dir / "%08d.png"), "-vcodec", "libx264",
-        "-vf", "format=yuv420p", "-crf", "18", str(silent_video),
-    ], check=True)
-    subprocess.run([
-        "ffmpeg", "-y", "-v", "warning", "-i", req["audio_path"],
-        "-i", str(silent_video), str(output_path),
-    ], check=True)
+    # One FFmpeg pass: raw blended frames -> H.264 + source audio. Avoid hundreds
+    # of PNG writes and the former second remux pass.
+    command = [
+        "ffmpeg", "-y", "-v", "warning", "-f", "rawvideo",
+        "-pix_fmt", "bgr24", "-s:v", f"{width}x{height}", "-r", str(fps),
+        "-i", "pipe:0", "-i", req["audio_path"],
+        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
+        "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "128k", "-shortest", str(output_path),
+    ]
+    started = time.monotonic()
+    process = subprocess.Popen(command, stdin=subprocess.PIPE)
+    try:
+        with ThreadPoolExecutor(max_workers=blend_workers) as pool:
+            for blended in pool.map(blend_one, enumerate(frames)):
+                process.stdin.write(memoryview(blended).cast("B"))
+        process.stdin.close()
+        returncode = process.wait()
+    except Exception:
+        if process.stdin and not process.stdin.closed:
+            process.stdin.close()
+        process.kill()
+        process.wait()
+        raise
+    if returncode != 0:
+        raise RuntimeError(f"ffmpeg encode failed with exit code {returncode}")
     if not output_path.is_file():
         raise RuntimeError(f"server output missing: {output_path}")
+    print(
+        f"[musetalk-server] blend+encode {len(frames)} frames in "
+        f"{time.monotonic() - started:.2f}s workers={blend_workers}", flush=True,
+    )
     return {"ok": True, "output_path": str(output_path)}
 
 
