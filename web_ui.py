@@ -145,7 +145,7 @@ def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model
     job_id = db.add_job(name, v_dst, a_dst, model_res, guidance, steps, seed,
                         int(bool(enhance_mouth)), enhance_region, out_res, input_type)
     gr.Info(f"✅ Đã thêm job #{job_id} vào queue.")   # toast thông báo
-    return f"✅ Đã thêm **job #{job_id}** ('{name}', model {model_res}) vào queue."
+    return f"✅ Đã thêm **job #{job_id}** ('{name}') vào hàng đợi **MuseTalk 1.5**."
 
 
 # ---------------------------------------------------------------- Tab 2 helpers
@@ -462,7 +462,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
         rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"),
         render_config=render_config, dedup=bool(dedup))
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
-             f"⚙️ Cấu hình render: **model {model} · {out_res} · "
+             f"⚙️ Engine **MuseTalk 1.5** · đầu ra **{out_res}** · "
              f"{'làm nét '+region if enhance_mouth else 'KHÔNG làm nét'} · guidance {guidance} · {steps} steps**.",
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
