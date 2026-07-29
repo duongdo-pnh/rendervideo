@@ -16,10 +16,10 @@ _envbin = os.path.dirname(sys.executable)
 if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
-# LƯU Ý (đã kiểm chứng 2026-06-15): KHÔNG ép insightface/onnxruntime chạy CUDAExecutionProvider.
-# Diffusion nhanh hơn ~43% (5.55->3.22 s/it) NHƯNG output bị HỎNG — vẽ ô ĐEN lên mặt (mediapipe
-# dò mặt 0/98 frame). insightface PHẢI chạy CPUExecutionProvider để kết quả dò mặt đúng. Đừng
-# preload các lib CUDA (libnvrtc/cudnn…) để "sửa" cảnh báo onnxruntime — đó là fallback ĐÚNG.
+# RTX 5090 profile (2026-07-23): keep Torch cu128/sm_120 and DO NOT enable xformers unless
+# a wheel explicitly supports Blackwell. Face detect/align should use ONNXRuntime GPU; verify with:
+#   import onnxruntime as ort; print(ort.get_available_providers())
+# Expected providers include CUDAExecutionProvider. Keep protobuf<5 for mediapipe/GFPGAN restore.
 
 import argparse
 import contextlib
@@ -52,15 +52,10 @@ def gpu_lock():
 # Autotune cuDNN for the fixed diffusion chunk shape (matches gradio_app.py).
 torch.backends.cudnn.benchmark = True
 
-from omegaconf import OmegaConf
-
-from scripts.inference import main as inference_main
 from extend_video import prepare_carrier
-from restore_mouth_gfpgan import restore_mouth
-from color_correct_mouth import color_correct_mouth, composite_ai_mouth
 
 # Output resolution presets (target SHORTER side). None = keep source.
-OUT_RES = {"Gốc": None, "1080": 1080, "720": 720}
+OUT_RES = {"Gốc": None, "1080": 1080, "720": 720, "480 Nhanh": 480}
 
 
 def _maybe_downscale(video_path, target_short, work_dir):
@@ -75,11 +70,19 @@ def _maybe_downscale(video_path, target_short, work_dir):
         return video_path
     out = os.path.join(work_dir, f"_in_{target_short}p.mp4")
     vf = f"scale='if(gt(iw,ih),-2,{target_short})':'if(gt(iw,ih),{target_short},-2)'"
-    subprocess.run(
+    nvenc = subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path, "-vf", vf,
-         "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-an", out],
-        check=True,
+         "-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-cq", "20",
+         "-pix_fmt", "yuv420p", "-an", out],
+        capture_output=True, text=True,
     )
+    if nvenc.returncode != 0:
+        print(f"[render_job] NVENC downscale failed; CPU fallback: {nvenc.stderr[-200:]}", flush=True)
+        subprocess.run(
+            ["ffmpeg", "-y", "-loglevel", "error", "-i", video_path, "-vf", vf,
+             "-c:v", "libx264", "-crf", "18", "-preset", "veryfast", "-an", out],
+            check=True,
+        )
     print(f"[render_job] downscale {w}x{h} -> shorter side {target_short}", flush=True)
     return out
 
@@ -156,7 +159,7 @@ def _build_args(video_path, audio_path, output_path, checkpoint, steps, guidance
 
 def render(video_path, audio_path, output_path, config_path, checkpoint,
            guidance, steps, seed, enhance_mouth, enhance_region, out_res, color_correct=True,
-           input_type="real"):
+           input_type="real", engine="musetalk"):
     work_dir = Path(output_path).parent
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -164,16 +167,24 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     audio_path = Path(audio_path).absolute().as_posix()
     output_path = Path(output_path).absolute().as_posix()
 
-    # Carrier longer than audio? Trim to ~audio length FIRST (cheap stream-copy) so the heavy
-    # downscale / normalize / scenedetect below process ~audio-length, not the full clip. Shorter
-    # videos pass through untouched -> prepare_carrier forward-loops + cuts them to audio length.
-    video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
+    # MuseTalk cache identity must depend only on video, never on audio duration.
+    # LatentSync still benefits from trimming a long carrier before diffusion.
+    if engine == "latentsync":
+        video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
 
     # Output resolution: downscale input to chosen shorter side (output res = input res).
     video_path = _maybe_downscale(video_path, OUT_RES.get(out_res), str(work_dir))
 
-    # If the carrier video is shorter than the audio, extend it (forward loop + crossfade);
-    # returns seam indices so the mouth temporal smooth won't ghost across discontinuities.
+    if engine == "musetalk":
+        from musetalk_adapter import render as musetalk_render
+        print("[render_job] engine=MuseTalk 1.5 (fp16)", flush=True)
+        musetalk_render(video_path, audio_path, output_path, work_dir)
+        if not os.path.exists(output_path):
+            raise RuntimeError(f"render finished but output missing: {output_path}")
+        print(f"[render_job] OK -> {output_path}", flush=True)
+        return
+
+    # LatentSync needs a carrier at least as long as the audio; MuseTalk cycles its cached avatar.
     ext_path = str(work_dir / "_carrier_ext.mp4")
     try:
         video_path, seams = prepare_carrier(video_path, audio_path, ext_path)
@@ -181,6 +192,10 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         print(f"[render_job] prepare_carrier failed ({e}); using original video", flush=True)
         seams = []
 
+    from omegaconf import OmegaConf
+    from scripts.inference import main as inference_main
+    from restore_mouth_gfpgan import restore_mouth
+    from color_correct_mouth import color_correct_mouth, composite_ai_mouth
     ai_mode = input_type == "ai"
     if ai_mode:
         guidance = min(float(guidance), 1.3)
@@ -243,7 +258,7 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LatentSync single-job render runner")
+    ap = argparse.ArgumentParser(description="Single-job lip-sync render runner")
     ap.add_argument("--video", required=True)
     ap.add_argument("--audio", required=True)
     ap.add_argument("--output", required=True)
@@ -257,10 +272,11 @@ def main():
     ap.add_argument("--out_res", default="720", choices=list(OUT_RES.keys()))
     ap.add_argument("--color_correct", type=int, default=1, help="1=match mouth tone to carrier after GFPGAN")
     ap.add_argument("--input_type", choices=["real", "ai"], default="real")
+    ap.add_argument("--engine", choices=["musetalk", "latentsync"], default="musetalk")
     a = ap.parse_args()
     try:
         render(a.video, a.audio, a.output, a.config, a.checkpoint, a.guidance, a.steps,
-               a.seed, bool(a.enhance_mouth), a.enhance_region, a.out_res, bool(a.color_correct), a.input_type)
+               a.seed, bool(a.enhance_mouth), a.enhance_region, a.out_res, bool(a.color_correct), a.input_type, a.engine)
     except Exception as e:
         print(f"[render_job] ERROR: {e}", file=sys.stderr, flush=True)
         sys.exit(1)

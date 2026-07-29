@@ -41,6 +41,7 @@ def _connect():
 # Render config columns added after the first schema version, with their SQL defaults.
 # init_db() ALTERs them in for older DBs so upgrades never lose existing jobs.
 _CONFIG_COLUMNS = {
+    "engine":         "TEXT    NOT NULL DEFAULT 'musetalk'",
     "guidance":       "REAL    NOT NULL DEFAULT 1.5",
     "steps":          "INTEGER NOT NULL DEFAULT 24",
     "seed":           "INTEGER NOT NULL DEFAULT 1247",
@@ -93,7 +94,7 @@ def init_db():
 
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
             enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
-            drive_folder=None, drive_name=None):
+            drive_folder=None, drive_name=None, engine="musetalk"):
     """Insert a new queued job with its full render config. Resolves model_res -> config/checkpoint."""
     model_res = str(model_res)
     if model_res not in MODELS:
@@ -102,12 +103,12 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
     with _connect() as con:
         cur = con.execute(
             """
-            INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path,
+            INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path, engine,
                               guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
                               drive_folder, drive_name)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path,
+            (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path, str(engine),
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
              str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real",
              str(drive_folder) if drive_folder else None,
@@ -144,6 +145,48 @@ def claim_next_job():
         ).fetchone()
         con.commit()
         return dict(row) if row else None
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def has_completed_matching_avatar(anchor):
+    """True after one successful MuseTalk render has warmed this avatar/resolution."""
+    if anchor.get("engine") != "musetalk":
+        return False
+    with _connect() as con:
+        return con.execute(
+            "SELECT 1 FROM jobs WHERE status='done' AND engine='musetalk' "
+            "AND video_path=? AND out_res=? LIMIT 1",
+            (anchor["video_path"], anchor["out_res"]),
+        ).fetchone() is not None
+
+
+def claim_matching_jobs(anchor, limit=2):
+    """Atomically claim queued MuseTalk jobs that can share the anchor avatar."""
+    if limit <= 0 or anchor.get("engine") != "musetalk":
+        return []
+    con = _connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            "SELECT id FROM jobs WHERE status=\x27queued\x27 AND engine=\x27musetalk\x27 "
+            "AND video_path=? AND out_res=? ORDER BY created_at,id LIMIT ?",
+            (anchor["video_path"], anchor["out_res"], int(limit)),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            item = con.execute(
+                "UPDATE jobs SET status=\x27rendering\x27, started_at=datetime(\x27now\x27,\x27localtime\x27), "
+                "finished_at=NULL,error=NULL WHERE id=? AND status=\x27queued\x27 RETURNING *",
+                (row["id"],),
+            ).fetchone()
+            if item:
+                claimed.append(dict(item))
+        con.commit()
+        return claimed
     except Exception:
         con.rollback()
         raise
