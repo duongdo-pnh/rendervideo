@@ -109,7 +109,7 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
             INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path, engine,
                               guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
                               drive_folder, drive_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path, str(engine),
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
