@@ -77,12 +77,15 @@ TTS_PROVIDER_ALIASES = {
 
 
 def _voice_options():
-    """Mã giọng cố định của hệ (4 vbee + 4 ausynclab) cho dropdown tts_voice."""
+    """Voice IDs configured by each provider, including dynamic AutoVoice IDs."""
     try:
         from latentsync.tts.vbee import VbeeTTS
         from latentsync.tts.ausynclab import AusynclabTTS
-        return [code for _, code in VbeeTTS.CURATED_VOICES] + \
-               [code for _, code in AusynclabTTS.CURATED_VOICES]
+        from latentsync.tts import factory
+        voices = [code for _, code in VbeeTTS.CURATED_VOICES] + \
+                 [code for _, code in AusynclabTTS.CURATED_VOICES]
+        voices.extend(factory.list_voices("autovoice"))
+        return list(dict.fromkeys(v for v in voices if v))
     except Exception:
         return []
 

@@ -42,6 +42,9 @@ def parse_retry_after(exc):
 
 def is_retryable(exc):
     """True nếu lỗi tạm thời (nên retry). Không có HTTP code -> coi là network/timeout -> retry."""
+    explicit = getattr(exc, "retryable", None)
+    if explicit is not None:
+        return bool(explicit)
     code = parse_status(exc)
     if code is None:
         return True                  # network error / timeout
