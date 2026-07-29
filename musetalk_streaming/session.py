@@ -1,0 +1,391 @@
+from __future__ import annotations
+
+import heapq
+import itertools
+import math
+import os
+import queue
+import shutil
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Iterable
+
+import numpy as np
+
+from .models import SessionState, StreamConfig, StreamMetrics
+from .output import StreamOutput
+
+
+@dataclass(order=True)
+class SentenceRequest:
+    sort_key: tuple[int, int] = field(init=False, repr=False)
+    priority: int = field(compare=False)
+    sequence: int = field(compare=False)
+    request_id: str = field(compare=False)
+    audio_path: str = field(compare=False)
+    queued_at: float = field(default_factory=time.monotonic, compare=False)
+    total_frames: int = field(default=0, compare=False)
+    rendered_frames: int = field(default=0, compare=False)
+    played_frames: int = field(default=0, compare=False)
+
+    def __post_init__(self) -> None:
+        self.sort_key = (-self.priority, self.sequence)
+
+
+@dataclass
+class AVPacket:
+    request_id: str
+    frame_path: str
+    pcm: np.ndarray
+
+
+Producer = Callable[
+    [SentenceRequest, Callable[[np.ndarray, np.ndarray], None], threading.Event],
+    None,
+]
+EventCallback = Callable[[str, str, dict], None]
+
+
+def half_frame_threshold(total_frames: int, fallback: int) -> int:
+    return max(1, math.ceil(total_frames / 2)) if total_frames > 0 else fallback
+
+
+class StreamSession:
+    """Owns one realtime playout clock and its bounded sentence/AV queues."""
+
+    def __init__(
+        self,
+        config: StreamConfig,
+        output: StreamOutput,
+        idle_frames: Iterable[np.ndarray],
+        producer: Producer,
+        event_callback: EventCallback | None = None,
+    ):
+        self.config = config
+        self.output = output
+        self.metrics = StreamMetrics()
+        self._idle_frames = [self._normalize_frame(frame) for frame in idle_frames]
+        if not self._idle_frames:
+            raise ValueError("at least one idle frame is required")
+        self._producer = producer
+        self._event_callback = event_callback or (lambda *_: None)
+        self._state = SessionState.CREATED
+        self._state_lock = threading.RLock()
+        self._sentence_heap: list[SentenceRequest] = []
+        self._sentence_ids: set[str] = set()
+        self._sentence_cv = threading.Condition()
+        self._sequence = itertools.count()
+        # Rendered frames wait on disk, not in RAM. This allows playout to wait
+        # for 50% of audio of any length without exhausting host memory.
+        self._packet_dir = tempfile.mkdtemp(prefix=f"musetalk-{config.session_id}-")
+        self._packet_sequence = itertools.count()
+        self._packets: queue.Queue[AVPacket] = queue.Queue()
+        self._stop = threading.Event()
+        self._cancel_current = threading.Event()
+        self._render_complete = threading.Event()
+        self._current: SentenceRequest | None = None
+        self._render_thread: threading.Thread | None = None
+        self._playout_thread: threading.Thread | None = None
+        self._last_frame = self._idle_frames[0]
+        self._preview_lock = threading.Lock()
+        self._preview_frame = self._last_frame.copy()
+        self._video_pts = 0
+        self._audio_pts = 0
+
+    @property
+    def state(self) -> SessionState:
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, state: SessionState) -> None:
+        with self._state_lock:
+            if self._state not in {SessionState.STOPPING, SessionState.STOPPED}:
+                self._state = state
+
+    def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("idle frame must be an HxWx3 numpy array")
+        if frame.shape[1] != self.config.width or frame.shape[0] != self.config.height:
+            source_h, source_w = frame.shape[:2]
+            scale = min(self.config.width / source_w, self.config.height / source_h)
+            target_w = max(2, int(round(source_w * scale)) // 2 * 2)
+            target_h = max(2, int(round(source_h * scale)) // 2 * 2)
+            resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            canvas = np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
+            x = (self.config.width - target_w) // 2
+            y = (self.config.height - target_h) // 2
+            canvas[y:y + target_h, x:x + target_w] = resized
+            frame = canvas
+        return np.ascontiguousarray(frame, dtype=np.uint8)
+
+    def start(self) -> None:
+        if self.state is not SessionState.CREATED:
+            raise RuntimeError("session has already been started")
+        self._set_state(SessionState.STARTING)
+        self.output.start(
+            self.config.width, self.config.height,
+            self.config.fps, self.config.sample_rate,
+        )
+        self._render_thread = threading.Thread(
+            target=self._render_loop, name=f"render-{self.config.session_id}", daemon=True,
+        )
+        self._playout_thread = threading.Thread(
+            target=self._playout_loop, name=f"playout-{self.config.session_id}", daemon=True,
+        )
+        self._render_thread.start()
+        self._playout_thread.start()
+        self._set_state(SessionState.IDLE)
+
+    def enqueue(
+        self, request_id: str, audio_path: str, priority: int = 0, interrupt: bool = False,
+    ) -> None:
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
+            raise RuntimeError("session is not accepting requests")
+        if interrupt:
+            self.interrupt()
+        with self._sentence_cv:
+            if request_id in self._sentence_ids or (
+                self._current is not None and self._current.request_id == request_id
+            ):
+                raise ValueError(f"duplicate request_id: {request_id}")
+            if len(self._sentence_heap) >= self.config.sentence_queue_size:
+                raise queue.Full("sentence queue is full")
+            request = SentenceRequest(
+                priority=int(priority), sequence=next(self._sequence),
+                request_id=request_id, audio_path=audio_path,
+            )
+            heapq.heappush(self._sentence_heap, request)
+            self._sentence_ids.add(request_id)
+            self._sentence_cv.notify()
+        self._event_callback(request_id, "queued", {})
+
+    def interrupt(self) -> None:
+        with self._sentence_cv:
+            pending = list(self._sentence_heap)
+            self._sentence_heap.clear()
+            for request in pending:
+                self._sentence_ids.discard(request.request_id)
+            self._cancel_current.set()
+            self._discard_packets()
+            self._sentence_cv.notify_all()
+        for request in pending:
+            self._event_callback(request.request_id, "interrupted", {"pending": True})
+
+    def _discard_packets(self) -> None:
+        while True:
+            try:
+                packet = self._packets.get_nowait()
+                try:
+                    os.unlink(packet.frame_path)
+                except FileNotFoundError:
+                    pass
+                self.metrics.increment("dropped_frames")
+            except queue.Empty:
+                break
+
+    def _emit(self, frame: np.ndarray, pcm: np.ndarray) -> None:
+        if self._current is None:
+            return
+        frame = self._normalize_frame(frame)
+        pcm = np.ascontiguousarray(pcm, dtype=np.int16).reshape(-1)
+        expected = self.config.sample_rate // self.config.fps
+        if pcm.size < expected:
+            pcm = np.pad(pcm, (0, expected - pcm.size))
+        elif pcm.size > expected:
+            pcm = pcm[:expected]
+        import cv2
+
+        frame_path = os.path.join(
+            self._packet_dir, f"{next(self._packet_sequence):012d}.jpg"
+        )
+        if not cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 90]):
+            raise RuntimeError("cannot spool rendered stream frame")
+        if self._stop.is_set() or self._cancel_current.is_set():
+            try:
+                os.unlink(frame_path)
+            except FileNotFoundError:
+                pass
+            return
+        self._packets.put(AVPacket(self._current.request_id, frame_path, pcm))
+        buffered = self._packets.qsize()
+        self._current.rendered_frames += 1
+        self.metrics.update(
+            video_buffer_frames=buffered,
+            audio_buffer_ms=buffered * 1000 / self.config.fps,
+        )
+
+    def _render_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._sentence_cv:
+                while not self._sentence_heap and not self._stop.is_set():
+                    self._sentence_cv.wait(timeout=0.5)
+                if self._stop.is_set():
+                    return
+                request = heapq.heappop(self._sentence_heap)
+                self._sentence_ids.discard(request.request_id)
+            self._current = request
+            self._cancel_current.clear()
+            self._render_complete.clear()
+            self._set_state(SessionState.BUFFERING)
+            self._event_callback(request.request_id, "buffering", {})
+            started = time.monotonic()
+            try:
+                result = self._producer(request, self._emit, self._cancel_current) or {}
+                if isinstance(result, dict):
+                    self.metrics.update(
+                        inference_frames=self.metrics.inference_frames + int(result.get("frames", 0)),
+                        gpu_batch_ms=float(result.get("gpu_batch_ms", 0.0)),
+                        blend_ms=float(result.get("blend_ms", 0.0)),
+                        gpu_memory_bytes=int(result.get("gpu_memory_bytes", 0)),
+                    )
+                event = "interrupted" if self._cancel_current.is_set() else "completed"
+                self._event_callback(request.request_id, event, {})
+            except Exception as exc:
+                self._event_callback(
+                    request.request_id, "failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+            finally:
+                elapsed = time.monotonic() - started
+                self.metrics.update(inference_seconds=self.metrics.inference_seconds + elapsed)
+                self._render_complete.set()
+                while self._packets.qsize() and not self._stop.is_set():
+                    time.sleep(0.02)
+                self._current = None
+                self._cancel_current.clear()
+                if not self._stop.is_set():
+                    self._set_state(SessionState.IDLE)
+
+    def _ready_to_play(self) -> bool:
+        total_frames = self._current.total_frames if self._current else 0
+        threshold = half_frame_threshold(total_frames, self.config.warmup_frames)
+        return (
+            self._packets.qsize() >= threshold
+            or (self._render_complete.is_set() and not self._packets.empty())
+        )
+
+    def _playout_loop(self) -> None:
+        epoch = time.monotonic()
+        idle_index = 0
+        active_request_id: str | None = None
+        silence = np.zeros(self.config.sample_rate // self.config.fps, dtype=np.int16)
+        while not self._stop.is_set():
+            deadline = epoch + self._video_pts / self.config.fps
+            delay = deadline - time.monotonic()
+            if delay > 0 and self._stop.wait(delay):
+                break
+            packet = None
+            if self._ready_to_play() or self.state is SessionState.PLAYING:
+                try:
+                    packet = self._packets.get_nowait()
+                except queue.Empty:
+                    packet = None
+            if packet is not None:
+                if active_request_id != packet.request_id:
+                    active_request_id = packet.request_id
+                    self._set_state(SessionState.PLAYING)
+                    self.metrics.update(
+                        time_to_first_frame_ms=round(
+                            (time.monotonic() - (
+                                self._current.queued_at if self._current else time.monotonic()
+                            )) * 1000, 2
+                        )
+                    )
+                    self._event_callback(packet.request_id, "started", {})
+                import cv2
+
+                frame = cv2.imread(packet.frame_path, cv2.IMREAD_COLOR)
+                try:
+                    os.unlink(packet.frame_path)
+                except FileNotFoundError:
+                    pass
+                if frame is None:
+                    self.metrics.increment("dropped_frames")
+                    continue
+                pcm = packet.pcm
+                if self._current is not None and self._current.request_id == packet.request_id:
+                    self._current.played_frames += 1
+                self._last_frame = frame
+            else:
+                if self.state is SessionState.PLAYING and self._current is not None:
+                    frame = self._last_frame
+                else:
+                    frame = self._idle_frames[idle_index % len(self._idle_frames)]
+                    idle_index += 1
+                    active_request_id = None
+                pcm = silence
+            with self._preview_lock:
+                self._preview_frame = frame.copy()
+            try:
+                self.output.push_video_frame(frame, pts=self._video_pts)
+                self.output.push_audio_frame(pcm, pts=self._audio_pts)
+            except Exception:
+                self._set_state(SessionState.RECONNECTING)
+            self._video_pts += 1
+            self._audio_pts += pcm.size
+            buffered = self._packets.qsize()
+            drift = (
+                self._video_pts / self.config.fps
+                - self._audio_pts / self.config.sample_rate
+            ) * 1000
+            self.metrics.increment("output_frames")
+            self.metrics.update(
+                video_buffer_frames=buffered,
+                audio_buffer_ms=buffered * 1000 / self.config.fps,
+                av_drift_ms=drift,
+                reconnect_count=self.output.get_status().get("reconnect_count", 0),
+            )
+
+    def get_preview_frame(self) -> np.ndarray:
+        """Return the latest frame sent to the streaming output."""
+        with self._preview_lock:
+            return self._preview_frame.copy()
+
+    def get_status(self) -> dict:
+        transport = self.output.get_status()
+        current = self._current.request_id if self._current else None
+        total = self._current.total_frames if self._current else 0
+        rendered = self._current.rendered_frames if self._current else 0
+        played = self._current.played_frames if self._current else 0
+        progress = round(played * 100 / total, 1) if total else 0.0
+        return {
+            "session_id": self.config.session_id,
+            "status": self.state.value,
+            "avatar_id": self.config.avatar_id,
+            "transport": "rtmp",
+            "transport_running": bool(transport.get("running")),
+            "transport_reconnecting": bool(transport.get("reconnecting")),
+            "transport_last_error": transport.get("last_error"),
+            "audio_delay_ms": self.config.audio_delay_ms,
+            "current_request_id": current,
+            "audio_total_frames": total,
+            "audio_rendered_frames": rendered,
+            "audio_played_frames": played,
+            "audio_progress_percent": progress,
+            "audio_total_seconds": round(total / self.config.fps, 2) if total else 0.0,
+            "audio_played_seconds": round(played / self.config.fps, 2),
+            "sentence_queue_size": len(self._sentence_heap),
+            **self.metrics.snapshot(),
+        }
+
+    def stop(self) -> None:
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED}:
+            return
+        with self._state_lock:
+            self._state = SessionState.STOPPING
+        self._stop.set()
+        self._cancel_current.set()
+        with self._sentence_cv:
+            self._sentence_cv.notify_all()
+        for thread in (self._render_thread, self._playout_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5)
+        self._discard_packets()
+        shutil.rmtree(self._packet_dir, ignore_errors=True)
+        self.output.stop()
+        with self._state_lock:
+            self._state = SessionState.STOPPED

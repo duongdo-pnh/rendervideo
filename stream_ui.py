@@ -1,0 +1,232 @@
+"""Gradio callbacks for user-managed MuseTalk livestream sessions.
+
+Credentials are accepted from UI inputs and forwarded to the local streaming
+backend. They are never persisted to .env/database or written to logs.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+import gradio as gr
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent
+BACKEND_HOST = os.environ.get("MUSETALK_STREAM_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.environ.get("MUSETALK_STREAM_PORT", "8091"))
+BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
+MUSETALK_PYTHON = ROOT / "engines" / "MuseTalk" / ".venv" / "bin" / "python"
+BACKEND_SCRIPT = ROOT / "musetalk_stream_api.py"
+BACKEND_LOG = ROOT / "logs" / "musetalk_stream_api.log"
+_CURRENT_PREVIEW_SESSION = "facebook-live"
+_CURRENT_AVATAR_VIDEO = None
+
+
+def _backend_ready(timeout: float = 0.5) -> bool:
+    try:
+        with socket.create_connection((BACKEND_HOST, BACKEND_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _ensure_backend() -> None:
+    if _backend_ready():
+        return
+    if not MUSETALK_PYTHON.is_file():
+        raise gr.Error("Chưa cài MuseTalk environment. Xem docs/MUSETALK_STREAMING_USAGE.md.")
+    BACKEND_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log = open(BACKEND_LOG, "a", buffering=1)
+    subprocess.Popen(
+        [
+            str(MUSETALK_PYTHON), str(BACKEND_SCRIPT),
+            "--host", BACKEND_HOST, "--port", str(BACKEND_PORT),
+        ],
+        cwd=ROOT,
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        if _backend_ready():
+            return
+        time.sleep(1)
+    raise gr.Error(f"Streaming backend không khởi động được. Xem {BACKEND_LOG}.")
+
+
+def _request(method: str, path: str, body: dict | None = None, timeout: float = 180) -> dict:
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(
+        BACKEND_URL + path,
+        data=payload,
+        headers={"Content-Type": "application/json"} if payload else {},
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        try:
+            message = json.loads(exc.read()).get("error", f"HTTP {exc.code}")
+        except Exception:
+            message = f"HTTP {exc.code}"
+        raise gr.Error(f"Streaming API: {message}") from None
+    except (OSError, urllib.error.URLError) as exc:
+        raise gr.Error(f"Không kết nối được streaming backend: {type(exc).__name__}") from None
+
+
+def _compose_push_url(server_url: str, stream_key: str) -> str:
+    server_url = (server_url or "").strip()
+    stream_key = (stream_key or "").strip()
+    if not server_url:
+        raise gr.Error("Cần nhập Facebook Server URL.")
+    if not stream_key:
+        raise gr.Error("Cần nhập Facebook Stream key.")
+    if any(char.isspace() for char in stream_key):
+        raise gr.Error("Stream key không được chứa khoảng trắng.")
+    parts = urlsplit(server_url)
+    if parts.scheme not in {"rtmp", "rtmps"} or not parts.hostname:
+        raise gr.Error("Server URL phải bắt đầu bằng rtmp:// hoặc rtmps://.")
+    # Credentials in the authority are unnecessary and easy to leak.
+    if parts.username or parts.password:
+        raise gr.Error("Không đặt username/password trong Server URL.")
+    base_path = parts.path.rstrip("/")
+    push_path = f"{base_path}/{stream_key.lstrip('/')}"
+    return urlunsplit((parts.scheme, parts.netloc, push_path, "", ""))
+
+
+def _status_text(status: dict, prefix: str = "") -> str:
+    label = prefix or "Trạng thái"
+    progress = float(status.get("audio_progress_percent", 0) or 0)
+    filled = min(20, max(0, int(progress / 5)))
+    bar = "█" * filled + "░" * (20 - filled)
+    return (
+        f"### {label}: `{status.get('status', 'unknown')}`\n"
+        f"- Session: `{status.get('session_id', '-')}`\n"
+        f"- Output FPS: **{status.get('output_fps', 0)}**\n"
+        f"- Render FPS: **{status.get('render_fps', 0)}**\n"
+        f"- AV drift: **{status.get('av_drift_ms', 0)} ms**\n"
+        f"- Audio delay: **{status.get('audio_delay_ms', 0)} ms**\n"
+        f"- Buffer: **{status.get('video_buffer_frames', 0)} frame / "
+        f"{round(float(status.get('audio_buffer_ms', 0) or 0) / 1000, 2)} giây**\n"
+        f"- RTMP: **{('đã kết nối' if status.get('transport_running') else 'mất kết nối')}**\n"
+        f"- Reconnect: **{status.get('reconnect_count', 0)}**\n"
+        f"- Lỗi transport: `{status.get('transport_last_error') or '-'}`\n"
+        f"- Request hiện tại: `{status.get('current_request_id') or '-'}`\n"
+        f"- Tiến trình audio: **{bar} {progress:.1f}%** "
+        f"({status.get('audio_played_seconds', 0)} / {status.get('audio_total_seconds', 0)} giây)\n"
+        f"- Render audio: **{status.get('audio_rendered_frames', 0)} / {status.get('audio_total_frames', 0)} frame**\n"
+        f"- Câu đang chờ: **{status.get('sentence_queue_size', 0)}**"
+    )
+
+
+def start_stream(
+    session_id: str,
+    avatar_video: str,
+    server_url: str,
+    stream_key: str,
+    render_ahead_seconds: float,
+    batch_size: int,
+    audio_delay_ms: int,
+):
+    global _CURRENT_PREVIEW_SESSION, _CURRENT_AVATAR_VIDEO
+    session_id = (session_id or "").strip()
+    if not session_id:
+        raise gr.Error("Cần nhập Session ID.")
+    _CURRENT_PREVIEW_SESSION = session_id
+    _CURRENT_AVATAR_VIDEO = str(Path(avatar_video).resolve()) if avatar_video else None
+    if not avatar_video or not Path(avatar_video).is_file():
+        raise gr.Error("Cần tải lên avatar video hợp lệ.")
+    push_url = _compose_push_url(server_url, stream_key)
+    _ensure_backend()
+    status = _request("POST", "/api/streams", {
+        "session_id": session_id,
+        "avatar_id": session_id,
+        "avatar_video": str(Path(avatar_video).resolve()),
+        "push_url": push_url,
+        "fps": 25,
+        "resolution": "720",
+        "warmup_frames": min(250, max(0, int(round(float(render_ahead_seconds) * 25)))),
+        "batch_size": int(batch_size),
+        "audio_delay_ms": int(audio_delay_ms),
+    }, timeout=1800)
+    # Clear the password field after the backend has accepted the credential.
+    return _status_text(status, "Đã bắt đầu stream"), status, gr.update(value="")
+
+
+def enqueue_audio(
+    session_id: str,
+    request_id: str,
+    audio_path: str,
+    priority: int,
+    interrupt: bool,
+):
+    if not audio_path or not Path(audio_path).is_file():
+        raise gr.Error("Cần tải lên audio hợp lệ.")
+    request_id = (request_id or "").strip() or f"sentence-{int(time.time())}"
+    status = _request(
+        "POST", f"/api/streams/{(session_id or '').strip()}/enqueue",
+        {
+            "request_id": request_id,
+            "audio_path": str(Path(audio_path).resolve()),
+            "priority": int(priority),
+            "interrupt": bool(interrupt),
+        },
+    )
+    return _status_text(status, "Đã enqueue audio"), status
+
+
+def refresh_stream(session_id: str):
+    status = _request("GET", f"/api/streams/{(session_id or '').strip()}")
+    return _status_text(status), status
+
+
+def preview_stream():
+    session_id = _CURRENT_PREVIEW_SESSION
+    image = _avatar_preview_frame()
+    if not session_id or not _backend_ready():
+        return image, "### Trạng thái: đang chờ Start stream", {}
+    try:
+        status = _request("GET", f"/api/streams/{session_id}", timeout=1)
+        with urllib.request.urlopen(
+            f"{BACKEND_URL}/api/streams/{session_id}/preview.jpg", timeout=2
+        ) as response:
+            image = np.asarray(Image.open(response).convert("RGB"))
+        return image, _status_text(status), status
+    except Exception:
+        return image, "### Trạng thái: đang chuẩn bị avatar/session...", {}
+
+
+def _avatar_preview_frame():
+    if not _CURRENT_AVATAR_VIDEO or not Path(_CURRENT_AVATAR_VIDEO).is_file():
+        return None
+    try:
+        import cv2
+        capture = cv2.VideoCapture(_CURRENT_AVATAR_VIDEO)
+        ok, frame = capture.read()
+        capture.release()
+        if ok:
+            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    except Exception:
+        pass
+    return None
+
+
+def interrupt_stream(session_id: str):
+    status = _request("POST", f"/api/streams/{(session_id or '').strip()}/interrupt", {})
+    return _status_text(status, "Đã ngắt câu"), status
+
+
+def stop_stream(session_id: str):
+    status = _request("DELETE", f"/api/streams/{(session_id or '').strip()}")
+    return _status_text(status, "Đã dừng stream"), status

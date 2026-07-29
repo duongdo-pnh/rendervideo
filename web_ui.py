@@ -24,6 +24,14 @@ from latentsync.tts.factory import available_providers, list_voices
 from latentsync.tts.vbee import VbeeTTS
 from latentsync.tts.ausynclab import AusynclabTTS
 from render_job import OUT_RES  # bảng độ phân giải; render THỰC do queue_worker chạy nền
+from stream_ui import (
+    enqueue_audio as stream_enqueue_audio,
+    interrupt_stream as stream_interrupt,
+    preview_stream as stream_preview,
+    refresh_stream as stream_refresh,
+    start_stream as stream_start,
+    stop_stream as stream_stop,
+)
 
 # Provider list for the Import-Excel tab dropdowns (label shows config status).
 _TTS_PROVIDERS = available_providers()
@@ -689,7 +697,33 @@ CSS = """
 }
 """
 
-with gr.Blocks(title="Render Queue", css=CSS) as demo:
+UPLOAD_PROGRESS_FIX_JS = r"""
+() => {
+  if (window.__renderVideoUploadFix) return;
+  window.__renderVideoUploadFix = true;
+  const originalFetch = window.fetch.bind(window);
+  let uploadId = null;
+  window.fetch = (input, init) => {
+    const raw = typeof input === "string" ? input : (input instanceof URL ? input.href : input.url);
+    const url = new URL(raw, window.location.href);
+    if (url.pathname.endsWith("/gradio_api/upload_progress") && url.searchParams.get("upload_id") === "undefined") {
+      uploadId = uploadId || Math.random().toString(36).slice(2, 15);
+      url.searchParams.set("upload_id", uploadId);
+      input = input instanceof Request ? new Request(url.toString(), input) : url.toString();
+    } else if (url.pathname.endsWith("/gradio_api/upload") && url.searchParams.has("upload_id")) {
+      if (uploadId) {
+        url.searchParams.set("upload_id", uploadId);
+        input = input instanceof Request ? new Request(url.toString(), input) : url.toString();
+      } else {
+        uploadId = url.searchParams.get("upload_id");
+      }
+    }
+    return originalFetch(input, init);
+  };
+}
+"""
+
+with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo:
     gr.Markdown("<h1 align='center'>Render Queue 24/7</h1>")
 
     with gr.Tab("🎬 Render / Tạo job"):
@@ -916,6 +950,74 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)
         timer.tick(tts_status_md, outputs=xl_tts_status)   # 'timer' định nghĩa ở tab Trạng thái queue
 
+    with gr.Tab("📡 Livestream"):
+        gr.Markdown(
+            "### Facebook Live — người dùng tự nhập Stream key\n"
+            "Stream key **không được lưu** vào `.env`, database hoặc log. "
+            "Mở Facebook Live Producer, chọn **Streaming software**, rồi copy "
+            "Server URL và Stream key vào form này."
+        )
+        with gr.Row():
+            with gr.Column():
+                live_session = gr.Textbox(
+                    label="Session ID", value="facebook-live",
+                    placeholder="vd: facebook-live")
+                live_avatar = gr.File(
+                    label="Avatar video (MP4)", file_types=["video"], type="filepath")
+                live_server_url = gr.Textbox(
+                    label="Facebook Server URL",
+                    value="rtmps://live-api-s.facebook.com:443/rtmp/",
+                    placeholder="rtmps://live-api-s.facebook.com:443/rtmp/")
+                live_stream_key = gr.Textbox(
+                    label="Facebook Stream key", type="password",
+                    placeholder="Dán stream key từ Live Producer",
+                    info="Chỉ dùng trong session hiện tại; ô sẽ được xóa sau khi Start.")
+                with gr.Row():
+                    live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
+                    live_batch = gr.Slider(1, 32, value=20, step=1, label="MuseTalk batch size")
+                live_audio_delay = gr.Slider(
+                    0, 1000, value=300, step=50,
+                    label="Audio delay (ms) — tăng khi hình chậm hơn tiếng")
+                with gr.Row():
+                    live_start_btn = gr.Button("▶ Start stream", variant="primary")
+                    live_stop_btn = gr.Button("⏹ Stop stream", variant="stop")
+
+            with gr.Column():
+                live_preview = gr.Image(
+                    label="Preview đang phát", interactive=False, height=480)
+                live_audio = gr.File(
+                    label="Audio câu tiếp theo", file_types=["audio"], type="filepath")
+                live_request = gr.Textbox(
+                    label="Request ID (có thể để trống)", placeholder="vd: sentence-001")
+                with gr.Row():
+                    live_priority = gr.Number(label="Priority", value=10, precision=0)
+                    live_interrupt_next = gr.Checkbox(
+                        label="Ngắt câu hiện tại trước khi phát", value=False)
+                with gr.Row():
+                    live_enqueue_btn = gr.Button("🔊 Phát audio", variant="primary")
+                    live_interrupt_btn = gr.Button("⏭ Ngắt câu", variant="secondary")
+                    live_refresh_btn = gr.Button("🔄 Status")
+                live_status_md = gr.Markdown("### Trạng thái: chưa chạy")
+                live_status_json = gr.JSON(label="Streaming metrics")
+                live_preview_timer = gr.Timer(1.0)
+
+        live_start_btn.click(
+            stream_start,
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_audio_delay],
+            [live_status_md, live_status_json, live_stream_key],
+        )
+        live_enqueue_btn.click(
+            stream_enqueue_audio,
+            [live_session, live_request, live_audio, live_priority, live_interrupt_next],
+            [live_status_md, live_status_json],
+        )
+        live_refresh_btn.click(stream_refresh, live_session, [live_status_md, live_status_json])
+        live_interrupt_btn.click(stream_interrupt, live_session, [live_status_md, live_status_json])
+        live_stop_btn.click(stream_stop, live_session, [live_status_md, live_status_json])
+        live_preview_timer.tick(
+            stream_preview, inputs=None,
+            outputs=[live_preview, live_status_md, live_status_json], queue=False)
+
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
             "### Cấu hình TTS\n"
@@ -1028,6 +1130,9 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
     demo.load(load_tts_config_form, outputs=[cfg_default, *cfg_inputs, cfg_status])
 
 
+# Gradio always injects a manifest link; enable its built-in PWA route to avoid 404.
+demo.pwa = True
+
 if __name__ == "__main__":
     demo.queue()  # cho render đồng bộ chạy tuần tự, không nghẽn server
     # allowed_paths: cho phép Gradio phục vụ video kết quả nằm ngoài thư mục app (trên Desktop).
@@ -1037,5 +1142,6 @@ if __name__ == "__main__":
         server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
         inbrowser=False,
         share=os.environ.get("GRADIO_SHARE", "0") == "1",
+        pwa=True,
         allowed_paths=[str(db.RENDERS_DIR)],
     )
