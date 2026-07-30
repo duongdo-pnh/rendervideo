@@ -46,7 +46,7 @@ from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.utils import datagen, load_all_model
 from musetalk_streaming.manager import StreamManager
 from musetalk_streaming.models import StreamConfig
-from musetalk_streaming.output import RTMPOutput
+from musetalk_streaming.output import RTMPOutput, ReLiveClipOutput
 from musetalk_streaming.session import StreamSession
 
 MANAGER = StreamManager()
@@ -218,21 +218,36 @@ def start_session(body: dict) -> dict:
         f"{video_path}:{video_stat.st_size}:{video_stat.st_mtime_ns}".encode("utf-8")
     ).hexdigest()[:12]
     avatar_id = f"{str(body.get('avatar_id', session_id))}-{fingerprint}"
+    # Same rule as the normal MuseTalk renderer: output keeps the driver's
+    # native frame size/aspect ratio.  Realtime used to default to 1280x720,
+    # which stretched portrait and square avatars.
+    idle_frames = read_idle_frames(video_path)
+    source_height, source_width = idle_frames[0].shape[:2]
+    width = max(2, source_width // 2 * 2)
+    height = max(2, source_height // 2 * 2)
     config = StreamConfig(
         session_id=session_id, avatar_id=avatar_id, avatar_video=video_path,
-        push_url=str(body["push_url"]), fps=int(body.get("fps", 25)),
+        push_url=str(body.get("push_url", "")), fps=int(body.get("fps", 25)),
+        width=width, height=height,
         warmup_frames=int(body.get("warmup_frames", 25)),
         video_bitrate=str(body.get("video_bitrate", "3500k")),
         audio_bitrate=str(body.get("audio_bitrate", "128k")),
         audio_delay_ms=int(body.get("audio_delay_ms", 300)),
     )
     avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 20)))
-    output = RTMPOutput(
-        config.push_url, config.video_bitrate, config.audio_bitrate,
-        config.output_sample_rate, config.audio_delay_ms,
-    )
+    output_mode = str(body.get("output_mode", "rtmp")).lower()
+    if output_mode == "relive":
+        output = ReLiveClipOutput(
+            APP_ROOT / "outputs" / "relive_clips",
+            str(body.get("relive_callback_url", "http://127.0.0.1:7864/api/musetalk/clip")),
+        )
+    elif output_mode == "rtmp":
+        output = RTMPOutput(config.push_url, config.video_bitrate, config.audio_bitrate,
+                            config.output_sample_rate, config.audio_delay_ms)
+    else:
+        raise ValueError("output_mode must be rtmp or relive")
     session = StreamSession(
-        config, output, read_idle_frames(video_path),
+        config, output, idle_frames,
         lambda request, emit, cancel: produce_sentence(avatar, request, emit, cancel),
         lambda request_id, event, details: print(
             f"[stream] session={session_id} request={request_id} event={event}",

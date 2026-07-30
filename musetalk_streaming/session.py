@@ -285,6 +285,7 @@ class StreamSession:
         epoch = time.monotonic()
         idle_index = 0
         active_request_id: str | None = None
+        ended_request_id: str | None = None
         silence = np.zeros(self.config.sample_rate // self.config.fps, dtype=np.int16)
         while not self._stop.is_set():
             deadline = epoch + self._video_pts / self.config.fps
@@ -300,6 +301,8 @@ class StreamSession:
             if packet is not None:
                 if active_request_id != packet.request_id:
                     active_request_id = packet.request_id
+                    ended_request_id = None
+                    self.output.begin_request(packet.request_id)
                     self._set_state(SessionState.PLAYING)
                     self.metrics.update(
                         time_to_first_frame_ms=round(
@@ -340,6 +343,10 @@ class StreamSession:
                 self._set_state(SessionState.RECONNECTING)
             self._video_pts += 1
             self._audio_pts += pcm.size
+            if (packet is not None and self._render_complete.is_set()
+                    and self._packets.empty() and ended_request_id != packet.request_id):
+                self.output.end_request(packet.request_id)
+                ended_request_id = packet.request_id
             buffered = self._packets.qsize()
             drift = (
                 self._video_pts / self.config.fps
@@ -369,7 +376,9 @@ class StreamSession:
             "session_id": self.config.session_id,
             "status": self.state.value,
             "avatar_id": self.config.avatar_id,
-            "transport": "rtmp",
+            "width": self.config.width,
+            "height": self.config.height,
+            "transport": "relive" if self.output.__class__.__name__ == "ReLiveClipOutput" else "rtmp",
             "transport_running": bool(transport.get("running")),
             "transport_reconnecting": bool(transport.get("reconnecting")),
             "transport_last_error": transport.get("last_error"),

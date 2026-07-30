@@ -952,10 +952,9 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
 
     with gr.Tab("📡 Livestream"):
         gr.Markdown(
-            "### Facebook Live — người dùng tự nhập Stream key\n"
-            "Stream key **không được lưu** vào `.env`, database hoặc log. "
-            "Mở Facebook Live Producer, chọn **Streaming software**, rồi copy "
-            "Server URL và Stream key vào form này."
+            "### MuseTalk → ReLive → OBS\n"
+            "Để trống Server URL và Stream key để MuseTalk trả MP4 cho ReLive, "
+            "sau đó ReLive tự đưa clip vào OBS. Stream key chỉ dùng khi muốn đẩy RTMP trực tiếp."
         )
         with gr.Row():
             with gr.Column():
@@ -965,13 +964,13 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                 live_avatar = gr.File(
                     label="Avatar video (MP4)", file_types=["video"], type="filepath")
                 live_server_url = gr.Textbox(
-                    label="Facebook Server URL",
-                    value="rtmps://live-api-s.facebook.com:443/rtmp/",
-                    placeholder="rtmps://live-api-s.facebook.com:443/rtmp/")
+                    label="Facebook Server URL (chỉ RTMP trực tiếp)",
+                    value="",
+                    placeholder="Để trống khi dùng ReLive/OBS")
                 live_stream_key = gr.Textbox(
-                    label="Facebook Stream key", type="password",
-                    placeholder="Dán stream key từ Live Producer",
-                    info="Chỉ dùng trong session hiện tại; ô sẽ được xóa sau khi Start.")
+                    label="Facebook Stream key (chỉ RTMP trực tiếp)", type="password",
+                    placeholder="Để trống khi dùng ReLive/OBS",
+                    info="Không cần stream key khi dùng ReLive; ô sẽ được xóa sau khi Start.")
                 with gr.Row():
                     live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
                     live_batch = gr.Slider(1, 32, value=20, step=1, label="MuseTalk batch size")
@@ -979,7 +978,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                     0, 1000, value=300, step=50,
                     label="Audio delay (ms) — tăng khi hình chậm hơn tiếng")
                 with gr.Row():
-                    live_start_btn = gr.Button("▶ Start stream", variant="primary")
+                    live_start_btn = gr.Button("▶ Start ReLive / OBS", variant="primary")
                     live_stop_btn = gr.Button("⏹ Stop stream", variant="stop")
 
             with gr.Column():

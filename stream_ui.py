@@ -113,13 +113,16 @@ def _status_text(status: dict, prefix: str = "") -> str:
     return (
         f"### {label}: `{status.get('status', 'unknown')}`\n"
         f"- Session: `{status.get('session_id', '-')}`\n"
+        f"- Khung hình: **{status.get('width', '-')}×{status.get('height', '-')}** "
+        "(theo video avatar)\n"
         f"- Output FPS: **{status.get('output_fps', 0)}**\n"
         f"- Render FPS: **{status.get('render_fps', 0)}**\n"
         f"- AV drift: **{status.get('av_drift_ms', 0)} ms**\n"
         f"- Audio delay: **{status.get('audio_delay_ms', 0)} ms**\n"
         f"- Buffer: **{status.get('video_buffer_frames', 0)} frame / "
         f"{round(float(status.get('audio_buffer_ms', 0) or 0) / 1000, 2)} giây**\n"
-        f"- RTMP: **{('đã kết nối' if status.get('transport_running') else 'mất kết nối')}**\n"
+        f"- Output: **{status.get('transport', 'rtmp')}** "
+        f"{('đã kết nối' if status.get('transport_running') else '')}\n"
         f"- Reconnect: **{status.get('reconnect_count', 0)}**\n"
         f"- Lỗi transport: `{status.get('transport_last_error') or '-'}`\n"
         f"- Request hiện tại: `{status.get('current_request_id') or '-'}`\n"
@@ -147,15 +150,16 @@ def start_stream(
     _CURRENT_AVATAR_VIDEO = str(Path(avatar_video).resolve()) if avatar_video else None
     if not avatar_video or not Path(avatar_video).is_file():
         raise gr.Error("Cần tải lên avatar video hợp lệ.")
-    push_url = _compose_push_url(server_url, stream_key)
+    use_relive = not (server_url or "").strip() and not (stream_key or "").strip()
+    push_url = "" if use_relive else _compose_push_url(server_url, stream_key)
     _ensure_backend()
     status = _request("POST", "/api/streams", {
         "session_id": session_id,
         "avatar_id": session_id,
         "avatar_video": str(Path(avatar_video).resolve()),
         "push_url": push_url,
+        "output_mode": "relive" if use_relive else "rtmp",
         "fps": 25,
-        "resolution": "720",
         "warmup_frames": min(250, max(0, int(round(float(render_ahead_seconds) * 25)))),
         "batch_size": int(batch_size),
         "audio_delay_ms": int(audio_delay_ms),
