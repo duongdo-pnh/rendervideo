@@ -36,7 +36,7 @@ class StreamConfig:
     # Frames and PCM are generated as matching 40 ms pairs.  A non-zero delay
     # intentionally makes the voice late, so default to exact lip-sync.
     audio_delay_ms: int = 0
-    warmup_frames: int = 25
+    warmup_frames: int = 30
     video_queue_frames: int = 250
     sentence_queue_size: int = 100
 

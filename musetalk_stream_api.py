@@ -244,7 +244,8 @@ def produce_sentence(
                 if cancel.is_set():
                     break
                 # At 720p the 3090 sustains about 12.5 generated mouth frames
-                # per second. Duplicate each generated frame into the 25 FPS
+                # per second. Duplicate each generated frame into the output
+                # FPS clock when a lower render FPS is used.
                 # output clock while advancing audio on every output frame.
                 for repeat_index in range(frame_repeat):
                     output_index = frame_index * frame_repeat + repeat_index
@@ -300,7 +301,7 @@ def start_session(body: dict) -> dict:
         push_url=push_url, fps=int(body.get("fps", 25)),
         output_fps=int(body["output_fps"]) if body.get("output_fps") else None,
         width=width, height=height,
-        warmup_frames=int(body.get("warmup_frames", 25)),
+        warmup_frames=int(body.get("warmup_frames", 30)),
         video_bitrate=str(body.get("video_bitrate", "3500k")),
         audio_bitrate=str(body.get("audio_bitrate", "128k")),
         audio_delay_ms=int(body.get("audio_delay_ms", 300)),

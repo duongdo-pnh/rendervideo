@@ -973,7 +973,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                 with gr.Row():
                     live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
                     live_batch = gr.Slider(1, 32, value=32, step=1, label="MuseTalk batch size")
-                live_obs_fps = gr.Slider(25, 60, value=30, step=1, label="OBS output FPS")
+                live_obs_fps = gr.Slider(30, 30, value=30, step=1, label="OBS output FPS")
                 live_audio_delay = gr.Slider(
                     0, 3000, value=0, step=100,
                     label="Audio delay (ms) — tiếng chờ hình")
