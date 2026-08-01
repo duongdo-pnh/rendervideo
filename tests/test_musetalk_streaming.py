@@ -149,7 +149,7 @@ class StreamingTests(unittest.TestCase):
 
             resumed = session._sentence_heap[0]
             self.assertEqual(resumed.start_frame, 176)
-            self.assertEqual(resumed.start_driver_frame_index, 44)
+            self.assertIsNone(resumed.start_driver_frame_index)
             self.assertEqual(next_driver_frame_index, 44)
             self.assertTrue(resumed.delete_after_use)
             self.assertFalse(current.delete_after_use)

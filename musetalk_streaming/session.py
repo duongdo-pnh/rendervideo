@@ -265,7 +265,6 @@ class StreamSession:
                         current.start_frame,
                         current.start_frame + current.played_frames + buffered_current_frames,
                     ),
-                    start_driver_frame_index=next_driver_frame_index,
                 )
                 heapq.heappush(self._sentence_heap, resumed)
                 self._sentence_ids.add(resume_id)
