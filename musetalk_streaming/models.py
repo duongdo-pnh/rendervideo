@@ -28,6 +28,7 @@ class StreamConfig:
     width: int = 1280
     height: int = 720
     fps: int = 25
+    output_fps: int | None = None
     sample_rate: int = 16_000
     output_sample_rate: int = 44_100
     video_bitrate: str = "3500k"
@@ -42,6 +43,8 @@ class StreamConfig:
     def __post_init__(self) -> None:
         if self.fps < 10 or self.fps > 30:
             raise ValueError("stream FPS must be between 10 and 30")
+        if self.output_fps is not None and (self.output_fps < self.fps or self.output_fps > 60):
+            raise ValueError("output_fps must be between stream FPS and 60")
         if self.width <= 0 or self.height <= 0:
             raise ValueError("stream dimensions must be positive")
         if self.sample_rate != 16_000:

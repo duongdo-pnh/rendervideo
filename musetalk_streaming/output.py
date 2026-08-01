@@ -216,6 +216,7 @@ class RTMPOutput(StreamOutput):
         audio_bitrate: str = "128k",
         output_sample_rate: int = 44_100,
         audio_delay_ms: int = 300,
+        output_fps: int | None = None,
         queue_size: int = 100,
     ):
         self._scheme = urlsplit(push_url).scheme
@@ -226,6 +227,7 @@ class RTMPOutput(StreamOutput):
         self._audio_bitrate = audio_bitrate
         self._output_sample_rate = output_sample_rate
         self._audio_delay_ms = max(0, int(audio_delay_ms))
+        self._output_fps = int(output_fps) if output_fps else None
         self._video_queue = queue.Queue(maxsize=queue_size)
         self._audio_queue = queue.Queue(maxsize=queue_size)
         self._stop = threading.Event()
@@ -257,6 +259,7 @@ class RTMPOutput(StreamOutput):
 
     def _spawn(self) -> None:
         width, height, fps, sample_rate = self._spec
+        encoded_fps = self._output_fps or fps
         video_read, video_write = os.pipe()
         audio_read, audio_write = os.pipe()
         if self._scheme == "udp":
@@ -275,7 +278,8 @@ class RTMPOutput(StreamOutput):
             "-thread_queue_size", "512", "-f", "s16le", "-ar", str(sample_rate),
             "-ac", "1", "-i", f"pipe:{audio_read}",
             *video_encoder,
-            "-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps),
+            *(["-vf", f"fps={self._output_fps}"] if self._output_fps and self._output_fps != fps else []),
+            "-pix_fmt", "yuv420p", "-g", str(encoded_fps * 2), "-keyint_min", str(encoded_fps),
             "-sc_threshold", "0", "-b:v", self._video_bitrate,
             "-maxrate", self._video_bitrate, "-bufsize", self._video_bitrate,
             "-c:a", "aac", "-ar", str(self._output_sample_rate), "-ac", "2",

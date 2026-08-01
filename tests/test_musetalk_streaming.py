@@ -128,14 +128,32 @@ class StreamingTests(unittest.TestCase):
             )
             session._current = current
             session._last_driver_frame_index = 42
+            session._packets.put(type(
+                "Packet", (), {
+                    "request_id": "product",
+                    "frame_path": "/tmp/missing-1.jpg",
+                    "driver_frame_index": 43,
+                }
+            )())
+            session._packets.put(type(
+                "Packet", (), {
+                    "request_id": "other",
+                    "frame_path": "/tmp/missing-2.jpg",
+                    "driver_frame_index": 99,
+                }
+            )())
 
-            session.interrupt(clear_pending=False, resume_current=True)
+            next_driver_frame_index = session.interrupt(
+                clear_pending=False, resume_current=True
+            )
 
             resumed = session._sentence_heap[0]
-            self.assertEqual(resumed.start_frame, 175)
-            self.assertIsNone(resumed.start_driver_frame_index)
+            self.assertEqual(resumed.start_frame, 176)
+            self.assertEqual(resumed.start_driver_frame_index, 44)
+            self.assertEqual(next_driver_frame_index, 44)
             self.assertTrue(resumed.delete_after_use)
             self.assertFalse(current.delete_after_use)
+            self.assertEqual(session._packets.qsize(), 2)
 
 
 if __name__ == "__main__":

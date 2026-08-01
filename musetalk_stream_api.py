@@ -298,6 +298,7 @@ def start_session(body: dict) -> dict:
     config = StreamConfig(
         session_id=session_id, avatar_id=avatar_id, avatar_video=video_path,
         push_url=push_url, fps=int(body.get("fps", 25)),
+        output_fps=int(body["output_fps"]) if body.get("output_fps") else None,
         width=width, height=height,
         warmup_frames=int(body.get("warmup_frames", 25)),
         video_bitrate=str(body.get("video_bitrate", "3500k")),
@@ -312,7 +313,8 @@ def start_session(body: dict) -> dict:
         )
     elif output_mode in {"rtmp", "udp"}:
         output = RTMPOutput(config.push_url, config.video_bitrate, config.audio_bitrate,
-                            config.output_sample_rate, config.audio_delay_ms)
+                            config.output_sample_rate, config.audio_delay_ms,
+                            output_fps=config.output_fps)
     else:
         raise ValueError("output_mode must be rtmp, udp or relive")
     frame_cursor = [0]

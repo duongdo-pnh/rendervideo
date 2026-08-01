@@ -27,11 +27,13 @@ from render_job import OUT_RES  # bảng độ phân giải; render THỰC do qu
 from stream_ui import (
     enqueue_audio as stream_enqueue_audio,
     enqueue_audio_playlist as stream_enqueue_audio_playlist,
+    enqueue_sample_audio as stream_enqueue_sample_audio,
     interrupt_stream as stream_interrupt,
     preview_stream as stream_preview,
     refresh_stream as stream_refresh,
     start_stream as stream_start,
     stop_stream as stream_stop,
+    _sample_audio_choices,
 )
 
 # Provider list for the Import-Excel tab dropdowns (label shows config status).
@@ -971,8 +973,9 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                 with gr.Row():
                     live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
                     live_batch = gr.Slider(1, 32, value=32, step=1, label="MuseTalk batch size")
+                live_obs_fps = gr.Slider(25, 60, value=30, step=1, label="OBS output FPS")
                 live_audio_delay = gr.Slider(
-                    0, 3000, value=2000, step=100,
+                    0, 3000, value=0, step=100,
                     label="Audio delay (ms) — tiếng chờ hình")
                 with gr.Row():
                     live_start_btn = gr.Button("▶ Start OBS", variant="primary")
@@ -989,6 +992,15 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                     label="Preview đang phát", interactive=False, height=480)
                 live_audio = gr.File(
                     label="Audio câu tiếp theo", file_types=["audio"], type="filepath")
+                live_sample_audio = gr.Dropdown(
+                    label="Voice mẫu",
+                    choices=_sample_audio_choices(),
+                    value=(
+                        _sample_audio_choices()[0][1]
+                        if _sample_audio_choices() else None
+                    ),
+                    allow_custom_value=False,
+                )
                 live_request = gr.Textbox(
                     label="Request ID (có thể để trống)", placeholder="vd: sentence-001")
                 with gr.Row():
@@ -997,6 +1009,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                         label="Ngắt câu hiện tại trước khi phát", value=False)
                 with gr.Row():
                     live_enqueue_btn = gr.Button("🔊 Phát audio", variant="primary")
+                    live_sample_enqueue_btn = gr.Button("⭐ Gửi voice mẫu", variant="secondary")
                     live_interrupt_btn = gr.Button("⏭ Ngắt câu", variant="secondary")
                     live_refresh_btn = gr.Button("🔄 Status")
                 gr.Markdown("#### Voice playlist giới thiệu sản phẩm")
@@ -1011,17 +1024,22 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
 
         live_start_btn.click(
             stream_start,
-            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_audio_delay],
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_obs_fps, live_audio_delay],
             [live_status_md, live_status_json, live_stream_key, live_cache_progress],
         )
         live_reload_avatar_btn.click(
             stream_start,
-            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_audio_delay],
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_obs_fps, live_audio_delay],
             [live_status_md, live_status_json, live_stream_key, live_cache_progress],
         )
         live_enqueue_btn.click(
             stream_enqueue_audio,
             [live_session, live_request, live_audio, live_priority, live_interrupt_next],
+            [live_status_md, live_status_json],
+        )
+        live_sample_enqueue_btn.click(
+            stream_enqueue_sample_audio,
+            [live_session, live_sample_audio, live_request, live_priority, live_interrupt_next],
             [live_status_md, live_status_json],
         )
         live_voice_playlist_btn.click(
