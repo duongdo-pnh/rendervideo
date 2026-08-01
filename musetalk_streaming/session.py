@@ -419,7 +419,13 @@ class StreamSession:
                     self._current.played_frames += 1
                 self._last_frame = frame
             else:
-                if self.state is SessionState.PLAYING and self._current is not None:
+                # Keep the last live frame whenever playout has already begun.
+                # Rendering the next sentence can briefly leave the packet
+                # queue empty after the previous render has completed (and
+                # ``_current`` may already point at the next request or be
+                # None). Falling back to idle here creates a visible flash and
+                # can make OBS treat the source as disconnected/default scene.
+                if self.state is SessionState.PLAYING and active_request_id is not None:
                     frame = self._last_frame
                 else:
                     frame = self._idle_frames[idle_index % len(self._idle_frames)]
