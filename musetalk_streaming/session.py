@@ -26,10 +26,14 @@ class SentenceRequest:
     request_id: str = field(compare=False)
     audio_path: str = field(compare=False)
     delete_after_use: bool = field(default=False, compare=False)
+    prebuffer_before_play: bool = field(default=False, compare=False)
     queued_at: float = field(default_factory=time.monotonic, compare=False)
     total_frames: int = field(default=0, compare=False)
     rendered_frames: int = field(default=0, compare=False)
     played_frames: int = field(default=0, compare=False)
+    start_frame: int = field(default=0, compare=False)
+    freeze_frame_index: int | None = field(default=None, compare=False)
+    start_driver_frame_index: int | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         self.sort_key = (-self.priority, self.sequence)
@@ -40,6 +44,7 @@ class AVPacket:
     request_id: str
     frame_path: str
     pcm: np.ndarray
+    driver_frame_index: int | None = None
 
 
 Producer = Callable[
@@ -78,6 +83,7 @@ class StreamSession:
         self._sentence_ids: set[str] = set()
         self._sentence_cv = threading.Condition()
         self._sequence = itertools.count()
+        self._prebuffer_request_ids: set[str] = set()
         # Rendered frames wait on disk, not in RAM. This allows playout to wait
         # for 50% of audio of any length without exhausting host memory.
         self._packet_dir = tempfile.mkdtemp(prefix=f"musetalk-{config.session_id}-")
@@ -90,6 +96,7 @@ class StreamSession:
         self._render_thread: threading.Thread | None = None
         self._playout_thread: threading.Thread | None = None
         self._last_frame = self._idle_frames[0]
+        self._last_driver_frame_index = 0
         self._preview_lock = threading.Lock()
         self._preview_frame = self._last_frame.copy()
         self._video_pts = 0
@@ -147,8 +154,9 @@ class StreamSession:
     ) -> None:
         if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
             raise RuntimeError("session is not accepting requests")
+        start_driver_frame_index = self._last_driver_frame_index if interrupt else None
         if interrupt:
-            self.interrupt()
+            self.interrupt(clear_pending=False, resume_current=True)
         with self._sentence_cv:
             if request_id in self._sentence_ids or (
                 self._current is not None and self._current.request_id == request_id
@@ -160,11 +168,42 @@ class StreamSession:
                 priority=int(priority), sequence=next(self._sequence),
                 request_id=request_id, audio_path=audio_path,
                 delete_after_use=bool(delete_after_use),
+                start_driver_frame_index=start_driver_frame_index,
             )
             heapq.heappush(self._sentence_heap, request)
             self._sentence_ids.add(request_id)
             self._sentence_cv.notify()
         self._event_callback(request_id, "queued", {})
+
+    def enqueue_batch(self, requests: list[tuple[str, str, int, bool]], interrupt: bool = False) -> None:
+        """Queue ordered voice chunks for pipelined render and continuous playout."""
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
+            raise RuntimeError("session is not accepting requests")
+        start_driver_frame_index = self._last_driver_frame_index if interrupt else None
+        if interrupt:
+            self.interrupt(clear_pending=False, resume_current=True)
+        with self._sentence_cv:
+            ids = [request_id for request_id, _, _, _ in requests]
+            if not ids or len(ids) != len(set(ids)):
+                raise ValueError("invalid batch request_ids")
+            if any(request_id in self._sentence_ids or (
+                self._current is not None and self._current.request_id == request_id
+            ) for request_id in ids):
+                raise ValueError("duplicate request_id")
+            if len(self._sentence_heap) + len(requests) > self.config.sentence_queue_size:
+                raise queue.Full("sentence queue is full")
+            for request_id, audio_path, priority, delete_after_use in requests:
+                request = SentenceRequest(
+                    priority=int(priority), sequence=next(self._sequence), request_id=request_id,
+                    audio_path=audio_path, delete_after_use=bool(delete_after_use),
+                    prebuffer_before_play=False,
+                    start_driver_frame_index=start_driver_frame_index,
+                )
+                heapq.heappush(self._sentence_heap, request)
+                self._sentence_ids.add(request_id)
+            self._sentence_cv.notify_all()
+        for request_id in ids:
+            self._event_callback(request_id, "queued", {"prebuffer": False})
 
     @staticmethod
     def _cleanup_request(request: SentenceRequest) -> None:
@@ -174,13 +213,53 @@ class StreamSession:
             except FileNotFoundError:
                 pass
 
-    def interrupt(self) -> None:
+    def interrupt(
+        self, clear_pending: bool = True, resume_current: bool = False
+    ) -> None:
         with self._sentence_cv:
-            pending = list(self._sentence_heap)
-            self._sentence_heap.clear()
-            for request in pending:
-                self._sentence_ids.discard(request.request_id)
+            pending = list(self._sentence_heap) if clear_pending else []
+            if clear_pending:
+                self._sentence_heap.clear()
+                for request in pending:
+                    self._sentence_ids.discard(request.request_id)
+            current = self._current
+            if (
+                resume_current
+                and current is not None
+                and (
+                    current.total_frames == 0
+                    or current.played_frames < current.total_frames
+                )
+            ):
+                # Keep ownership of the uploaded audio with the resumed request.
+                # The interrupted render must not delete it in its finally block.
+                delete_after_resume = current.delete_after_use
+                current.delete_after_use = False
+                resume_sequence = next(self._sequence)
+                resume_id = f"{current.request_id}:resume-{resume_sequence}"
+                resumed = SentenceRequest(
+                    priority=current.priority,
+                    sequence=resume_sequence,
+                    request_id=resume_id,
+                    audio_path=current.audio_path,
+                    delete_after_use=delete_after_resume,
+                    start_frame=max(
+                        current.start_frame,
+                        current.start_frame + current.played_frames,
+                    ),
+                )
+                heapq.heappush(self._sentence_heap, resumed)
+                self._sentence_ids.add(resume_id)
+                self._event_callback(
+                    current.request_id,
+                    "paused",
+                    {
+                        "played_frames": current.played_frames,
+                        "resume_request_id": resume_id,
+                    },
+                )
             self._cancel_current.set()
+            self._prebuffer_request_ids.clear()
             self._discard_packets()
             self._sentence_cv.notify_all()
         for request in pending:
@@ -199,16 +278,13 @@ class StreamSession:
             except queue.Empty:
                 break
 
-    def _emit(self, frame: np.ndarray, pcm: np.ndarray) -> None:
+    def _emit(
+        self, frame: np.ndarray, pcm: np.ndarray, driver_frame_index: int | None = None
+    ) -> None:
         if self._current is None:
             return
         frame = self._normalize_frame(frame)
         pcm = np.ascontiguousarray(pcm, dtype=np.int16).reshape(-1)
-        expected = self.config.sample_rate // self.config.fps
-        if pcm.size < expected:
-            pcm = np.pad(pcm, (0, expected - pcm.size))
-        elif pcm.size > expected:
-            pcm = pcm[:expected]
         import cv2
 
         frame_path = os.path.join(
@@ -222,7 +298,12 @@ class StreamSession:
             except FileNotFoundError:
                 pass
             return
-        self._packets.put(AVPacket(self._current.request_id, frame_path, pcm))
+        self._packets.put(
+            AVPacket(
+                self._current.request_id, frame_path, pcm,
+                driver_frame_index=driver_frame_index,
+            )
+        )
         buffered = self._packets.qsize()
         self._current.rendered_frames += 1
         self.metrics.update(
@@ -266,16 +347,26 @@ class StreamSession:
                 self.metrics.update(inference_seconds=self.metrics.inference_seconds + elapsed)
                 self._render_complete.set()
                 self._cleanup_request(request)
-                while self._packets.qsize() and not self._stop.is_set():
-                    time.sleep(0.02)
+                if request.prebuffer_before_play:
+                    with self._sentence_cv:
+                        self._prebuffer_request_ids.discard(request.request_id)
+                # Safe pre-render: as soon as A has generated every frame, the
+                # GPU immediately starts B.  OBS keeps consuming A's packets in
+                # parallel.  Waiting for A to finish playing wastes the only
+                # available overlap; switching at 70% generation would drop
+                # A's missing 30% frames and visibly freeze the mouth.
                 self._current = None
                 self._cancel_current.clear()
                 if not self._stop.is_set():
                     self._set_state(SessionState.IDLE)
 
     def _ready_to_play(self) -> bool:
-        total_frames = self._current.total_frames if self._current else 0
-        threshold = half_frame_threshold(total_frames, self.config.warmup_frames)
+        with self._sentence_cv:
+            if self._prebuffer_request_ids:
+                return False
+        # Realtime mode starts as soon as the configured small frame buffer is
+        # available. It no longer waits for half of the complete sentence.
+        threshold = max(1, self.config.warmup_frames)
         return (
             self._packets.qsize() >= threshold
             or (self._render_complete.is_set() and not self._packets.empty())
@@ -286,7 +377,6 @@ class StreamSession:
         idle_index = 0
         active_request_id: str | None = None
         ended_request_id: str | None = None
-        silence = np.zeros(self.config.sample_rate // self.config.fps, dtype=np.int16)
         while not self._stop.is_set():
             deadline = epoch + self._video_pts / self.config.fps
             delay = deadline - time.monotonic()
@@ -323,6 +413,8 @@ class StreamSession:
                     self.metrics.increment("dropped_frames")
                     continue
                 pcm = packet.pcm
+                if packet.driver_frame_index is not None:
+                    self._last_driver_frame_index = packet.driver_frame_index
                 if self._current is not None and self._current.request_id == packet.request_id:
                     self._current.played_frames += 1
                 self._last_frame = frame
@@ -333,7 +425,24 @@ class StreamSession:
                     frame = self._idle_frames[idle_index % len(self._idle_frames)]
                     idle_index += 1
                     active_request_id = None
-                pcm = silence
+                    if (
+                        self.state is SessionState.PLAYING
+                        and self._current is None
+                        and self._packets.empty()
+                    ):
+                        self._set_state(SessionState.IDLE)
+                pcm = np.empty(0, dtype=np.int16)
+            # A 16 kHz clock does not divide evenly by every video FPS (15 FPS
+            # alternates 1067/1066 samples). Fit each audio packet to the exact
+            # rational boundary so long sessions cannot drift out of sync.
+            expected_audio_pts = round(
+                (self._video_pts + 1) * self.config.sample_rate / self.config.fps
+            )
+            expected_samples = max(1, expected_audio_pts - self._audio_pts)
+            if pcm.size < expected_samples:
+                pcm = np.pad(pcm, (0, expected_samples - pcm.size))
+            elif pcm.size > expected_samples:
+                pcm = pcm[:expected_samples]
             with self._preview_lock:
                 self._preview_frame = frame.copy()
             try:
@@ -378,7 +487,10 @@ class StreamSession:
             "avatar_id": self.config.avatar_id,
             "width": self.config.width,
             "height": self.config.height,
-            "transport": "relive" if self.output.__class__.__name__ == "ReLiveClipOutput" else "rtmp",
+            "transport": (
+                "relive" if self.output.__class__.__name__ == "ReLiveClipOutput"
+                else getattr(self.output, "_scheme", "rtmp")
+            ),
             "transport_running": bool(transport.get("running")),
             "transport_reconnecting": bool(transport.get("reconnecting")),
             "transport_last_error": transport.get("last_error"),
@@ -391,6 +503,7 @@ class StreamSession:
             "audio_total_seconds": round(total / self.config.fps, 2) if total else 0.0,
             "audio_played_seconds": round(played / self.config.fps, 2),
             "sentence_queue_size": len(self._sentence_heap),
+            "prebuffer_requests": len(self._prebuffer_request_ids),
             **self.metrics.snapshot(),
         }
 

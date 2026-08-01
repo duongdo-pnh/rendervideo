@@ -16,7 +16,6 @@ import threading
 import time
 import traceback
 import uuid
-import wave
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,17 +53,11 @@ MANAGER = StreamManager()
 GPU_LOCK = threading.Lock()
 AVATAR_LOCK = threading.Lock()
 AVATARS = {}
-# RTX 3090 (24 GB) has sufficient headroom for 32 frames at once.  This changes
-# throughput only: same MuseTalk model, precision, resolution and FPS.
-MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "32")))
-BLEND_WORKERS = max(1, int(os.getenv("MUSETALK_BLEND_WORKERS", "16")))
+MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "20")))
+BLEND_WORKERS = max(1, int(os.getenv("MUSETALK_BLEND_WORKERS", "4")))
 AUDIO_UPLOAD_DIR = APP_ROOT / "uploads" / "stream_audio"
 MAX_AUDIO_UPLOAD_BYTES = int(os.getenv("MUSETALK_MAX_AUDIO_UPLOAD_MB", "100")) * 1024 * 1024
 ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
-MAX_AUDIO_CHUNK_SECONDS = max(
-    5.0, float(os.getenv("MUSETALK_MAX_AUDIO_CHUNK_SECONDS", "5"))
-)
-AUDIO_CHUNK_DIR = APP_ROOT / "uploads" / "stream_audio_chunks"
 
 
 def load_runtime() -> None:
@@ -142,63 +135,26 @@ def read_idle_frames(video_path: str, limit: int = 250) -> list[np.ndarray]:
     return frames
 
 
-def audio_chunks(audio_path: str, fps: float):
+def audio_chunks(audio_path: str):
     features, length = rt.audio_processor.get_audio_feature(
         audio_path, weight_dtype=rt.weight_dtype
     )
     return rt.audio_processor.get_whisper_chunk(
-        features, rt.device, rt.weight_dtype, rt.whisper, length, fps=fps,
+        features, rt.device, rt.weight_dtype, rt.whisper, length, fps=25,
         audio_padding_length_left=rt.args.audio_padding_length_left,
         audio_padding_length_right=rt.args.audio_padding_length_right,
     )
 
 
-def split_audio_for_stream(audio_path: str, request_id: str, delete_source: bool = False):
-    """Keep one logical voice timeline; inference already streams it in GPU batches."""
-    path = Path(audio_path)
-    return [(request_id, str(path), delete_source)]
-
-
 @torch.inference_mode()
-def produce_sentence(
-    avatar, request, emit, cancel, fps: int, frame_repeat: int = 1,
-    frame_cursor: list[int] | None = None,
-) -> None:
-    frame_repeat = max(1, int(frame_repeat))
-    inference_fps = fps / frame_repeat
-    all_chunks = audio_chunks(request.audio_path, inference_fps)
-    full_total_frames = len(all_chunks) * frame_repeat
-    start_frame = min(max(0, int(request.start_frame)), full_total_frames)
-    start_chunk = min(len(all_chunks), start_frame // frame_repeat)
-    chunks = all_chunks[start_chunk:]
-    request.total_frames = max(0, full_total_frames - start_frame)
+def produce_sentence(avatar, request, emit, cancel) -> None:
+    chunks = audio_chunks(request.audio_path)
+    request.total_frames = len(chunks)
     waveform, _ = librosa.load(request.audio_path, sr=16_000, mono=True)
-    pcm_start = round(start_frame * 16_000 / fps)
-    waveform = waveform[pcm_start:]
     pcm = np.clip(waveform * 32767, -32768, 32767).astype(np.int16)
     latents = avatar.input_latent_list_cycle
-    freeze_frame_index = request.freeze_frame_index
-    base_frame_index = (
-        freeze_frame_index
-        if freeze_frame_index is not None
-        else (
-            request.start_driver_frame_index
-            if request.start_driver_frame_index is not None
-            else (frame_cursor[0] if frame_cursor is not None else 0)
-        )
-    )
     batches = datagen(
-        chunks,
-        [
-            latents[
-                (
-                    base_frame_index
-                    if freeze_frame_index is not None
-                    else base_frame_index + i
-                ) % len(latents)
-            ]
-            for i in range(len(chunks))
-        ],
+        chunks, [latents[i % len(latents)] for i in range(len(chunks))],
         min(MAX_GPU_BATCH, int(avatar.batch_size)),
     )
     frame_index = 0
@@ -207,11 +163,7 @@ def produce_sentence(
 
     def blend_frame(item):
         result, index = item
-        cycle = (
-            base_frame_index
-            if freeze_frame_index is not None
-            else base_frame_index + index
-        ) % len(avatar.frame_list_cycle)
+        cycle = index % len(avatar.frame_list_cycle)
         bbox = avatar.coord_list_cycle[cycle]
         x1, y1, x2, y2 = bbox
         mouth = cv2.resize(result.astype("uint8"), (x2 - x1, y2 - y1))
@@ -243,26 +195,11 @@ def produce_sentence(
             for frame in frames:
                 if cancel.is_set():
                     break
-                # At 720p the 3090 sustains about 12.5 generated mouth frames
-                # per second. Duplicate each generated frame into the 25 FPS
-                # output clock while advancing audio on every output frame.
-                for repeat_index in range(frame_repeat):
-                    output_index = frame_index * frame_repeat + repeat_index
-                    start = round(output_index * 16_000 / fps)
-                    end = round((output_index + 1) * 16_000 / fps)
-                    driver_index = (
-                        base_frame_index
-                        if freeze_frame_index is not None
-                        else base_frame_index + frame_index
-                    )
-                    emit(frame, pcm[start:end], driver_index)
+                start = frame_index * 640
+                emit(frame, pcm[start:start + 640])
                 frame_index += 1
             total_blend_seconds += time.monotonic() - blend_started
             del audio_features, latent_batch, predicted, decoded
-    if frame_cursor is not None and freeze_frame_index is None:
-        # Preserve the driver-video phase across all five-second voice chunks.
-        # Only the mouth changes; the body/background never jump back to frame 0.
-        frame_cursor[0] = base_frame_index + frame_index
     return {
         "frames": frame_index,
         "gpu_batch_ms": total_batch_seconds * 1000,
@@ -288,16 +225,9 @@ def start_session(body: dict) -> dict:
     source_height, source_width = idle_frames[0].shape[:2]
     width = max(2, source_width // 2 * 2)
     height = max(2, source_height // 2 * 2)
-    output_mode = str(body.get("output_mode", "rtmp")).lower()
-    push_url = str(body.get("push_url", ""))
-    # The desktop Facebook session is a persistent realtime feed consumed by
-    # OBS. Do not let an empty UI request replace it with legacy MP4 output.
-    if session_id == "facebook-live" and output_mode == "relive":
-        output_mode = "udp"
-        push_url = "udp://127.0.0.1:5000?pkt_size=1316"
     config = StreamConfig(
         session_id=session_id, avatar_id=avatar_id, avatar_video=video_path,
-        push_url=push_url, fps=int(body.get("fps", 25)),
+        push_url=str(body.get("push_url", "")), fps=int(body.get("fps", 25)),
         width=width, height=height,
         warmup_frames=int(body.get("warmup_frames", 25)),
         video_bitrate=str(body.get("video_bitrate", "3500k")),
@@ -305,24 +235,20 @@ def start_session(body: dict) -> dict:
         audio_delay_ms=int(body.get("audio_delay_ms", 300)),
     )
     avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 20)))
+    output_mode = str(body.get("output_mode", "rtmp")).lower()
     if output_mode == "relive":
         output = ReLiveClipOutput(
             APP_ROOT / "outputs" / "relive_clips",
             str(body.get("relive_callback_url", "http://127.0.0.1:7864/api/musetalk/clip")),
         )
-    elif output_mode in {"rtmp", "udp"}:
+    elif output_mode == "rtmp":
         output = RTMPOutput(config.push_url, config.video_bitrate, config.audio_bitrate,
                             config.output_sample_rate, config.audio_delay_ms)
     else:
-        raise ValueError("output_mode must be rtmp, udp or relive")
-    frame_cursor = [0]
+        raise ValueError("output_mode must be rtmp or relive")
     session = StreamSession(
         config, output, idle_frames,
-        lambda request, emit, cancel: produce_sentence(
-            avatar, request, emit, cancel, config.fps,
-            frame_repeat=2 if session_id == "facebook-live" and config.fps == 25 else 1,
-            frame_cursor=frame_cursor,
-        ),
+        lambda request, emit, cancel: produce_sentence(avatar, request, emit, cancel),
         lambda request_id, event, details: print(
             f"[stream] session={session_id} request={request_id} event={event}",
             flush=True,
@@ -419,7 +345,6 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         session_id, action = self._route()
         uploaded_path = None
-        enqueued_chunks = 0
         try:
             if session_id is None:
                 result = start_session(self._body())
@@ -429,38 +354,28 @@ class Handler(BaseHTTPRequestHandler):
             if action == "enqueue-file":
                 body = self._multipart_audio()
                 uploaded_path = body["audio_path"]
-                chunks = split_audio_for_stream(
-                    uploaded_path, str(body["request_id"]), delete_source=True
+                session.enqueue(
+                    str(body["request_id"]), uploaded_path,
+                    int(body.get("priority", 0)), bool(body.get("interrupt", False)),
+                    delete_after_use=True,
                 )
-                session.enqueue_batch(
-                    [(chunk_id, chunk_path, int(body.get("priority", 0)), delete_after_use)
-                     for chunk_id, chunk_path, delete_after_use in chunks],
-                    interrupt=bool(body.get("interrupt", False)),
-                )
-                enqueued_chunks = len(chunks)
-                uploaded_path = None  # split helper/session owns the upload now
+                uploaded_path = None  # ownership transferred to the session
             elif action == "enqueue":
                 body = self._body()
                 audio_path = str(Path(body["audio_path"]).resolve())
                 if not Path(audio_path).is_file():
                     raise ValueError("audio_path does not exist")
-                chunks = split_audio_for_stream(audio_path, str(body["request_id"]))
-                session.enqueue_batch(
-                    [(chunk_id, chunk_path, int(body.get("priority", 0)), delete_after_use)
-                     for chunk_id, chunk_path, delete_after_use in chunks],
-                    interrupt=bool(body.get("interrupt", False)),
+                session.enqueue(
+                    str(body["request_id"]), audio_path, int(body.get("priority", 0)),
+                    bool(body.get("interrupt", False)),
                 )
-                enqueued_chunks = len(chunks)
             elif action == "interrupt":
                 self._body()
                 session.interrupt()
             else:
                 self._json(404, {"error": "not found"})
                 return
-            status = session.get_status()
-            if enqueued_chunks:
-                status["audio_chunks_enqueued"] = enqueued_chunks
-            self._json(202, status)
+            self._json(202, session.get_status())
         except (KeyError, ValueError) as exc:
             if uploaded_path:
                 Path(uploaded_path).unlink(missing_ok=True)

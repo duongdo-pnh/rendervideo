@@ -26,6 +26,7 @@ from latentsync.tts.ausynclab import AusynclabTTS
 from render_job import OUT_RES  # bảng độ phân giải; render THỰC do queue_worker chạy nền
 from stream_ui import (
     enqueue_audio as stream_enqueue_audio,
+    enqueue_audio_playlist as stream_enqueue_audio_playlist,
     interrupt_stream as stream_interrupt,
     preview_stream as stream_preview,
     refresh_stream as stream_refresh,
@@ -952,9 +953,8 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
 
     with gr.Tab("📡 Livestream"):
         gr.Markdown(
-            "### MuseTalk → ReLive → OBS\n"
-            "Để trống Server URL và Stream key để MuseTalk trả MP4 cho ReLive, "
-            "sau đó ReLive tự đưa clip vào OBS. Stream key chỉ dùng khi muốn đẩy RTMP trực tiếp."
+            "### MuseTalk → OBS\n"
+            "Video avatar được render realtime và phát thẳng sang OBS qua UDP."
         )
         with gr.Row():
             with gr.Column():
@@ -963,23 +963,26 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                     placeholder="vd: facebook-live")
                 live_avatar = gr.File(
                     label="Avatar video (MP4)", file_types=["video"], type="filepath")
-                live_server_url = gr.Textbox(
-                    label="Facebook Server URL (chỉ RTMP trực tiếp)",
-                    value="",
-                    placeholder="Để trống khi dùng ReLive/OBS")
-                live_stream_key = gr.Textbox(
-                    label="Facebook Stream key (chỉ RTMP trực tiếp)", type="password",
-                    placeholder="Để trống khi dùng ReLive/OBS",
-                    info="Không cần stream key khi dùng ReLive; ô sẽ được xóa sau khi Start.")
+                # Facebook Live is sent to OBS over local UDP. Keep empty
+                # callback values as state instead of exposing obsolete RTMP
+                # credentials in the UI.
+                live_server_url = gr.State(value="")
+                live_stream_key = gr.State(value="")
                 with gr.Row():
                     live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
-                    live_batch = gr.Slider(1, 32, value=20, step=1, label="MuseTalk batch size")
+                    live_batch = gr.Slider(1, 32, value=32, step=1, label="MuseTalk batch size")
                 live_audio_delay = gr.Slider(
-                    0, 1000, value=300, step=50,
-                    label="Audio delay (ms) — tăng khi hình chậm hơn tiếng")
+                    0, 3000, value=2000, step=100,
+                    label="Audio delay (ms) — tiếng chờ hình")
                 with gr.Row():
-                    live_start_btn = gr.Button("▶ Start ReLive / OBS", variant="primary")
+                    live_start_btn = gr.Button("▶ Start OBS", variant="primary")
+                    live_reload_avatar_btn = gr.Button(
+                        "🔄 Đổi mẫu & nạp lại cache", variant="secondary")
                     live_stop_btn = gr.Button("⏹ Stop stream", variant="stop")
+                live_cache_progress = gr.Markdown(
+                    "#### Tiến trình tạo cache\n"
+                    "`░░░░░░░░░░░░░░░░░░░░` **0%**  \n"
+                    "Chưa bắt đầu.")
 
             with gr.Column():
                 live_preview = gr.Image(
@@ -996,6 +999,12 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                     live_enqueue_btn = gr.Button("🔊 Phát audio", variant="primary")
                     live_interrupt_btn = gr.Button("⏭ Ngắt câu", variant="secondary")
                     live_refresh_btn = gr.Button("🔄 Status")
+                gr.Markdown("#### Voice playlist giới thiệu sản phẩm")
+                live_voice_playlist = gr.File(
+                    label="Chọn nhiều MP3/WAV theo thứ tự phát",
+                    file_types=["audio"], file_count="multiple", type="filepath")
+                live_voice_playlist_btn = gr.Button(
+                    "➕ Thêm vào Voice playlist", variant="secondary")
                 live_status_md = gr.Markdown("### Trạng thái: chưa chạy")
                 live_status_json = gr.JSON(label="Streaming metrics")
                 live_preview_timer = gr.Timer(1.0)
@@ -1003,11 +1012,21 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
         live_start_btn.click(
             stream_start,
             [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_audio_delay],
-            [live_status_md, live_status_json, live_stream_key],
+            [live_status_md, live_status_json, live_stream_key, live_cache_progress],
+        )
+        live_reload_avatar_btn.click(
+            stream_start,
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_audio_delay],
+            [live_status_md, live_status_json, live_stream_key, live_cache_progress],
         )
         live_enqueue_btn.click(
             stream_enqueue_audio,
             [live_session, live_request, live_audio, live_priority, live_interrupt_next],
+            [live_status_md, live_status_json],
+        )
+        live_voice_playlist_btn.click(
+            stream_enqueue_audio_playlist,
+            [live_session, live_voice_playlist],
             [live_status_md, live_status_json],
         )
         live_refresh_btn.click(stream_refresh, live_session, [live_status_md, live_status_json])

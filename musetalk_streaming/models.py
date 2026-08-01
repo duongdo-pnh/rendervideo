@@ -32,14 +32,16 @@ class StreamConfig:
     output_sample_rate: int = 44_100
     video_bitrate: str = "3500k"
     audio_bitrate: str = "128k"
-    audio_delay_ms: int = 300
+    # Frames and PCM are generated as matching 40 ms pairs.  A non-zero delay
+    # intentionally makes the voice late, so default to exact lip-sync.
+    audio_delay_ms: int = 0
     warmup_frames: int = 25
     video_queue_frames: int = 250
     sentence_queue_size: int = 100
 
     def __post_init__(self) -> None:
-        if self.fps != 25:
-            raise ValueError("MVP supports exactly 25 FPS")
+        if self.fps < 10 or self.fps > 30:
+            raise ValueError("stream FPS must be between 10 and 30")
         if self.width <= 0 or self.height <= 0:
             raise ValueError("stream dimensions must be positive")
         if self.sample_rate != 16_000:

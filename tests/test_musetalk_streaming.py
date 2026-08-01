@@ -7,7 +7,7 @@ import numpy as np
 
 from musetalk_streaming.models import StreamConfig
 from musetalk_streaming.output import FileStreamOutput, mask_push_url
-from musetalk_streaming.session import StreamSession, half_frame_threshold
+from musetalk_streaming.session import SentenceRequest, StreamSession, half_frame_threshold
 
 
 class StreamingTests(unittest.TestCase):
@@ -16,15 +16,38 @@ class StreamingTests(unittest.TestCase):
         self.assertEqual(half_frame_threshold(600, 25), 300)
         self.assertEqual(half_frame_threshold(1, 25), 1)
 
+    def test_realtime_playout_uses_configured_warmup_not_half(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = StreamConfig(
+                "s", "a", "/tmp/avatar.mp4", "rtmp://host/live/key",
+                fps=15, width=16, height=16, warmup_frames=1,
+                video_queue_frames=4,
+            )
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+            session = StreamSession(
+                config, FileStreamOutput(directory), [frame], lambda *_: None
+            )
+            session._current = type("Request", (), {"total_frames": 100})()
+            session._packets.put(object())
+            self.assertTrue(session._ready_to_play())
+
     def test_mask_push_url(self):
         self.assertEqual(
             mask_push_url("rtmp://user:pass@example.com/live/secret-key?token=x"),
             "rtmp://example.com/live/***",
         )
 
-    def test_config_rejects_non_25_fps(self):
+    def test_config_accepts_realtime_15_fps(self):
+        config = StreamConfig(
+            "s", "a", "/tmp/a.mp4", "rtmp://host/live/key", fps=15
+        )
+        self.assertEqual(config.fps, 15)
+
+    def test_config_rejects_fps_outside_safe_range(self):
         with self.assertRaises(ValueError):
-            StreamConfig("s", "a", "/tmp/a.mp4", "rtmp://host/live/key", fps=30)
+            StreamConfig("s", "a", "/tmp/a.mp4", "rtmp://host/live/key", fps=9)
+        with self.assertRaises(ValueError):
+            StreamConfig("s", "a", "/tmp/a.mp4", "rtmp://host/live/key", fps=31)
 
     def test_normalize_frame_preserves_source_aspect_ratio(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -87,6 +110,32 @@ class StreamingTests(unittest.TestCase):
             self.assertLessEqual(abs(status["av_drift_ms"]), 0.01)
             self.assertGreaterEqual(status["output_fps"], 10)
             self.assertTrue((Path(directory) / "timeline.jsonl").is_file())
+
+    def test_comment_preemption_requeues_current_audio_from_played_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = StreamConfig(
+                "s", "a", "/tmp/avatar.mp4", "rtmp://host/live/key",
+                width=16, height=16, warmup_frames=1, video_queue_frames=4,
+            )
+            frame = np.zeros((16, 16, 3), dtype=np.uint8)
+            session = StreamSession(
+                config, FileStreamOutput(directory), [frame], lambda *_: None
+            )
+            current = SentenceRequest(
+                priority=10, sequence=0, request_id="product",
+                audio_path="/tmp/product.wav", delete_after_use=True,
+                start_frame=100, total_frames=500, played_frames=75,
+            )
+            session._current = current
+            session._last_driver_frame_index = 42
+
+            session.interrupt(clear_pending=False, resume_current=True)
+
+            resumed = session._sentence_heap[0]
+            self.assertEqual(resumed.start_frame, 175)
+            self.assertIsNone(resumed.start_driver_frame_index)
+            self.assertTrue(resumed.delete_after_use)
+            self.assertFalse(current.delete_after_use)
 
 
 if __name__ == "__main__":

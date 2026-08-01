@@ -26,6 +26,13 @@ BACKEND_URL = f"http://{BACKEND_HOST}:{BACKEND_PORT}"
 MUSETALK_PYTHON = ROOT / "engines" / "MuseTalk" / ".venv" / "bin" / "python"
 BACKEND_SCRIPT = ROOT / "musetalk_stream_api.py"
 BACKEND_LOG = ROOT / "logs" / "musetalk_stream_api.log"
+FACEBOOK_AVATAR_720 = Path(
+    os.environ.get(
+        "FACEBOOK_LIVE_AVATAR_PATH",
+        "/home/byscom/Desktop/code/AI-live/live_system/avatar_cache/"
+        "facebook_live_selected_720x1280.mp4",
+    )
+)
 _CURRENT_PREVIEW_SESSION = "facebook-live"
 _CURRENT_AVATAR_VIDEO = None
 
@@ -105,6 +112,36 @@ def _compose_push_url(server_url: str, stream_key: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, push_path, "", ""))
 
 
+def _normalize_facebook_avatar(avatar_video: str) -> str:
+    """Convert an uploaded Facebook avatar to a stable portrait 720p/25fps file."""
+    if not avatar_video:
+        raise gr.Error("Cần tải lên avatar video hợp lệ.")
+    source = Path(avatar_video).resolve()
+    if not source.is_file():
+        raise gr.Error("Cần tải lên avatar video hợp lệ.")
+    FACEBOOK_AVATAR_720.parent.mkdir(parents=True, exist_ok=True)
+    temporary = FACEBOOK_AVATAR_720.with_name(
+        f".{FACEBOOK_AVATAR_720.stem}.{os.getpid()}.tmp.mp4"
+    )
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-vf",
+        "scale=720:1280:force_original_aspect_ratio=decrease,"
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,fps=25",
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+        str(temporary),
+    ]
+    try:
+        subprocess.run(command, check=True, timeout=1800)
+        os.replace(temporary, FACEBOOK_AVATAR_720)
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        temporary.unlink(missing_ok=True)
+        raise gr.Error(f"Không thể resize avatar về 720×1280: {type(exc).__name__}") from None
+    return str(FACEBOOK_AVATAR_720.resolve())
+
+
 def _status_text(status: dict, prefix: str = "") -> str:
     label = prefix or "Trạng thái"
     progress = float(status.get("audio_progress_percent", 0) or 0)
@@ -133,6 +170,17 @@ def _status_text(status: dict, prefix: str = "") -> str:
     )
 
 
+def _cache_progress_text(percent: int, label: str) -> str:
+    percent = min(100, max(0, int(percent)))
+    filled = min(20, percent // 5)
+    bar = "█" * filled + "░" * (20 - filled)
+    return (
+        "#### Tiến trình tạo cache\n"
+        f"`{bar}` **{percent}%**  \n"
+        f"{label}"
+    )
+
+
 def start_stream(
     session_id: str,
     avatar_video: str,
@@ -141,31 +189,81 @@ def start_stream(
     render_ahead_seconds: float,
     batch_size: int,
     audio_delay_ms: int,
+    progress=gr.Progress(),
 ):
     global _CURRENT_PREVIEW_SESSION, _CURRENT_AVATAR_VIDEO
+    progress(0.02, desc="Kiểm tra video mẫu...")
     session_id = (session_id or "").strip()
     if not session_id:
         raise gr.Error("Cần nhập Session ID.")
+    yield (
+        "### Đang chuẩn bị mẫu...",
+        {"cache_progress_percent": 2, "cache_stage": "checking"},
+        gr.update(),
+        _cache_progress_text(2, "Đang kiểm tra video mẫu..."),
+    )
+    if session_id == "facebook-live":
+        progress(0.08, desc="Resize mẫu về 720×1280, 25 FPS...")
+        avatar_video = _normalize_facebook_avatar(avatar_video)
+        progress(0.35, desc="Resize hoàn tất")
+        yield (
+            "### Đã resize mẫu, chuẩn bị tạo cache...",
+            {"cache_progress_percent": 35, "cache_stage": "resized"},
+            gr.update(),
+            _cache_progress_text(35, "Resize 720×1280, 25 FPS đã hoàn tất."),
+        )
     _CURRENT_PREVIEW_SESSION = session_id
     _CURRENT_AVATAR_VIDEO = str(Path(avatar_video).resolve()) if avatar_video else None
     if not avatar_video or not Path(avatar_video).is_file():
         raise gr.Error("Cần tải lên avatar video hợp lệ.")
-    use_relive = not (server_url or "").strip() and not (stream_key or "").strip()
-    push_url = "" if use_relive else _compose_push_url(server_url, stream_key)
+    use_obs_udp = (
+        session_id == "facebook-live"
+        and not (server_url or "").strip()
+        and not (stream_key or "").strip()
+    )
+    use_relive = (
+        not use_obs_udp
+        and not (server_url or "").strip()
+        and not (stream_key or "").strip()
+    )
+    push_url = (
+        "udp://127.0.0.1:5000?pkt_size=1316"
+        if use_obs_udp
+        else ("" if use_relive else _compose_push_url(server_url, stream_key))
+    )
     _ensure_backend()
+    progress(0.45, desc="Đang tạo cache MuseTalk (khuôn mặt, latent, mask)...")
+    yield (
+        "### Đang tạo cache MuseTalk...",
+        {"cache_progress_percent": 45, "cache_stage": "musetalk_cache"},
+        gr.update(),
+        _cache_progress_text(
+            45, "Đang nhận diện khuôn mặt, tạo latent và mask. Vui lòng chờ..."
+        ),
+    )
     status = _request("POST", "/api/streams", {
         "session_id": session_id,
         "avatar_id": session_id,
         "avatar_video": str(Path(avatar_video).resolve()),
         "push_url": push_url,
-        "output_mode": "relive" if use_relive else "rtmp",
+        "output_mode": "udp" if use_obs_udp else ("relive" if use_relive else "rtmp"),
         "fps": 25,
-        "warmup_frames": min(250, max(0, int(round(float(render_ahead_seconds) * 25)))),
+        "warmup_frames": (
+            25 if session_id == "facebook-live"
+            else min(250, max(0, int(round(float(render_ahead_seconds) * 25))))
+        ),
         "batch_size": int(batch_size),
         "audio_delay_ms": int(audio_delay_ms),
     }, timeout=1800)
+    progress(0.95, desc="Cache xong, đang nối luồng với OBS...")
+    progress(1.0, desc="Đã nạp mẫu và khởi động luồng")
     # Clear the password field after the backend has accepted the credential.
-    return _status_text(status, "Đã bắt đầu stream"), status, gr.update(value="")
+    yield (
+        _status_text(status, "Đã bắt đầu stream"),
+        status,
+        gr.update(value=""),
+        _cache_progress_text(100, "Hoàn tất cache và đã nối luồng với OBS."),
+    )
 
 
 def enqueue_audio(
@@ -188,6 +286,29 @@ def enqueue_audio(
         },
     )
     return _status_text(status, "Đã enqueue audio"), status
+
+
+def enqueue_audio_playlist(session_id: str, audio_paths):
+    """Enqueue nhiều file voice theo thứ tự người dùng chọn cho MuseTalk realtime."""
+    paths = [str(Path(path).resolve()) for path in (audio_paths or []) if path]
+    if not paths:
+        raise gr.Error("Chọn ít nhất một file audio cho Voice playlist.")
+    for path in paths:
+        if not Path(path).is_file():
+            raise gr.Error(f"Không tìm thấy audio: {Path(path).name}")
+    status = None
+    stamp = int(time.time())
+    for index, path in enumerate(paths, 1):
+        status = _request(
+            "POST", f"/api/streams/{(session_id or '').strip()}/enqueue",
+            {
+                "request_id": f"voice-playlist-{stamp}-{index}",
+                "audio_path": path,
+                "priority": 10,
+                "interrupt": False,
+            },
+        )
+    return _status_text(status, f"Đã thêm {len(paths)} voice vào playlist"), status
 
 
 def refresh_stream(session_id: str):

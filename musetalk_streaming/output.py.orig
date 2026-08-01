@@ -261,26 +261,21 @@ class RTMPOutput(StreamOutput):
         audio_read, audio_write = os.pipe()
         if self._scheme == "udp":
             output_args = ["-flush_packets", "1", "-f", "mpegts", self._push_url]
-            # UDP is only the local OBS handoff. NVENC uses the 3090's dedicated
-            # encoder, preserving the same frame size/FPS/bitrate while freeing
-            # CPU for MuseTalk frame blending.
-            video_encoder = ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "ll"]
         else:
             output_args = ["-f", "flv", self._push_url]
-            video_encoder = ["-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency"]
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
             "-thread_queue_size", "512", "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s:v", f"{width}x{height}", "-r", str(fps), "-i", f"pipe:{video_read}",
             "-thread_queue_size", "512", "-f", "s16le", "-ar", str(sample_rate),
             "-ac", "1", "-i", f"pipe:{audio_read}",
-            *video_encoder,
+            "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
             "-pix_fmt", "yuv420p", "-g", str(fps * 2), "-keyint_min", str(fps),
             "-sc_threshold", "0", "-b:v", self._video_bitrate,
             "-maxrate", self._video_bitrate, "-bufsize", self._video_bitrate,
             "-c:a", "aac", "-ar", str(self._output_sample_rate), "-ac", "2",
             "-af", f"adelay={self._audio_delay_ms}:all=1",
-            "-b:a", self._audio_bitrate, *output_args,
+            "-b:a", self._audio_bitrate, "-f", "flv", self._push_url,
         ]
         try:
             process = subprocess.Popen(
