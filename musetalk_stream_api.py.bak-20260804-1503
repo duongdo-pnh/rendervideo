@@ -53,13 +53,9 @@ MANAGER = StreamManager()
 GPU_LOCK = threading.Lock()
 AVATAR_LOCK = threading.Lock()
 AVATARS = {}
-# TRẦN batch, không phải mục tiêu. Batch to = kernel CUDA chạy dài = OBS phải xếp
-# hàng sau nó để composite -> rớt frame ĐÚNG LÚC avatar đang nói. Đo trên 5090
-# (2026-08-04, avatar đọc + đang encode, 60s mỗi mức):
-#   batch 20 -> OBS 27,1 fps, skip 11,3%     batch 8 -> 30,0 fps, skip 0,19%
-#   batch  6 -> OBS 30,0 fps, skip 0,00%     batch 2 -> MuseTalk đói buffer
-# Giữ trần thấp để dù caller cũ truyền 20 vẫn không phá được độ mượt.
-MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "8")))
+# RTX 3090 (24 GB) has sufficient headroom for 32 frames at once.  This changes
+# throughput only: same MuseTalk model, precision, resolution and FPS.
+MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "32")))
 BLEND_WORKERS = max(1, int(os.getenv("MUSETALK_BLEND_WORKERS", "16")))
 AUDIO_UPLOAD_DIR = APP_ROOT / "uploads" / "stream_audio"
 MAX_AUDIO_UPLOAD_BYTES = int(os.getenv("MUSETALK_MAX_AUDIO_UPLOAD_MB", "100")) * 1024 * 1024
@@ -326,13 +322,11 @@ def start_session(body: dict) -> dict:
         output_fps=int(body["output_fps"]) if body.get("output_fps") else None,
         width=width, height=height,
         warmup_frames=int(body.get("warmup_frames", 30)),
-        video_queue_frames=int(body.get("video_queue_frames", 150)),
-        interrupt_cover_frames=int(body.get("interrupt_cover_frames", 20)),
         video_bitrate=str(body.get("video_bitrate", "3500k")),
         audio_bitrate=str(body.get("audio_bitrate", "128k")),
         audio_delay_ms=int(body.get("audio_delay_ms", 300)),
     )
-    avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 6)))
+    avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 20)))
     if output_mode == "relive":
         output = ReLiveClipOutput(
             APP_ROOT / "outputs" / "relive_clips",

@@ -112,11 +112,6 @@ class StreamSession:
         # Mẫu PCM thừa của khung trước, chuyển sang khung sau. Nếu không có nó thì
         # mỗi khung lệch 1 mẫu sẽ bị chèn số 0 hoặc bị cắt -> xung nhọn -> rè rẹt.
         self._pcm_carry = np.empty(0, dtype=np.int16)
-        # Khung nền CUỐI CÙNG thực sự đang nằm trong hàng đợi. Câu nào không được
-        # chỉ định điểm bắt đầu thì nối tiếp ngay sau nó. KHÔNG dùng frame_cursor
-        # phía render: con trỏ đó đếm cả khung đã dựng rồi BỊ XÉN BỎ, nên câu
-        # resume nhảy vọt lên trước và sai số cộng dồn qua mỗi lần cắt ngang.
-        self._last_emitted_driver_index: int | None = None
 
     @property
     def state(self) -> SessionState:
@@ -360,20 +355,6 @@ class StreamSession:
                 except FileNotFoundError:
                     pass
             self.metrics.increment("dropped_frames")
-        self._resync_driver_cursor()
-
-    def _resync_driver_cursor(self) -> None:
-        """Đưa con trỏ khung nền về đúng frame CUỐI còn sống trong hàng đợi.
-
-        Bắt buộc gọi sau mỗi lần xén/xả, nếu không câu kế sẽ nối tiếp từ những
-        frame vừa bị vứt -> avatar nhảy vọt, và lệch cộng dồn qua từng lần cắt.
-        """
-        with self._packets.mutex:
-            tail = [
-                packet.driver_frame_index for packet in self._packets.queue
-                if packet.driver_frame_index is not None
-            ]
-        self._last_emitted_driver_index = tail[-1] if tail else self._last_driver_frame_index
 
     def _discard_packets(self) -> None:
         while True:
@@ -388,7 +369,6 @@ class StreamSession:
                 self.metrics.increment("dropped_frames")
             except queue.Empty:
                 break
-        self._resync_driver_cursor()
 
     def _emit(
         self, frame: np.ndarray, pcm: np.ndarray, driver_frame_index: int | None = None
@@ -413,8 +393,6 @@ class StreamSession:
                 continue
         else:
             return
-        if driver_frame_index is not None:
-            self._last_emitted_driver_index = driver_frame_index
         buffered = self._packets.qsize()
         self._current.rendered_frames += 1
         self.metrics.update(
@@ -431,12 +409,6 @@ class StreamSession:
                     return
                 request = heapq.heappop(self._sentence_heap)
                 self._sentence_ids.discard(request.request_id)
-            # Câu chưa được chỉ định điểm bắt đầu (các câu resume) thì nối tiếp
-            # ngay sau frame CUỐI còn trong hàng đợi — không để producer tự lấy
-            # frame_cursor, vì con trỏ đó tính cả frame đã bị xén bỏ.
-            if (request.start_driver_frame_index is None
-                    and self._last_emitted_driver_index is not None):
-                request.start_driver_frame_index = self._last_emitted_driver_index + 1
             self._current = request
             self._cancel_current.clear()
             self._render_complete.clear()
@@ -500,15 +472,7 @@ class StreamSession:
             if delay > 0 and self._stop.wait(delay):
                 break
             packet = None
-            # warmup_frames CHỈ để chờ đủ đệm lúc BẮT ĐẦU, không được áp lại giữa
-            # chừng. Sau khi cắt ngang, hàng đợi bị xén còn ~45 và trạng thái đã
-            # chuyển BUFFERING, nên khi vơi xuống dưới 30 thì cả hai điều kiện cũ
-            # đều sai -> vòng phát NGỪNG lấy khung dù trong hàng đợi vẫn còn.
-            # Đo trên live: đứng hình 0,16-0,22s ở CẢ 3/3 lần cắt ngang.
-            # Đã phát rồi (active_request_id khác None) thì cứ lấy tiếp: còn khung
-            # nào phát khung đó, hết thật thì nhánh dưới tự giữ khung cuối.
-            if (self._ready_to_play() or self.state is SessionState.PLAYING
-                    or active_request_id is not None):
+            if self._ready_to_play() or self.state is SessionState.PLAYING:
                 try:
                     packet = self._packets.get_nowait()
                 except queue.Empty:

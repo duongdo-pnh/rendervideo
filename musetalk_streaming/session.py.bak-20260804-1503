@@ -107,16 +107,6 @@ class StreamSession:
         self._audio_pts = 0
         self._active_audio_request_id: str | None = None
         self._last_audio_sample = 0
-        self._fade_in_left = 0      # còn bao nhiêu mẫu nữa mới hết vuốt-vào câu mới
-        self._fade_in_total = 0
-        # Mẫu PCM thừa của khung trước, chuyển sang khung sau. Nếu không có nó thì
-        # mỗi khung lệch 1 mẫu sẽ bị chèn số 0 hoặc bị cắt -> xung nhọn -> rè rẹt.
-        self._pcm_carry = np.empty(0, dtype=np.int16)
-        # Khung nền CUỐI CÙNG thực sự đang nằm trong hàng đợi. Câu nào không được
-        # chỉ định điểm bắt đầu thì nối tiếp ngay sau nó. KHÔNG dùng frame_cursor
-        # phía render: con trỏ đó đếm cả khung đã dựng rồi BỊ XÉN BỎ, nên câu
-        # resume nhảy vọt lên trước và sai số cộng dồn qua mỗi lần cắt ngang.
-        self._last_emitted_driver_index: int | None = None
 
     @property
     def state(self) -> SessionState:
@@ -246,29 +236,15 @@ class StreamSession:
             current = self._current
             buffered_current_frames = 0
             if resume_current and current is not None:
-                # Xén TRƯỚC khi đếm: chỉ những frame còn sống mới thực sự được
-                # phát, nên câu resume phải nối tiếp đúng sau chúng.
-                # Không bao giờ xén xuống dưới warmup_frames: dưới ngưỡng đó
-                # playout coi như chưa đủ đệm, ngừng lấy frame và chiếu idle.
-                self._trim_packets(
-                    max(self.config.interrupt_cover_frames, self.config.warmup_frames)
-                )
-                queued_driver_indices = []
+                current_driver_indices = []
                 with self._packets.mutex:
                     for packet in self._packets.queue:
-                        # Khung nền cho câu mới phải nối tiếp khung CUỐI CÙNG còn
-                        # trong hàng đợi, BẤT KỂ của câu nào. Lọc theo _current là
-                        # sai: _current là câu đang RENDER, còn hàng đợi chứa câu
-                        # đang PHÁT — hai thứ lệch nhau suốt 5s cuối mỗi câu (lúc
-                        # render đã xong và nhảy sang bài kế). Lọc trúng lúc đó ra
-                        # rỗng -> tụt về _last_driver_frame_index -> thân người
-                        # giật lùi đúng bằng số khung nền che.
-                        if packet.driver_frame_index is not None:
-                            queued_driver_indices.append(packet.driver_frame_index)
                         if packet.request_id == current.request_id:
                             buffered_current_frames += 1
-                if queued_driver_indices:
-                    next_driver_frame_index = queued_driver_indices[-1] + 1
+                            if packet.driver_frame_index is not None:
+                                current_driver_indices.append(packet.driver_frame_index)
+                if current_driver_indices:
+                    next_driver_frame_index = current_driver_indices[-1] + 1
                 else:
                     next_driver_frame_index = self._last_driver_frame_index + 1
             if (
@@ -316,65 +292,6 @@ class StreamSession:
             self._event_callback(request.request_id, "interrupted", {"pending": True})
         return next_driver_frame_index
 
-    def _trim_packets(self, keep: int) -> None:
-        """Giữ lại ``keep`` packet ĐẦU hàng đợi, bỏ phần còn lại.
-
-        Dùng khi comment cắt ngang: phần giữ lại đủ che hình/tiếng trong lúc câu
-        trả lời đang dựng (~0,5s), còn phát nốt cả buffer thì người xem phải đợi
-        hết mới nghe được câu trả lời.
-        """
-        drained: list[AVPacket] = []
-        while True:
-            try:
-                drained.append(self._packets.get_nowait())
-            except queue.Empty:
-                break
-        kept = drained[:keep]
-        # VUỐT NHỎ DẦN đuôi phần giữ lại: câu nền tắt êm thay vì đứt phựt giữa từ.
-        fade = max(1, self.config.sample_rate * self.config.transition_fade_ms // 1000)
-        offset = 0                             # số mẫu nằm SAU packet này, tính từ cuối phần giữ lại
-        for packet in reversed(kept):          # đi ngược từ packet cuối về trước
-            if offset >= fade:
-                break                          # ra khỏi vùng vuốt -> giữ nguyên âm lượng
-            size = packet.pcm.size
-            if not size:
-                continue
-            # mẫu càng gần CUỐI thì càng nhỏ: khoảng cách tới cuối / fade
-            distance = offset + np.arange(size - 1, -1, -1, dtype=np.float32)
-            gain = np.clip(distance / fade, 0.0, 1.0)
-            packet.pcm = np.rint(packet.pcm.astype(np.float32) * gain).astype(np.int16)
-            offset += size
-        for index, packet in enumerate(drained):
-            # Luồng playout có thể đã lấp lại chỗ trong lúc ta rút ra; put_nowait
-            # thất bại thì bỏ luôn packet đó chứ không chặn ở đây.
-            if index < keep:
-                try:
-                    self._packets.put_nowait(packet)
-                    continue
-                except queue.Full:
-                    pass
-            frame_path = getattr(packet, "frame_path", None)
-            if frame_path:
-                try:
-                    os.unlink(frame_path)
-                except FileNotFoundError:
-                    pass
-            self.metrics.increment("dropped_frames")
-        self._resync_driver_cursor()
-
-    def _resync_driver_cursor(self) -> None:
-        """Đưa con trỏ khung nền về đúng frame CUỐI còn sống trong hàng đợi.
-
-        Bắt buộc gọi sau mỗi lần xén/xả, nếu không câu kế sẽ nối tiếp từ những
-        frame vừa bị vứt -> avatar nhảy vọt, và lệch cộng dồn qua từng lần cắt.
-        """
-        with self._packets.mutex:
-            tail = [
-                packet.driver_frame_index for packet in self._packets.queue
-                if packet.driver_frame_index is not None
-            ]
-        self._last_emitted_driver_index = tail[-1] if tail else self._last_driver_frame_index
-
     def _discard_packets(self) -> None:
         while True:
             try:
@@ -388,7 +305,6 @@ class StreamSession:
                 self.metrics.increment("dropped_frames")
             except queue.Empty:
                 break
-        self._resync_driver_cursor()
 
     def _emit(
         self, frame: np.ndarray, pcm: np.ndarray, driver_frame_index: int | None = None
@@ -413,8 +329,6 @@ class StreamSession:
                 continue
         else:
             return
-        if driver_frame_index is not None:
-            self._last_emitted_driver_index = driver_frame_index
         buffered = self._packets.qsize()
         self._current.rendered_frames += 1
         self.metrics.update(
@@ -431,12 +345,6 @@ class StreamSession:
                     return
                 request = heapq.heappop(self._sentence_heap)
                 self._sentence_ids.discard(request.request_id)
-            # Câu chưa được chỉ định điểm bắt đầu (các câu resume) thì nối tiếp
-            # ngay sau frame CUỐI còn trong hàng đợi — không để producer tự lấy
-            # frame_cursor, vì con trỏ đó tính cả frame đã bị xén bỏ.
-            if (request.start_driver_frame_index is None
-                    and self._last_emitted_driver_index is not None):
-                request.start_driver_frame_index = self._last_emitted_driver_index + 1
             self._current = request
             self._cancel_current.clear()
             self._render_complete.clear()
@@ -500,15 +408,7 @@ class StreamSession:
             if delay > 0 and self._stop.wait(delay):
                 break
             packet = None
-            # warmup_frames CHỈ để chờ đủ đệm lúc BẮT ĐẦU, không được áp lại giữa
-            # chừng. Sau khi cắt ngang, hàng đợi bị xén còn ~45 và trạng thái đã
-            # chuyển BUFFERING, nên khi vơi xuống dưới 30 thì cả hai điều kiện cũ
-            # đều sai -> vòng phát NGỪNG lấy khung dù trong hàng đợi vẫn còn.
-            # Đo trên live: đứng hình 0,16-0,22s ở CẢ 3/3 lần cắt ngang.
-            # Đã phát rồi (active_request_id khác None) thì cứ lấy tiếp: còn khung
-            # nào phát khung đó, hết thật thì nhánh dưới tự giữ khung cuối.
-            if (self._ready_to_play() or self.state is SessionState.PLAYING
-                    or active_request_id is not None):
+            if self._ready_to_play() or self.state is SessionState.PLAYING:
                 try:
                     packet = self._packets.get_nowait()
                 except queue.Empty:
@@ -554,12 +454,7 @@ class StreamSession:
                 # ``_current`` may already point at the next request or be
                 # None). Falling back to idle here creates a visible flash and
                 # can make OBS treat the source as disconnected/default scene.
-                # Đã phát được rồi thì TUYỆT ĐỐI không quay lại idle_frames giữa
-                # chừng — idle là khung đầu video mẫu, chiếu vào là avatar nhảy
-                # sang tư thế khác. Giữ khung cuối (đứng hình) luôn đỡ hơn nhảy.
-                # Không xét state ở đây: lúc render nhận câu mới state đã chuyển
-                # BUFFERING dù playout vẫn đang phát bình thường.
-                if active_request_id is not None:
+                if self.state is SessionState.PLAYING and active_request_id is not None:
                     frame = self._last_frame
                 else:
                     frame = self._idle_frames[idle_index % len(self._idle_frames)]
@@ -579,48 +474,29 @@ class StreamSession:
                 (self._video_pts + 1) * self.config.sample_rate / self.config.fps
             )
             expected_samples = max(1, expected_audio_pts - self._audio_pts)
-            # produce_sentence cắt PCM theo chỉ số TRONG CÂU, còn chỗ này đòi theo
-            # bộ đếm TOÀN CỤC — hai pha lệch nhau ở 2/3 số câu, mỗi giây lệch ~20
-            # khung. Cắt/chèn-0 theo từng khung như trước là tạo 20 xung nhọn mỗi
-            # giây => nghe rè rẹt tạch tạch. Giữ phần thừa lại cho khung sau thì
-            # dòng tiếng liền mạch, không mất và không thêm mẫu nào.
-            if self._pcm_carry.size:
-                pcm = np.concatenate((self._pcm_carry, pcm))
-                self._pcm_carry = np.empty(0, dtype=np.int16)
-            if pcm.size > expected_samples:
-                self._pcm_carry = pcm[expected_samples:].copy()
-                pcm = pcm[:expected_samples]
-            elif pcm.size < expected_samples:
-                # thiếu thật (đang đói khung / im lặng) -> đành đệm 0
+            if pcm.size < expected_samples:
                 pcm = np.pad(pcm, (0, expected_samples - pcm.size))
-            # Đổi câu -> VUỐT VÀO cho câu mới. Câu bị cắt thường dừng ở khoảng
-            # lặng, còn câu mới mở đầu bằng âm tiết nhấn rất to; ghép thẳng nghe
-            # như bị "nhảy". Vuốt trải dài nhiều packet nên phải giữ trạng thái
-            # qua từng vòng, không gói gọn trong 1 packet như bản cũ.
+            elif pcm.size > expected_samples:
+                pcm = pcm[:expected_samples]
+            # Smooth discontinuities when comments interrupt or resume one
+            # another. An abrupt int16 sample jump is heard as a click even
+            # though the A/V clock itself remains perfectly aligned.
             request_id = packet.request_id if packet is not None else None
-            if request_id is not None:
-                # CHỈ vuốt khi sang câu THỰC SỰ KHÁC. Hai bẫy phải tránh:
-                #  - "X:resume-5" / "X:resume-5:resume-9" vẫn là ĐANG ĐỌC TIẾP câu X
-                #    (bị comment cắt nhiều lần). Vuốt ở đây là giọng nhỏ đi giữa từ.
-                #  - packet None (hàng đợi hụt 1 nhịp) KHÔNG phải đổi câu; tính vào
-                #    là mỗi lần hụt lại vuốt thêm một lần nữa.
-                base = request_id.split(":resume-")[0]
-                if base != self._active_audio_request_id:
-                    self._fade_in_total = max(
-                        1, self.config.sample_rate * self.config.transition_fade_ms // 1000
-                    )
-                    self._fade_in_left = self._fade_in_total
-                    self._active_audio_request_id = base
-            if self._fade_in_left > 0 and pcm.size:
-                n = min(pcm.size, self._fade_in_left)
-                done = self._fade_in_total - self._fade_in_left
-                weights = (
-                    np.arange(done + 1, done + n + 1, dtype=np.float32)
-                    / self._fade_in_total
+            if request_id != self._active_audio_request_id:
+                ramp_samples = min(
+                    pcm.size, max(1, self.config.sample_rate // 100)
                 )
-                pcm = pcm.copy()
-                pcm[:n] = np.rint(pcm[:n].astype(np.float32) * weights).astype(np.int16)
-                self._fade_in_left -= n
+                if ramp_samples:
+                    pcm = pcm.copy()
+                    weights = (
+                        np.arange(1, ramp_samples + 1, dtype=np.float32)
+                        / ramp_samples
+                    )
+                    pcm[:ramp_samples] = np.rint(
+                        self._last_audio_sample * (1.0 - weights)
+                        + pcm[:ramp_samples].astype(np.float32) * weights
+                    ).astype(np.int16)
+                self._active_audio_request_id = request_id
             self._last_audio_sample = int(pcm[-1]) if pcm.size else 0
             with self._preview_lock:
                 self._preview_frame = frame.copy()

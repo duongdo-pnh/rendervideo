@@ -44,16 +44,7 @@ class StreamConfig:
     video_queue_frames: int = 150
     # Khi cắt ngang để trả lời comment: giữ lại chừng này frame làm nền che
     # trong lúc câu mới đang dựng, bỏ phần còn lại thay vì phát cho hết.
-    # PHẢI >= warmup_frames. Xén xuống dưới ngưỡng warmup thì _ready_to_play()
-    # thành False đúng lúc state vừa chuyển BUFFERING -> playout ngừng lấy frame
-    # và rơi sang idle_frames, tức CHIẾU KHUNG ĐẦU VIDEO MẪU vài chục frame:
-    # người xem thấy avatar nhảy sang tư thế khác rồi nhảy về.
-    interrupt_cover_frames: int = 45
-    # Vuốt tiếng khi đổi câu. Mọi file voice đều mở đầu bằng ~100ms gần lặng rồi
-    # bật lên âm tiết nhấn (đo trên 5090: RMS 440 -> 8147 trong 20ms). Ghép thẳng
-    # vào khoảng lặng của câu bị cắt nghe như "nhảy một cái mạnh"; 10ms cũ chỉ đủ
-    # chống lách tách, không đủ che. Vuốt ra + vuốt vào ~180ms là liền mạch.
-    transition_fade_ms: int = 180
+    interrupt_cover_frames: int = 20
     sentence_queue_size: int = 100
 
     def __post_init__(self) -> None:

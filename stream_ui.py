@@ -29,8 +29,7 @@ BACKEND_LOG = ROOT / "logs" / "musetalk_stream_api.log"
 FACEBOOK_AVATAR_720 = Path(
     os.environ.get(
         "FACEBOOK_LIVE_AVATAR_PATH",
-        "/home/byscom/Desktop/code/AI-live/live_system/avatar_cache/"
-        "facebook_live_selected_720x1280.mp4",
+        str(ROOT / "avatar_cache" / "facebook_live_selected_720x1280.mp4"),
     )
 )
 SAMPLE_AUDIO_DIR = ROOT / "engines" / "MuseTalk" / "data" / "audio"
@@ -128,7 +127,7 @@ def _compose_push_url(server_url: str, stream_key: str) -> str:
 
 
 def _normalize_facebook_avatar(avatar_video: str) -> str:
-    """Convert an uploaded Facebook avatar to a stable portrait 720p/30fps file."""
+    """Convert the complete uploaded avatar to a stable portrait 720p/30fps file."""
     if not avatar_video:
         raise gr.Error("Cần tải lên avatar video hợp lệ.")
     source = Path(avatar_video).resolve()
@@ -138,18 +137,27 @@ def _normalize_facebook_avatar(avatar_video: str) -> str:
     temporary = FACEBOOK_AVATAR_720.with_name(
         f".{FACEBOOK_AVATAR_720.stem}.{os.getpid()}.tmp.mp4"
     )
-    command = [
+    command_prefix = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(source),
         "-vf",
         "scale=720:1280:force_original_aspect_ratio=decrease,"
         "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,fps=30",
-        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-        "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-        str(temporary),
+        "-an",
+    ]
+    nvenc_command = command_prefix + [
+        "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "20", "-b:v", "0",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
+    ]
+    cpu_command = command_prefix + [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(temporary),
     ]
     try:
-        subprocess.run(command, check=True, timeout=1800)
+        try:
+            subprocess.run(nvenc_command, check=True, timeout=1800)
+        except subprocess.CalledProcessError:
+            subprocess.run(cpu_command, check=True, timeout=1800)
         os.replace(temporary, FACEBOOK_AVATAR_720)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         temporary.unlink(missing_ok=True)
