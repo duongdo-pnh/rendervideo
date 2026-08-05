@@ -1,4 +1,5 @@
 """Persistent MuseTalk 1.5 render server for the rendervideo queue."""
+import gc
 import json
 import os
 import shutil
@@ -8,6 +9,7 @@ import threading
 import time
 import traceback
 import uuid
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import sys
@@ -18,6 +20,7 @@ MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
 sys.path.insert(0, str(MUSETALK_ROOT))
 
 import cv2
+import numpy as np
 import torch
 from transformers import WhisperModel
 
@@ -32,11 +35,13 @@ SOCKET_PATH = Path(os.environ.get("MUSETALK_SOCKET", str(APP_ROOT / ".musetalk.s
 RUNS_DIR = ROOT / "results" / "server_runs"
 GPU_LOCK = threading.Lock()
 AVATAR_LOCK = threading.Lock()
-AVATARS = {}
+# LRU, newest last. Each entry pins ~1.5GB of decoded frames in RAM, so it must stay bounded.
+AVATARS = OrderedDict()
 REQUESTS = __import__("queue").Queue()
 COALESCE_SECONDS = float(os.environ.get("MUSETALK_BATCH_WAIT", "2.0"))
 MAX_GROUP_SIZE = int(os.environ.get("MUSETALK_MAX_GROUP", "2"))
 MAX_GPU_BATCH = int(os.environ.get("MUSETALK_GPU_BATCH", "32"))
+MAX_CACHED_AVATARS = max(1, int(os.environ.get("MUSETALK_AVATAR_CACHE", "2")))
 
 
 def _load_runtime():
@@ -71,12 +76,30 @@ def _avatar_cache_complete(avatar_id):
     return all((base / name).is_file() for name in required) and (base / "full_imgs").is_dir() and (base / "mask").is_dir()
 
 
+def _evict_avatars():
+    """Drop least-recently-used avatars past the cache limit.
+
+    An Avatar keeps every source frame and mask decoded in RAM (~1.5GB for a 30s
+    clip), so an unbounded cache grows until the box runs out of memory. On-disk
+    material under results/v15/avatars survives, making a later re-load a cheap
+    HIT instead of a rebuild.
+    """
+    while len(AVATARS) > MAX_CACHED_AVATARS:
+        evicted_id, _ = AVATARS.popitem(last=False)
+        print(
+            f"[musetalk-server] avatar {evicted_id}: EVICT "
+            f"(cache limit {MAX_CACHED_AVATARS})", flush=True,
+        )
+        gc.collect()
+
+
 def _get_avatar(req):
     avatar_id = req["avatar_id"]
     with AVATAR_LOCK:
         avatar = AVATARS.get(avatar_id)
         if avatar is not None:
             avatar.batch_size = int(req.get("batch_size", 20))
+            AVATARS.move_to_end(avatar_id)
             print(f"[musetalk-server] avatar {avatar_id}: HIT/memory", flush=True)
             return avatar
         complete = _avatar_cache_complete(avatar_id)
@@ -92,6 +115,7 @@ def _get_avatar(req):
             preparation=not complete,
         )
         AVATARS[avatar_id] = avatar
+        _evict_avatars()
         return avatar
 
 
@@ -104,6 +128,32 @@ def _audio_chunks(req):
         fps=int(req.get("fps", 25)),
         audio_padding_length_left=rt.args.audio_padding_length_left,
         audio_padding_length_right=rt.args.audio_padding_length_right,
+    )
+
+
+def _gpu_stats():
+    free, total = torch.cuda.mem_get_info()
+    reserved = torch.cuda.memory_reserved()
+    allocated = torch.cuda.memory_allocated()
+    return {
+        "free_mb": free // 1024 ** 2,
+        "total_mb": total // 1024 ** 2,
+        "reserved_mb": reserved // 1024 ** 2,
+        "allocated_mb": allocated // 1024 ** 2,
+        "avatars": len(AVATARS),
+    }
+
+
+def _release_gpu_cache():
+    """Return the allocator's free blocks to the driver so nvidia-smi tells the truth."""
+    before = torch.cuda.memory_reserved()
+    gc.collect()
+    torch.cuda.empty_cache()
+    freed_mb = (before - torch.cuda.memory_reserved()) // 1024 ** 2
+    stats = _gpu_stats()
+    print(
+        f"[musetalk-server] released {freed_mb}MB cache; "
+        f"reserved={stats['reserved_mb']}MB free={stats['free_mb']}MB", flush=True,
     )
 
 
@@ -181,7 +231,9 @@ def _encode_job(avatar, req, frames, run_dir):
     try:
         with ThreadPoolExecutor(max_workers=blend_workers) as pool:
             for blended in pool.map(blend_one, enumerate(frames)):
-                process.stdin.write(memoryview(blended).cast("B"))
+                # OpenCV blending can return a strided view. Rawvideo stdin requires
+                # C-contiguous bytes; normalize it before exposing a memoryview.
+                process.stdin.write(memoryview(np.ascontiguousarray(blended)).cast("B"))
         process.stdin.close()
         returncode = process.wait()
     except Exception:
@@ -214,6 +266,11 @@ def _render_group(reqs):
             ]
             return [future.result() for future in futures]
     finally:
+        # The VAE decode peak (batch 32 at 512²) leaves several GB parked in the
+        # caching allocator. PyTorch keeps that pool forever, and nvidia-smi counts
+        # it as used, so queue_worker's free-VRAM gate would refuse to claim the
+        # next job and the queue would wedge. Hand it back after every group.
+        _release_gpu_cache()
         for run_dir in run_dirs:
             shutil.rmtree(run_dir, ignore_errors=True)
 
@@ -274,7 +331,14 @@ def _handle(conn):
         line = conn.makefile("r", encoding="utf-8").readline()
         if not line:
             return
-        item = {"req": json.loads(line), "event": threading.Event(), "response": None}
+        req = json.loads(line)
+        # Answered on this thread, not via the render queue, so it stays responsive
+        # while a render holds the GPU.
+        if req.get("op") == "health":
+            response = {"ok": True, "busy": GPU_LOCK.locked(), **_gpu_stats()}
+            conn.sendall((json.dumps(response) + "\n").encode("utf-8"))
+            return
+        item = {"req": req, "event": threading.Event(), "response": None}
         REQUESTS.put(item)
         item["event"].wait()
         response = item["response"]
@@ -284,9 +348,30 @@ def _handle(conn):
     conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
+def _socket_is_live():
+    """True if another server already answers on SOCKET_PATH."""
+    if not SOCKET_PATH.exists():
+        return False
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.settimeout(2)
+    try:
+        probe.connect(str(SOCKET_PATH))
+        return True
+    except OSError:
+        return False  # stale socket file from a server that died
+    finally:
+        probe.close()
+
+
 def main():
     os.chdir(ROOT)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
+    # Checked before loading models: a duplicate that only notices at bind time has
+    # already pinned ~5.5GB of VRAM, and unlinking the socket would strand the
+    # server that legitimately owns it.
+    if _socket_is_live():
+        print(f"[musetalk-server] another server owns {SOCKET_PATH}; exiting", flush=True)
+        return
     _load_runtime()
     threading.Thread(target=_batch_loop, daemon=True).start()
     if SOCKET_PATH.exists():

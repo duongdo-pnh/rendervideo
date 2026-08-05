@@ -1,4 +1,5 @@
 """Adapter between the render queue and persistent MuseTalk 1.5 server."""
+import fcntl
 import hashlib
 import json
 import os
@@ -13,6 +14,7 @@ MUSETALK_PYTHON = MUSETALK_ROOT / ".venv" / "bin" / "python"
 SERVER_SCRIPT = ROOT / "musetalk_render_server.py"
 MODEL_ROOT = MUSETALK_ROOT / "models"
 SOCKET_PATH = ROOT / ".musetalk.sock"
+SPAWN_LOCK_PATH = ROOT / ".musetalk_spawn.lock"
 SERVER_LOG = ROOT / "logs" / "musetalk_server.log"
 REQUIRED_FILES = (
     SERVER_SCRIPT,
@@ -52,25 +54,40 @@ def _connect(timeout=2):
 
 
 def _ensure_server():
+    """Start the render server unless one is already listening.
+
+    queue_worker runs a matching pair of jobs concurrently, so two render_job
+    processes reach this within milliseconds of each other. Without the lock both
+    see a dead socket and both spawn a server; the second one rebinds the socket
+    and the first is orphaned, holding ~5.5GB of VRAM forever with no way to
+    receive work. The lock makes the check-then-spawn atomic across processes,
+    and the second holder re-checks and finds the server the first one started.
+    """
     try:
         client = _connect(); client.close(); return
     except OSError:
         pass
     SERVER_LOG.parent.mkdir(parents=True, exist_ok=True)
-    log = open(SERVER_LOG, "a", buffering=1)
-    subprocess.Popen(
-        [str(MUSETALK_PYTHON), str(SERVER_SCRIPT)],
-        cwd=MUSETALK_ROOT, stdout=log, stderr=subprocess.STDOUT,
-        start_new_session=True, close_fds=True,
-        env={**os.environ, "MUSETALK_SOCKET": str(SOCKET_PATH)},
-    )
-    deadline = time.monotonic() + 180
-    while time.monotonic() < deadline:
-        time.sleep(1)
+    with open(SPAWN_LOCK_PATH, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             client = _connect(); client.close(); return
         except OSError:
-            continue
+            pass
+        log = open(SERVER_LOG, "a", buffering=1)
+        subprocess.Popen(
+            [str(MUSETALK_PYTHON), str(SERVER_SCRIPT)],
+            cwd=MUSETALK_ROOT, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, close_fds=True,
+            env={**os.environ, "MUSETALK_SOCKET": str(SOCKET_PATH)},
+        )
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            time.sleep(1)
+            try:
+                client = _connect(); client.close(); return
+            except OSError:
+                continue
     raise RuntimeError(f"MuseTalk server did not start; see {SERVER_LOG}")
 
 
