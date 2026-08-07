@@ -9,6 +9,7 @@ Run with:  conda activate latentsync && python queue_worker.py
 """
 import fcntl
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -304,6 +305,17 @@ def _safe_name(name):
     return safe[:140] or "job"
 
 
+def _drive_safe_name(path):
+    """ASCII-only Drive filename with one underscore between name segments."""
+    path = Path(path)
+    ascii_stem = unicodedata.normalize("NFKD", path.stem).encode(
+        "ascii", "ignore"
+    ).decode("ascii")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", ascii_stem).strip("_") or "video"
+    suffix = re.sub(r"[^A-Za-z0-9]", "", path.suffix.lstrip("."))
+    return f"{stem[:140]}.{suffix}" if suffix else stem[:140]
+
+
 def process_job(job):
     job_id = job["id"]
     _log(f"claim job #{job_id} '{job['name']}' model={job['model_res']}")
@@ -358,9 +370,8 @@ def process_job(job):
 def _start_drive_upload(job_id, path, subfolder=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
-    Tên file trên Drive = ĐÚNG tên file đã lưu ở máy (path.name, do _safe_name dựng
-    từ job['name']) — một chỗ đặt tên duy nhất, tên trên Drive và trong downloads/
-    không bao giờ lệch nhau.
+    Tên file trên Drive được chuẩn hóa ASCII; mọi khoảng trắng/dấu câu/ký tự đặc
+    biệt được gộp thành một dấu gạch dưới. Tên file local không bị thay đổi.
     Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
       - job import Excel: tên file Excel (cột drive_folder);
       - job render tay (không có drive_folder): gom theo ngày render 'dd-mm-yyyy'
@@ -385,7 +396,9 @@ def _start_drive_upload(job_id, path, subfolder=None):
 
 def _drive_upload(job_id, path, subfolder=None):
     try:
-        info = gdrive.upload_file(path, subfolder=subfolder)
+        info = gdrive.upload_file(
+            path, name=_drive_safe_name(path), subfolder=subfolder
+        )
         db.set_drive_result(job_id, link=info.get("webViewLink"))
         where = f" [{subfolder}]" if subfolder else ""
         _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")

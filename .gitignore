@@ -105,3 +105,7 @@ client_secret*.json
 service_account*.json
 credentials*.json
 token*.json
+
+# --- local runtimes / process locks ---
+/venv.backup/
+.musetalk_start.lock
