@@ -350,14 +350,17 @@ def process_job(job):
     shutil.copy(out_path, dst)
     db.mark_done(job_id, str(dst))
     _log(f"job #{job_id} DONE -> {dst}")
-    _start_drive_upload(job_id, dst, job.get("drive_folder"), job.get("drive_name"))
+    _start_drive_upload(job_id, dst, job.get("drive_folder"))
 
 
 # ---------------------------------------------------------------- Google Drive
 
-def _start_drive_upload(job_id, path, subfolder=None, drive_name=None):
+def _start_drive_upload(job_id, path, subfolder=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
+    Tên file trên Drive = ĐÚNG tên file đã lưu ở máy (path.name, do _safe_name dựng
+    từ job['name']) — một chỗ đặt tên duy nhất, tên trên Drive và trong downloads/
+    không bao giờ lệch nhau.
     Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
       - job import Excel: tên file Excel (cột drive_folder);
       - job render tay (không có drive_folder): gom theo ngày render 'dd-mm-yyyy'
@@ -373,17 +376,16 @@ def _start_drive_upload(job_id, path, subfolder=None, drive_name=None):
         return
     if not subfolder:
         subfolder = datetime.now().strftime("%d-%m-%Y")
-    upload_name = f"{_safe_name(drive_name)}{Path(path).suffix}" if drive_name else None
     threading.Thread(
         target=_drive_upload,
-        args=(job_id, path, subfolder, upload_name),
+        args=(job_id, path, subfolder),
         daemon=True,
     ).start()
 
 
-def _drive_upload(job_id, path, subfolder=None, upload_name=None):
+def _drive_upload(job_id, path, subfolder=None):
     try:
-        info = gdrive.upload_file(path, name=upload_name, subfolder=subfolder)
+        info = gdrive.upload_file(path, subfolder=subfolder)
         db.set_drive_result(job_id, link=info.get("webViewLink"))
         where = f" [{subfolder}]" if subfolder else ""
         _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")

@@ -53,7 +53,7 @@ _CONFIG_COLUMNS = {
     "drive_link":     "TEXT",
     "drive_error":    "TEXT",
     "drive_folder":   "TEXT",   # tên thư mục con trong folder Drive chính (job từ Excel = tên file Excel); NULL = lên thẳng folder chính
-    "drive_name":     "TEXT",   # tên file riêng khi upload Drive; NULL = giữ tên file local
+    # (không có drive_name: file trên Drive luôn giữ đúng tên file đã lưu ở máy)
     "priority":       "INTEGER NOT NULL DEFAULT 0",  # lớn hơn = chạy trước
 }
 
@@ -94,7 +94,7 @@ def init_db():
 
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
             enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
-            drive_folder=None, drive_name=None, engine="musetalk"):
+            drive_folder=None, engine="musetalk"):
     """Insert a new MuseTalk job with its full render config."""
     # Normal/Excel/TTS renders are MuseTalk-only. Keep the argument for backward
     # compatibility with existing callers, but never persist another engine.
@@ -108,14 +108,13 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
             """
             INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path, engine,
                               guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
-                              drive_folder, drive_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                              drive_folder)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path, str(engine),
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
              str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real",
-             str(drive_folder) if drive_folder else None,
-             str(drive_name) if drive_name else None),
+             str(drive_folder) if drive_folder else None),
         )
         return cur.lastrowid
 
