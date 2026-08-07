@@ -18,6 +18,7 @@ MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
 sys.path.insert(0, str(MUSETALK_ROOT))
 
 import cv2
+import numpy as np
 import torch
 from transformers import WhisperModel
 
@@ -34,6 +35,10 @@ GPU_LOCK = threading.Lock()
 AVATAR_LOCK = threading.Lock()
 AVATARS = {}
 REQUESTS = __import__("queue").Queue()
+REQUEST_LOCK = threading.Lock()
+# Keep successful requests for reconnect/retry. Failed requests are evicted so
+# the queue's normal retry policy can submit them again.
+REQUEST_BY_ID = {}
 COALESCE_SECONDS = float(os.environ.get("MUSETALK_BATCH_WAIT", "2.0"))
 MAX_GROUP_SIZE = int(os.environ.get("MUSETALK_MAX_GROUP", "2"))
 MAX_GPU_BATCH = int(os.environ.get("MUSETALK_GPU_BATCH", "32"))
@@ -181,6 +186,10 @@ def _encode_job(avatar, req, frames, run_dir):
     try:
         with ThreadPoolExecutor(max_workers=blend_workers) as pool:
             for blended in pool.map(blend_one, enumerate(frames)):
+                # Some blending paths return a strided NumPy view. memoryview.cast()
+                # only accepts C-contiguous buffers, so normalize the layout before
+                # streaming raw BGR bytes to FFmpeg.
+                blended = np.ascontiguousarray(blended, dtype=np.uint8)
                 process.stdin.write(memoryview(blended).cast("B"))
         process.stdin.close()
         returncode = process.wait()
@@ -221,6 +230,28 @@ def _render_group(reqs):
 def _compatible(left, right):
     keys = ("avatar_id", "bbox_shift", "fps")
     return all(left.get(key, 0) == right.get(key, 0) for key in keys)
+
+
+def _media_duration(path):
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(result.stdout.strip()) if result.returncode == 0 else 0.0
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return 0.0
+
+
+def _completed_output(req):
+    """Only reuse a finalized output, never an FFmpeg file left half-written."""
+    output_path = Path(req["output_path"])
+    if not output_path.is_file() or output_path.stat().st_size == 0:
+        return False
+    output_duration = _media_duration(output_path)
+    audio_duration = _media_duration(req["audio_path"])
+    return output_duration > 0 and audio_duration > 0 and output_duration >= audio_duration - 1.0
 
 
 def _batch_loop():
@@ -267,6 +298,42 @@ def _batch_loop():
         for item, response in zip(group, responses):
             item["response"] = response
             item["event"].set()
+            if not response.get("ok"):
+                with REQUEST_LOCK:
+                    if REQUEST_BY_ID.get(item["request_id"]) is item:
+                        REQUEST_BY_ID.pop(item["request_id"], None)
+
+
+def _request_item(req):
+    """Return an existing render for retries, or enqueue one new render."""
+    request_id = str(req.get("request_id") or Path(req["output_path"]).resolve())
+    with REQUEST_LOCK:
+        item = REQUEST_BY_ID.get(request_id)
+        if item is not None:
+            response = item.get("response")
+            # A completed output may have been moved/deleted since it was cached.
+            if response and response.get("ok") and not Path(req["output_path"]).is_file():
+                REQUEST_BY_ID.pop(request_id, None)
+                item = None
+        if item is None:
+            if _completed_output(req):
+                item = {
+                    "request_id": request_id, "req": req,
+                    "event": threading.Event(),
+                    "response": {"ok": True, "output_path": str(Path(req["output_path"]).resolve())},
+                }
+                item["event"].set()
+                REQUEST_BY_ID[request_id] = item
+                print(f"[musetalk-server] output cache HIT request={request_id}", flush=True)
+                return item, True
+            item = {
+                "request_id": request_id, "req": req,
+                "event": threading.Event(), "response": None,
+            }
+            REQUEST_BY_ID[request_id] = item
+            REQUESTS.put(item)
+            return item, False
+        return item, True
 
 
 def _handle(conn):
@@ -274,14 +341,21 @@ def _handle(conn):
         line = conn.makefile("r", encoding="utf-8").readline()
         if not line:
             return
-        item = {"req": json.loads(line), "event": threading.Event(), "response": None}
-        REQUESTS.put(item)
+        item, reused = _request_item(json.loads(line))
+        if reused:
+            print(f"[musetalk-server] reconnect request={item['request_id']}", flush=True)
         item["event"].wait()
         response = item["response"]
     except Exception as exc:
         traceback.print_exc()
         response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
-    conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+    try:
+        conn.sendall((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+    except (BrokenPipeError, ConnectionResetError):
+        # The queue client may have restarted while the server safely continued.
+        pass
+    finally:
+        conn.close()
 
 
 def main():
