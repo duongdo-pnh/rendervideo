@@ -108,8 +108,9 @@ token*.json
 
 
 venv/
-venv.backup/
 .venv/
-.musetalk_start.lock
 __pycache__/
 *.pyc
+# --- local runtimes / process locks ---
+/venv.backup/
+.musetalk_start.lock

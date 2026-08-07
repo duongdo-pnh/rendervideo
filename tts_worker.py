@@ -177,10 +177,7 @@ def _process(job):
         excel_path = tts_db.get_batch_excel(job["batch_id"])
         if excel_path:
             drive_folder = os.path.splitext(os.path.basename(excel_path))[0].strip() or None
-    drive_name = xi.build_drive_name(job["product"], job["video_type"], job["question_type"],
-                                     job.get("other_key"))
-    render_id = db.add_job(name, job["video_path"], audio_path, drive_folder=drive_folder,
-                           drive_name=drive_name, **cfg)
+    render_id = db.add_job(name, job["video_path"], audio_path, drive_folder=drive_folder, **cfg)
     tts_db.mark_done(job["id"], audio_path, render_id)
     _log(f"#{job['id']} DONE ({duration:.1f}s) -> render job #{render_id} ('{name}')")
 

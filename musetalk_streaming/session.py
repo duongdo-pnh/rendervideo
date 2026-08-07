@@ -156,7 +156,9 @@ class StreamSession:
             raise RuntimeError("session is not accepting requests")
         start_driver_frame_index = self._last_driver_frame_index if interrupt else None
         if interrupt:
-            self.interrupt(clear_pending=False, resume_current=True)
+            start_driver_frame_index = self.interrupt(
+                clear_pending=False, resume_current=True
+            )
         with self._sentence_cv:
             if request_id in self._sentence_ids or (
                 self._current is not None and self._current.request_id == request_id
@@ -181,7 +183,9 @@ class StreamSession:
             raise RuntimeError("session is not accepting requests")
         start_driver_frame_index = self._last_driver_frame_index if interrupt else None
         if interrupt:
-            self.interrupt(clear_pending=False, resume_current=True)
+            start_driver_frame_index = self.interrupt(
+                clear_pending=False, resume_current=True
+            )
         with self._sentence_cv:
             ids = [request_id for request_id, _, _, _ in requests]
             if not ids or len(ids) != len(set(ids)):
@@ -215,7 +219,8 @@ class StreamSession:
 
     def interrupt(
         self, clear_pending: bool = True, resume_current: bool = False
-    ) -> None:
+    ) -> int | None:
+        next_driver_frame_index: int | None = None
         with self._sentence_cv:
             pending = list(self._sentence_heap) if clear_pending else []
             if clear_pending:
@@ -223,6 +228,19 @@ class StreamSession:
                 for request in pending:
                     self._sentence_ids.discard(request.request_id)
             current = self._current
+            buffered_current_frames = 0
+            if resume_current and current is not None:
+                current_driver_indices = []
+                with self._packets.mutex:
+                    for packet in self._packets.queue:
+                        if packet.request_id == current.request_id:
+                            buffered_current_frames += 1
+                            if packet.driver_frame_index is not None:
+                                current_driver_indices.append(packet.driver_frame_index)
+                if current_driver_indices:
+                    next_driver_frame_index = current_driver_indices[-1] + 1
+                else:
+                    next_driver_frame_index = self._last_driver_frame_index + 1
             if (
                 resume_current
                 and current is not None
@@ -245,7 +263,7 @@ class StreamSession:
                     delete_after_use=delete_after_resume,
                     start_frame=max(
                         current.start_frame,
-                        current.start_frame + current.played_frames,
+                        current.start_frame + current.played_frames + buffered_current_frames,
                     ),
                 )
                 heapq.heappush(self._sentence_heap, resumed)
@@ -260,11 +278,13 @@ class StreamSession:
                 )
             self._cancel_current.set()
             self._prebuffer_request_ids.clear()
-            self._discard_packets()
+            if not resume_current:
+                self._discard_packets()
             self._sentence_cv.notify_all()
         for request in pending:
             self._cleanup_request(request)
             self._event_callback(request.request_id, "interrupted", {"pending": True})
+        return next_driver_frame_index
 
     def _discard_packets(self) -> None:
         while True:
@@ -419,7 +439,13 @@ class StreamSession:
                     self._current.played_frames += 1
                 self._last_frame = frame
             else:
-                if self.state is SessionState.PLAYING and self._current is not None:
+                # Keep the last live frame whenever playout has already begun.
+                # Rendering the next sentence can briefly leave the packet
+                # queue empty after the previous render has completed (and
+                # ``_current`` may already point at the next request or be
+                # None). Falling back to idle here creates a visible flash and
+                # can make OBS treat the source as disconnected/default scene.
+                if self.state is SessionState.PLAYING and active_request_id is not None:
                     frame = self._last_frame
                 else:
                     frame = self._idle_frames[idle_index % len(self._idle_frames)]
@@ -487,6 +513,8 @@ class StreamSession:
             "avatar_id": self.config.avatar_id,
             "width": self.config.width,
             "height": self.config.height,
+            "fps": self.config.fps,
+            "output_fps_target": self.config.output_fps or self.config.fps,
             "transport": (
                 "relive" if self.output.__class__.__name__ == "ReLiveClipOutput"
                 else getattr(self.output, "_scheme", "rtmp")

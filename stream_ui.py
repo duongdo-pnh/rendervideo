@@ -33,8 +33,23 @@ FACEBOOK_AVATAR_720 = Path(
         "facebook_live_selected_720x1280.mp4",
     )
 )
+SAMPLE_AUDIO_DIR = ROOT / "engines" / "MuseTalk" / "data" / "audio"
 _CURRENT_PREVIEW_SESSION = "facebook-live"
 _CURRENT_AVATAR_VIDEO = None
+
+
+def _sample_audio_choices() -> list[tuple[str, str]]:
+    samples = [
+        SAMPLE_AUDIO_DIR / "eng.wav",
+        SAMPLE_AUDIO_DIR / "sun.wav",
+        SAMPLE_AUDIO_DIR / "yongen.wav",
+    ]
+    choices: list[tuple[str, str]] = []
+    for path in samples:
+        if path.is_file():
+            label = path.stem.replace("_", " ")
+            choices.append((f"{label} · {path.name}", str(path.resolve())))
+    return choices
 
 
 def _backend_ready(timeout: float = 0.5) -> bool:
@@ -113,7 +128,7 @@ def _compose_push_url(server_url: str, stream_key: str) -> str:
 
 
 def _normalize_facebook_avatar(avatar_video: str) -> str:
-    """Convert an uploaded Facebook avatar to a stable portrait 720p/25fps file."""
+    """Convert an uploaded Facebook avatar to a stable portrait 720p/30fps file."""
     if not avatar_video:
         raise gr.Error("Cần tải lên avatar video hợp lệ.")
     source = Path(avatar_video).resolve()
@@ -128,7 +143,7 @@ def _normalize_facebook_avatar(avatar_video: str) -> str:
         "-i", str(source),
         "-vf",
         "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,fps=25",
+        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,fps=30",
         "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
         "-pix_fmt", "yuv420p", "-movflags", "+faststart",
         str(temporary),
@@ -153,6 +168,7 @@ def _status_text(status: dict, prefix: str = "") -> str:
         f"- Khung hình: **{status.get('width', '-')}×{status.get('height', '-')}** "
         "(theo video avatar)\n"
         f"- Output FPS: **{status.get('output_fps', 0)}**\n"
+        f"- OBS FPS target: **{status.get('output_fps_target', status.get('fps', '-'))}**\n"
         f"- Render FPS: **{status.get('render_fps', 0)}**\n"
         f"- AV drift: **{status.get('av_drift_ms', 0)} ms**\n"
         f"- Audio delay: **{status.get('audio_delay_ms', 0)} ms**\n"
@@ -188,6 +204,7 @@ def start_stream(
     stream_key: str,
     render_ahead_seconds: float,
     batch_size: int,
+    obs_output_fps: int,
     audio_delay_ms: int,
     progress=gr.Progress(),
 ):
@@ -203,14 +220,14 @@ def start_stream(
         _cache_progress_text(2, "Đang kiểm tra video mẫu..."),
     )
     if session_id == "facebook-live":
-        progress(0.08, desc="Resize mẫu về 720×1280, 25 FPS...")
+        progress(0.08, desc="Resize mẫu về 720×1280, 30 FPS...")
         avatar_video = _normalize_facebook_avatar(avatar_video)
         progress(0.35, desc="Resize hoàn tất")
         yield (
             "### Đã resize mẫu, chuẩn bị tạo cache...",
             {"cache_progress_percent": 35, "cache_stage": "resized"},
             gr.update(),
-            _cache_progress_text(35, "Resize 720×1280, 25 FPS đã hoàn tất."),
+            _cache_progress_text(35, "Resize 720×1280, 30 FPS đã hoàn tất."),
         )
     _CURRENT_PREVIEW_SESSION = session_id
     _CURRENT_AVATAR_VIDEO = str(Path(avatar_video).resolve()) if avatar_video else None
@@ -247,10 +264,11 @@ def start_stream(
         "avatar_video": str(Path(avatar_video).resolve()),
         "push_url": push_url,
         "output_mode": "udp" if use_obs_udp else ("relive" if use_relive else "rtmp"),
-        "fps": 25,
+        "fps": 30,
+        "output_fps": int(obs_output_fps) if obs_output_fps else 30,
         "warmup_frames": (
-            25 if session_id == "facebook-live"
-            else min(250, max(0, int(round(float(render_ahead_seconds) * 25))))
+            30 if session_id == "facebook-live"
+            else min(250, max(0, int(round(float(render_ahead_seconds) * 30))))
         ),
         "batch_size": int(batch_size),
         "audio_delay_ms": int(audio_delay_ms),
@@ -309,6 +327,25 @@ def enqueue_audio_playlist(session_id: str, audio_paths):
             },
         )
     return _status_text(status, f"Đã thêm {len(paths)} voice vào playlist"), status
+
+
+def enqueue_sample_audio(session_id: str, sample_audio: str, request_id: str, priority: int, interrupt: bool):
+    sample_audio = (sample_audio or "").strip()
+    if not sample_audio:
+        raise gr.Error("Chọn một voice mẫu trước khi gửi.")
+    if not Path(sample_audio).is_file():
+        raise gr.Error("Không tìm thấy file voice mẫu.")
+    request_id = (request_id or "").strip() or f"sample-{int(time.time())}"
+    status = _request(
+        "POST", f"/api/streams/{(session_id or '').strip()}/enqueue",
+        {
+            "request_id": request_id,
+            "audio_path": sample_audio,
+            "priority": int(priority),
+            "interrupt": bool(interrupt),
+        },
+    )
+    return _status_text(status, "Đã gửi voice mẫu vào render"), status
 
 
 def refresh_stream(session_id: str):
