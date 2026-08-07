@@ -109,3 +109,11 @@ token*.json
 # MuseTalk server runtime artifacts
 .musetalk.sock
 .musetalk_spawn.lock
+.musetalk_start.lock
+
+# Local Python runtimes
+venv/
+.venv/
+/venv.backup/
+__pycache__/
+*.pyc
