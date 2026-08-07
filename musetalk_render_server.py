@@ -444,6 +444,9 @@ def main():
         print(f"[musetalk-server] another server owns {SOCKET_PATH}; exiting", flush=True)
         return
     _load_runtime()
+    # Model loading can leave unused allocator blocks parked on a 10GB card.
+    # Release them before the queue worker performs its free-VRAM admission check.
+    _release_gpu_cache()
     threading.Thread(target=_batch_loop, daemon=True).start()
     if SOCKET_PATH.exists():
         SOCKET_PATH.unlink()
