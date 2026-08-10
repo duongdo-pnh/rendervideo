@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 CACHE_FILES = ("frames_aligned.npz", "face_data.pkl", "affine_matrix.pkl", "mouth_coords.pkl")
+MAX_CONSECUTIVE_FACE_MISSES = 5
 
 
 def video_md5(path, chunk=1 << 20):
@@ -56,13 +57,40 @@ def precompute_avatar(video_path, cache_root="avatar_cache", resolution=512):
     frames = read_video(video_path, use_decord=False)
     n = len(frames)
     faces, boxes, affines = [], [], []
+    consecutive_misses = 0
+    total_misses = 0
     for i in range(n):
-        face, box, aff = ip.affine_transform(frames[i])          # face (3,512,512) uint8 cpu
+        try:
+            face, box, aff = ip.affine_transform(frames[i])      # face (3,512,512) uint8 cpu
+            affine_np = aff.squeeze(0).float().cpu().numpy()     # (2,3) float32
+            consecutive_misses = 0
+        except RuntimeError as exc:
+            if str(exc) != "Face not detected":
+                raise
+            consecutive_misses += 1
+            total_misses += 1
+            timestamp = i / 25.0
+            if not faces or consecutive_misses > MAX_CONSECUTIVE_FACE_MISSES:
+                raise RuntimeError(
+                    f"Face not detected at frame {i} ({timestamp:.2f}s); "
+                    f"{consecutive_misses} consecutive misses"
+                ) from exc
+            # A blink, motion-blurred frame, or brief detector miss should not
+            # invalidate an otherwise valid avatar video.  Reuse the last stable
+            # crop/transform for at most a few adjacent frames.
+            face = faces[-1].clone()
+            box = list(boxes[-1])
+            affine_np = affines[-1].copy()
+            print(
+                f"  face miss frame {i} ({timestamp:.2f}s); "
+                f"reuse previous transform ({consecutive_misses}/{MAX_CONSECUTIVE_FACE_MISSES})",
+                flush=True,
+            )
         faces.append(face)
         boxes.append(box)
-        affines.append(aff.squeeze(0).float().cpu().numpy())     # (2,3) float32
+        affines.append(affine_np)
         if (i + 1) % 100 == 0 or i == n - 1:
-            print(f"  affine {i+1}/{n}", flush=True)
+            print(f"  affine {i+1}/{n} (face misses reused={total_misses})", flush=True)
     faces = torch.stack(faces).numpy().astype(np.uint8)          # (N,3,512,512)
     t_affine = time.time() - t
 
