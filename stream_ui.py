@@ -251,8 +251,11 @@ def start_stream(
         and not (server_url or "").strip()
         and not (stream_key or "").strip()
     )
+    # Máy phát (OBS) có thể nằm trên MÁY KHÁC — 5090 chỉ dựng hình. Đặt
+    # MUSETALK_OBS_UDP=udp://<ip-máy-obs>:5000?pkt_size=1316 để đẩy sang đó.
+    obs_udp = os.environ.get("MUSETALK_OBS_UDP", "udp://127.0.0.1:5000?pkt_size=1316")
     push_url = (
-        "udp://127.0.0.1:5000?pkt_size=1316"
+        obs_udp
         if use_obs_udp
         else ("" if use_relive else _compose_push_url(server_url, stream_key))
     )
