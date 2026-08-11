@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import cgi
+import gc
 import hashlib
 import json
 import os
@@ -53,6 +54,17 @@ MANAGER = StreamManager()
 GPU_LOCK = threading.Lock()
 AVATAR_LOCK = threading.Lock()
 AVATARS = {}
+# Hashing a clip costs a disk read, and _ensure_session() on the caller side
+# retries the same file often, so remember the digest per (path, size, mtime).
+_FINGERPRINTS = {}
+# Avatar prep (frame extraction, landmark, mask/latent) runs ~40 min for a
+# 3 min clip. start_session() used to run inline in the POST handler, so the
+# HTTP client held one connection open the whole time — Gradio's own request
+# timeout (well under 40 min) fired first and showed a scary error even though
+# the build kept running fine in the background. Track it here instead so
+# do_POST can return immediately and callers poll do_GET for real progress.
+PREP_LOCK = threading.Lock()
+PREPARING: dict[str, dict] = {}
 # TRẦN batch, không phải mục tiêu. Batch to = kernel CUDA chạy dài = OBS phải xếp
 # hàng sau nó để composite -> rớt frame ĐÚNG LÚC avatar đang nói. Đo trên 5090
 # (2026-08-04, avatar đọc + đang encode, 60s mỗi mức):
@@ -109,10 +121,74 @@ def avatar_cache_complete(avatar_id: str) -> bool:
     )
 
 
-def get_avatar(avatar_id: str, video_path: str, batch_size: int):
+def video_fingerprint(video_path: str) -> str:
+    """Hash the clip's bytes, same scheme as musetalk_adapter._video_cache_key.
+
+    Preparing one avatar costs ~40 min and ~13 GB, so the cache key must depend
+    on the content alone.  Keying it on path+mtime — as this did — meant every
+    rewrite of an identical clip (the UI re-normalises the Facebook avatar on
+    each Start stream) produced a fresh key and re-ran the whole preparation.
+    """
+    stat = Path(video_path).stat()
+    memo_key = (video_path, stat.st_size, stat.st_mtime_ns)
+    cached = _FINGERPRINTS.get(memo_key)
+    if cached is not None:
+        return cached
+    digest = hashlib.sha256()
+    with open(video_path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+    fingerprint = digest.hexdigest()[:16]
+    _FINGERPRINTS[memo_key] = fingerprint
+    return fingerprint
+
+
+def _avatar_max_seconds(body: dict) -> float | None:
+    """How much of avatar_video to extract/cache, from body["avatar_max_seconds"].
+
+    None/0/absent means the full clip, unchanged. Preparing a long sample
+    (frame extraction + landmark + mask/latent) scales linearly with its
+    length even though the realtime idle loop only ever cycles
+    frame_list_cycle forward+backward — trimming a long source to a short
+    loop (e.g. 8-15s) cuts prep time, disk and RAM proportionally.
+    """
+    value = body.get("avatar_max_seconds")
+    if value in (None, ""):
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.5, seconds) if seconds > 0 else None
+
+
+def _avatar_id_for(video_path: str, max_seconds: float | None) -> str:
+    avatar_id = f"avatar-{video_fingerprint(video_path)}"
+    if max_seconds:
+        # Distinct trims of the same source are distinct caches — otherwise
+        # a 10s trim and the full clip would collide on the same avatar_id
+        # and silently reuse whichever was built first.
+        avatar_id += f"-{int(round(max_seconds))}s"
+    return avatar_id
+
+
+def get_avatar(avatar_id: str, video_path: str, batch_size: int, max_seconds: float | None = None):
     with AVATAR_LOCK:
         avatar = AVATARS.get(avatar_id)
         if avatar is None:
+            # Each resident avatar holds its whole frame/mask cycle in RAM —
+            # ~19-27 GB per clip on this box, enough on its own to near the
+            # 31 GB ceiling. AVATARS used to keep every avatar it ever built,
+            # and a stopped-but-not-replaced StreamSession's closure keeps its
+            # avatar alive regardless — building a second, different avatar
+            # while the first stayed resident OOM-killed this process (kernel
+            # log, 2026-08-07 17:16, anon-rss 27 GB). Only one stream is ever
+            # active (StreamManager's own MVP design) — matching that here
+            # means dropping whatever's resident before building a new one.
+            if AVATARS:
+                MANAGER.stop_all()
+                AVATARS.clear()
+                gc.collect()
             cache_dir = MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id
             cache_ready = avatar_cache_complete(avatar_id)
             # MuseTalk upstream prompts on stdin when an incomplete cache exists.
@@ -122,6 +198,7 @@ def get_avatar(avatar_id: str, video_path: str, batch_size: int):
             avatar = rt.Avatar(
                 avatar_id=avatar_id, video_path=video_path, bbox_shift=0,
                 batch_size=min(MAX_GPU_BATCH, batch_size), preparation=not cache_ready,
+                max_seconds=max_seconds,
             )
             AVATARS[avatar_id] = avatar
         else:
@@ -301,11 +378,11 @@ def start_session(body: dict) -> dict:
     if not Path(video_path).is_file():
         raise ValueError("avatar_video does not exist")
     session_id = str(body["session_id"])
-    video_stat = Path(video_path).stat()
-    fingerprint = hashlib.sha256(
-        f"{video_path}:{video_stat.st_size}:{video_stat.st_mtime_ns}".encode("utf-8")
-    ).hexdigest()[:12]
-    avatar_id = f"{str(body.get('avatar_id', session_id))}-{fingerprint}"
+    # Keyed on the clip alone — NOT on the caller's avatar_id.  The UI posts
+    # avatar_id="facebook-live" while AI-live posts "facebook-live-realtime-720"
+    # for the very same file, which used to build (and keep) two 13 GB caches.
+    max_seconds = _avatar_max_seconds(body)
+    avatar_id = _avatar_id_for(video_path, max_seconds)
     # Same rule as the normal MuseTalk renderer: output keeps the driver's
     # native frame size/aspect ratio.  Realtime used to default to 1280x720,
     # which stretched portrait and square avatars.
@@ -332,7 +409,7 @@ def start_session(body: dict) -> dict:
         audio_bitrate=str(body.get("audio_bitrate", "128k")),
         audio_delay_ms=int(body.get("audio_delay_ms", 300)),
     )
-    avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 6)))
+    avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 6)), max_seconds)
     if output_mode == "relive":
         output = ReLiveClipOutput(
             APP_ROOT / "outputs" / "relive_clips",
@@ -360,6 +437,127 @@ def start_session(body: dict) -> dict:
     MANAGER.replace(session)
     session.start()
     return session.get_status()
+
+
+def _prep_frame_total(video_path: str, max_seconds: float | None = None) -> int | None:
+    capture = cv2.VideoCapture(video_path)
+    try:
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if max_seconds:
+            fps = capture.get(cv2.CAP_PROP_FPS) or 0
+            if fps > 0:
+                total = min(total, int(round(max_seconds * fps)))
+    finally:
+        capture.release()
+    return total if total > 0 else None
+
+
+def prep_status(session_id: str) -> dict | None:
+    """Progress for a session whose avatar cache is still being prepared.
+
+    rt.Avatar's preparation writes its own tqdm bars to stdout with no
+    programmatic hook, but it does write frames/masks to disk as it goes —
+    counting those files is the same trick used to watch this build by hand,
+    just automated so the UI can poll it instead.
+    """
+    with PREP_LOCK:
+        entry = PREPARING.get(session_id)
+        if entry is None:
+            return None
+        avatar_id = entry["avatar_id"]
+        cache_ready = entry["cache_ready"]
+        frame_total = entry.get("frame_total")
+        started_at = entry["started_at"]
+        error = entry.get("error")
+    if error:
+        return {"session_id": session_id, "status": "error", "avatar_id": avatar_id, "error": error}
+    base = MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id
+    n_full = len(os.listdir(base / "full_imgs")) if (base / "full_imgs").is_dir() else 0
+    n_mask = len(os.listdir(base / "mask")) if (base / "mask").is_dir() else 0
+    stage, percent, detail = "starting", 0.0, ""
+    if frame_total:
+        if n_mask > 0:
+            # mask/ ends up with frame_total*2 files (forward + reversed
+            # idle-loop halves), but only the first frame_total are actual
+            # GPU/CPU work -- the reversed half is written from already-
+            # computed results (Avatar.prepare_material dedup), so it lands
+            # on disk in a fast near-instant burst at the very end. Track
+            # percent against the compute-bound half so it doesn't stall at
+            # 50% for most of the stage then jump straight to 100%.
+            n_computed = min(n_mask, frame_total)
+            stage, detail = "mask_latent", f"{n_computed}/{frame_total}"
+            percent = min(99.0, n_computed * 100.0 / frame_total)
+        elif n_full >= frame_total:
+            # Landmark detection writes no per-frame files, but it does write
+            # a small .landmark_progress marker (just the frame count as
+            # text) every 20 frames -- read that instead of reporting a flat
+            # 0% for the whole stage, which used to look identical to a hang.
+            n_landmark = 0
+            landmark_progress_path = base / ".landmark_progress"
+            if landmark_progress_path.is_file():
+                try:
+                    n_landmark = int(landmark_progress_path.read_text().strip())
+                except (ValueError, OSError):
+                    n_landmark = 0
+            stage, detail = "landmark", f"{n_landmark}/{frame_total}"
+            percent = min(99.0, n_landmark * 100.0 / frame_total)
+        elif n_full > 0:
+            stage, detail = "frames", f"{n_full}/{frame_total}"
+            percent = n_full * 100.0 / frame_total
+    return {
+        "session_id": session_id, "status": "preparing", "avatar_id": avatar_id,
+        "cache_ready": cache_ready, "elapsed_seconds": round(time.monotonic() - started_at, 1),
+        "prep_stage": stage, "prep_percent": round(percent, 1), "prep_detail": detail,
+    }
+
+
+def begin_session(body: dict) -> dict:
+    """Non-blocking counterpart to start_session(): kick off prep in a
+    background thread and return immediately so the HTTP request never
+    outlives the ~40 min build. Callers poll GET /api/streams/<id> for
+    progress until it stops reporting status == "preparing"."""
+    video_path = str(Path(body["avatar_video"]).resolve())
+    if not Path(video_path).is_file():
+        raise ValueError("avatar_video does not exist")
+    session_id = str(body["session_id"])
+    max_seconds = _avatar_max_seconds(body)
+    avatar_id = _avatar_id_for(video_path, max_seconds)
+    cache_ready = avatar_cache_complete(avatar_id)
+    # prep_status() takes PREP_LOCK itself, so it must only ever be called
+    # AFTER this block releases it — threading.Lock isn't reentrant, calling
+    # it from inside the `with` below deadlocks this thread on itself, and
+    # since PREP_LOCK is process-global that wedges every other session too.
+    start_worker = False
+    with PREP_LOCK:
+        existing = PREPARING.get(session_id)
+        if existing is not None and existing.get("thread") is not None and existing["thread"].is_alive():
+            entry = existing
+        else:
+            entry = {
+                "avatar_id": avatar_id, "started_at": time.monotonic(), "cache_ready": cache_ready,
+                "error": None, "thread": None,
+                "frame_total": None if cache_ready else _prep_frame_total(video_path, max_seconds),
+            }
+            PREPARING[session_id] = entry
+            start_worker = True
+
+    if start_worker:
+        def worker() -> None:
+            try:
+                start_session(body)
+            except Exception as exc:  # noqa: BLE001 — surfaced to the poller, not swallowed
+                with PREP_LOCK:
+                    entry["error"] = f"{type(exc).__name__}: {exc}"
+                traceback.print_exc()
+            else:
+                with PREP_LOCK:
+                    PREPARING.pop(session_id, None)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        with PREP_LOCK:
+            entry["thread"] = thread
+        thread.start()
+    return prep_status(session_id)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -451,8 +649,8 @@ class Handler(BaseHTTPRequestHandler):
         enqueued_chunks = 0
         try:
             if session_id is None:
-                result = start_session(self._body())
-                self._json(201, result)
+                result = begin_session(self._body())
+                self._json(202, result)
                 return
             session = MANAGER.get(session_id)
             if action == "enqueue-file":
@@ -525,6 +723,12 @@ class Handler(BaseHTTPRequestHandler):
                     cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA,
                 )
                 self._jpeg(placeholder)
+            elif action is None:
+                prep = prep_status(session_id)
+                if prep is not None:
+                    self._json(200, prep)
+                else:
+                    self._json(404, {"error": str(exc)})
             else:
                 self._json(404, {"error": str(exc)})
 

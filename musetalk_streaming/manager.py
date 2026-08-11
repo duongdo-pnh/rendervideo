@@ -34,6 +34,20 @@ class StreamManager:
         with self._lock:
             self._sessions[session.config.session_id] = session
 
+    def stop_all(self) -> None:
+        """Stop and drop every session, registering nothing in its place.
+
+        Used before building a different avatar: a stopped-but-not-replaced
+        session's closures still hold a direct reference to its (multi-GB,
+        fully RAM-resident) avatar object, so simply evicting that avatar
+        from the build cache elsewhere doesn't free the memory on its own.
+        """
+        with self._lock:
+            previous = list(self._sessions.values())
+            self._sessions.clear()
+        for item in previous:
+            item.stop()
+
     def get(self, session_id: str) -> StreamSession:
         with self._lock:
             try:

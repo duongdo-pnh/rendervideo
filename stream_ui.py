@@ -194,6 +194,14 @@ def _status_text(status: dict, prefix: str = "") -> str:
     )
 
 
+_PREP_STAGE_LABELS = {
+    "starting": "Đang khởi tạo",
+    "frames": "Đang trích khung hình từ video mẫu",
+    "landmark": "Đang nhận diện khuôn mặt",
+    "mask_latent": "Đang tạo mask và latent",
+}
+
+
 def _cache_progress_text(percent: int, label: str) -> str:
     percent = min(100, max(0, int(percent)))
     filled = min(20, percent // 5)
@@ -214,10 +222,9 @@ def start_stream(
     batch_size: int,
     obs_output_fps: int,
     audio_delay_ms: int,
-    progress=gr.Progress(),
+    avatar_max_seconds: float = 0,
 ):
     global _CURRENT_PREVIEW_SESSION, _CURRENT_AVATAR_VIDEO
-    progress(0.02, desc="Kiểm tra video mẫu...")
     session_id = (session_id or "").strip()
     if not session_id:
         raise gr.Error("Cần nhập Session ID.")
@@ -228,9 +235,7 @@ def start_stream(
         _cache_progress_text(2, "Đang kiểm tra video mẫu..."),
     )
     if session_id == "facebook-live":
-        progress(0.08, desc="Resize mẫu về 720×1280, 30 FPS...")
         avatar_video = _normalize_facebook_avatar(avatar_video)
-        progress(0.35, desc="Resize hoàn tất")
         yield (
             "### Đã resize mẫu, chuẩn bị tạo cache...",
             {"cache_progress_percent": 35, "cache_stage": "resized"},
@@ -257,7 +262,6 @@ def start_stream(
         else ("" if use_relive else _compose_push_url(server_url, stream_key))
     )
     _ensure_backend()
-    progress(0.45, desc="Đang tạo cache MuseTalk (khuôn mặt, latent, mask)...")
     yield (
         "### Đang tạo cache MuseTalk...",
         {"cache_progress_percent": 45, "cache_stage": "musetalk_cache"},
@@ -280,9 +284,33 @@ def start_stream(
         ),
         "batch_size": int(batch_size),
         "audio_delay_ms": int(audio_delay_ms),
-    }, timeout=1800)
-    progress(0.95, desc="Cache xong, đang nối luồng với OBS...")
-    progress(1.0, desc="Đã nạp mẫu và khởi động luồng")
+        "avatar_max_seconds": float(avatar_max_seconds) if avatar_max_seconds else 0,
+    }, timeout=30)
+    # The backend now answers immediately and preps the avatar (~40 min for a
+    # fresh clip) in a background thread — poll its real progress instead of
+    # holding one HTTP request open that long. A single blocking call used to
+    # outlive Gradio's own request timeout and surface a scary "Timeout" error
+    # even though the build kept running fine on the server.
+    # live_cache_progress is the one progress readout — no gr.Progress() bar
+    # alongside it repeating the same stage/percent/elapsed text.
+    prep_deadline = time.monotonic() + 3600
+    while status.get("status") == "preparing":
+        percent = float(status.get("prep_percent") or 0.0)
+        stage = _PREP_STAGE_LABELS.get(status.get("prep_stage"), status.get("prep_stage") or "")
+        detail = status.get("prep_detail") or ""
+        elapsed = int(status.get("elapsed_seconds") or 0)
+        yield (
+            "### Đang chuẩn bị avatar...",
+            status,
+            gr.update(),
+            _cache_progress_text(int(45 + 50 * percent / 100), f"{stage} {detail} (đã chạy {elapsed}s)"),
+        )
+        if time.monotonic() > prep_deadline:
+            raise gr.Error("Chuẩn bị avatar quá lâu (>60 phút). Kiểm tra logs/musetalk_stream_api.log.")
+        time.sleep(3)
+        status = _request("GET", f"/api/streams/{session_id}", timeout=10)
+    if status.get("status") == "error":
+        raise gr.Error(f"Chuẩn bị avatar lỗi: {status.get('error')}")
     # Clear the password field after the backend has accepted the credential.
     yield (
         _status_text(status, "Đã bắt đầu stream"),
