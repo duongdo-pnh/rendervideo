@@ -204,7 +204,7 @@ _COL_HELP = {
 
 # Default render config for jobs created from Excel (matches the web UI defaults).
 RENDER_DEFAULTS = dict(model_res="512", guidance=1.5, steps=24, seed=1247,
-                       enhance_mouth=1, enhance_region="mouth", out_res="720")
+                       enhance_mouth=1, enhance_region="mouth", out_res="720", engine="musetalk")
 
 IMPORT_LOG = ROOT / "logs" / "import_tts.log"
 

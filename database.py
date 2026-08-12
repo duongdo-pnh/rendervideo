@@ -95,10 +95,10 @@ def init_db():
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
             enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
             drive_folder=None, drive_name=None, engine="musetalk"):
-    """Insert a new MuseTalk job with its full render config."""
-    # Normal/Excel/TTS renders are MuseTalk-only. Keep the argument for backward
-    # compatibility with existing callers, but never persist another engine.
-    engine = "musetalk"
+    """Insert a new render job with its full render config."""
+    engine = str(engine)
+    if engine not in ("musetalk", "latentsync"):
+        raise ValueError(f"unknown engine {engine!r} (expected 'musetalk' or 'latentsync')")
     model_res = str(model_res)
     if model_res not in MODELS:
         raise ValueError(f"unknown model_res {model_res!r} (expected one of {list(MODELS)})")

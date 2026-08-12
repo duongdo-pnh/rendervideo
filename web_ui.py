@@ -129,10 +129,19 @@ def input_type_preset(input_type):
     return gr.update(value=1.5), gr.update(value=24), gr.update(value=True)
 
 
+ENGINE_CHOICES = [("MuseTalk 1.5", "musetalk"), ("LatentSync", "latentsync")]
+ENGINE_LABEL = {"musetalk": "MuseTalk 1.5", "latentsync": "LatentSync"}
+
+
+def engine_model_visibility(engine):
+    """256/512 checkpoint choice only applies to LatentSync — hide it for MuseTalk."""
+    return gr.update(visible=(engine == "latentsync"))
+
+
 # ---------------------------------------------------------------- Thêm vào queue
 
 def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model_res, guidance, steps, seed,
-                 enhance_mouth, enhance_region, out_res, input_type):
+                 enhance_mouth, enhance_region, out_res, input_type, engine):
     if not video_path or not audio_path:
         raise gr.Error("Cần cả video và audio.")
     if kind == KIND_ANSWER and intent == "ASK_OTHER" and not _slug_key(other_key):
@@ -146,9 +155,10 @@ def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model
     shutil.copy(video_path, v_dst)
     shutil.copy(audio_path, a_dst)
     job_id = db.add_job(name, v_dst, a_dst, model_res, guidance, steps, seed,
-                        int(bool(enhance_mouth)), enhance_region, out_res, input_type)
+                        int(bool(enhance_mouth)), enhance_region, out_res, input_type,
+                        engine=engine)
     gr.Info(f"✅ Đã thêm job #{job_id} vào queue.")   # toast thông báo
-    return f"✅ Đã thêm **job #{job_id}** ('{name}') vào hàng đợi **MuseTalk 1.5**."
+    return f"✅ Đã thêm **job #{job_id}** ('{name}') vào hàng đợi **{ENGINE_LABEL[engine]}**."
 
 
 # ---------------------------------------------------------------- Tab 2 helpers
@@ -449,14 +459,15 @@ def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
 
 
 def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region, input_type,
-                 dedup, progress=gr.Progress()):
+                 dedup, engine, progress=gr.Progress()):
     if not state or not state.get("rows"):
         raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
     rows = state["rows"]
     shopee = state.get("shopee")
     render_config = dict(model_res=str(model), out_res=str(out_res),
                          enhance_mouth=int(bool(enhance_mouth)), enhance_region=region,
-                         guidance=float(guidance), steps=int(steps), seed=int(seed), input_type=input_type)
+                         guidance=float(guidance), steps=int(steps), seed=int(seed), input_type=input_type,
+                         engine=engine)
 
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
@@ -465,7 +476,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
         rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"),
         render_config=render_config, dedup=bool(dedup))
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
-             f"⚙️ Engine **MuseTalk 1.5** · đầu ra **{out_res}** · "
+             f"⚙️ Engine **{ENGINE_LABEL[engine]}** · đầu ra **{out_res}** · "
              f"{'làm nét '+region if enhance_mouth else 'KHÔNG làm nét'} · guidance {guidance} · {steps} steps**.",
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
@@ -758,15 +769,20 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                 input_type_in = gr.Radio(
                     choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
                     label="Loại input (Video AI dùng mask môi hẹp, không GFPGAN)")
+                engine_in = gr.Radio(
+                    choices=ENGINE_CHOICES, value="musetalk",
+                    label="Engine render")
                 with gr.Row():
                     model_in = gr.Radio(
                         choices=["256", "512"], value="512",
-                        label="Model: 256 (nhanh ~2×) | 512 (nét/tự nhiên, chậm)",
+                        label="LatentSync checkpoint: 256 (nhanh ~2×) | 512 (nét/tự nhiên, chậm)",
+                        visible=False,
                     )
                     out_res_in = gr.Radio(
                         choices=list(OUT_RES.keys()), value="720",
                         label="Độ phân giải (cạnh ngắn)",
                     )
+                engine_in.change(engine_model_visibility, engine_in, model_in)
                 with gr.Row():
                     guidance_in = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
                     steps_in = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
@@ -796,7 +812,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
                 result_refresh = gr.Button("🔄 Cập nhật danh sách (hiện video mới render xong)")
 
         cfg_inputs = [video_in, audio_in, product_in, kind_in, intent_in, other_key_in, model_in, guidance_in,
-                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in, input_type_in]
+                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in, input_type_in, engine_in]
         # Hiện ô câu hỏi chỉ khi chọn "Trả lời".
         kind_in.change(lambda k: gr.update(visible=(k == KIND_ANSWER)), kind_in, intent_in)
         kind_in.change(other_key_visibility, [kind_in, intent_in], other_key_in)
@@ -899,13 +915,16 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
         xl_input_type = gr.Radio(
             choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
             label="Loại input")
+        xl_engine = gr.Radio(choices=ENGINE_CHOICES, value="musetalk", label="Engine render")
         with gr.Row():
             xl_model = gr.Radio(["256", "512"], value="512",
-                                label="Model: 256 (nhanh) | 512 (nét/tự nhiên, chậm)")
+                                label="LatentSync checkpoint: 256 (nhanh) | 512 (nét/tự nhiên, chậm)",
+                                visible=False)
             xl_out_res = gr.Radio(choices=list(OUT_RES.keys()), value="720",
                                   label="Độ phân giải (cạnh ngắn): Gốc | 1080 | 720")
             xl_enhance = gr.Checkbox(value=True, label="Làm nét miệng (GFPGAN)")
             xl_region = gr.Radio(["mouth", "face"], value="mouth", label="Vùng làm nét")
+        xl_engine.change(engine_model_visibility, xl_engine, xl_model)
         with gr.Row():
             xl_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
             xl_steps = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
@@ -947,7 +966,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
         xl_submit_btn.click(
             submit_excel,
             [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed,
-             xl_region, xl_input_type, xl_dedup],
+             xl_region, xl_input_type, xl_dedup, xl_engine],
             [xl_result, status_table, xl_batch_state])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)
