@@ -17,6 +17,7 @@ APP_ROOT = Path(__file__).resolve().parent
 MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
 sys.path.insert(0, str(MUSETALK_ROOT))
 
+import avatar_cache_gc
 import cv2
 import torch
 from transformers import WhisperModel
@@ -73,14 +74,15 @@ def _avatar_cache_complete(avatar_id):
 
 def _get_avatar(req):
     avatar_id = req["avatar_id"]
+    base = ROOT / "results" / "v15" / "avatars" / avatar_id
     with AVATAR_LOCK:
         avatar = AVATARS.get(avatar_id)
         if avatar is not None:
             avatar.batch_size = int(req.get("batch_size", 20))
             print(f"[musetalk-server] avatar {avatar_id}: HIT/memory", flush=True)
+            avatar_cache_gc.touch(base)
             return avatar
         complete = _avatar_cache_complete(avatar_id)
-        base = ROOT / "results" / "v15" / "avatars" / avatar_id
         if base.exists() and not complete:
             shutil.rmtree(base)
         print(f"[musetalk-server] avatar {avatar_id}: {'HIT' if complete else 'MISS/build'}", flush=True)
@@ -92,6 +94,7 @@ def _get_avatar(req):
             preparation=not complete,
         )
         AVATARS[avatar_id] = avatar
+        avatar_cache_gc.touch(base)
         return avatar
 
 

@@ -26,6 +26,7 @@ _envbin = os.path.dirname(sys.executable)
 if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
+import avatar_cache_gc
 import database as db
 
 # Google Drive auto-upload là tùy chọn: thiếu thư viện google-* thì worker vẫn chạy bình thường.
@@ -41,10 +42,13 @@ WORK_DIR = ROOT / "work"
 LOGS_DIR = ROOT / "logs"
 BACKUP_DIR = ROOT / "backups"
 WORKER_LOCK_PATH = ROOT / ".queue_worker.lock"
+AVATAR_CACHE_ROOT = ROOT / "engines" / "MuseTalk" / "results" / "v15" / "avatars"
 
 POLL_SECONDS = 5            # idle poll interval when the queue is empty
 BACKUP_INTERVAL = 6 * 3600  # SQLite backup cadence
 BACKUP_KEEP = 8             # keep this many most-recent backups
+AVATAR_GC_INTERVAL = 6 * 3600     # how often to check for stale avatar cache
+AVATAR_GC_MAX_AGE_DAYS = 3        # delete an avatar cache not used for a render in this long
 GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claiming a job
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
 RENDER_IDLE_TIMEOUT = 20 * 60  # no new log output this long means the renderer is genuinely stuck
@@ -278,6 +282,22 @@ def backup_db():
     finally:
         src.close()
     _log(f"DB backup -> {dst.name}")
+
+
+# ---------------------------------------------------------------- avatar cache GC
+
+def gc_avatar_cache():
+    """Delete avatar caches (MuseTalk batch queue + livestream) unused for AVATAR_GC_MAX_AGE_DAYS.
+
+    Uses the same touch()-tracked last-used timestamp both call sites (musetalk_render_server.py,
+    musetalk_stream_api.py) record on every avatar HIT/build — see avatar_cache_gc.py.
+    """
+    removed = avatar_cache_gc.sweep(AVATAR_CACHE_ROOT, max_age_days=AVATAR_GC_MAX_AGE_DAYS)
+    if removed:
+        freed = sum(size for _, size in removed) / 1e9
+        names = ", ".join(name for name, _ in removed)
+        _log(f"avatar cache GC: removed {len(removed)} unused >{AVATAR_GC_MAX_AGE_DAYS}d "
+             f"(~{freed:.1f} GB): {names}")
     backups = sorted(BACKUP_DIR.glob("jobs_*.db"))
     for old in backups[:-BACKUP_KEEP]:        # prune oldest beyond BACKUP_KEEP
         old.unlink(missing_ok=True)
@@ -453,6 +473,8 @@ def main():
     _log("worker started; polling for jobs...")
 
     last_backup = time.time()
+    last_avatar_gc = time.time()
+    gc_avatar_cache()  # sweep once on startup too, not just every AVATAR_GC_INTERVAL
     while _RUNNING:
         try:
             if not gpu_healthy():
@@ -462,6 +484,10 @@ def main():
             if time.time() - last_backup >= BACKUP_INTERVAL:
                 backup_db()
                 last_backup = time.time()
+
+            if time.time() - last_avatar_gc >= AVATAR_GC_INTERVAL:
+                gc_avatar_cache()
+                last_avatar_gc = time.time()
 
             job = db.claim_next_job()
             if not job:

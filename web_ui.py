@@ -20,6 +20,7 @@ from pathlib import Path
 
 import gradio as gr
 
+import avatar_cache_gc
 import database as db
 import excel_import
 import tts_config
@@ -51,6 +52,7 @@ _TTS_DEFAULT = next((p["name"] for p in _TTS_PROVIDERS if p["is_default"]),
 ROOT = Path(__file__).parent
 UPLOADS_DIR = ROOT / "uploads"
 AVATAR_CACHE_ROOT = ROOT / "engines" / "MuseTalk" / "results" / "v15" / "avatars"
+AVATAR_GC_CHECK_HOURS = 6  # phải khớp AVATAR_GC_INTERVAL trong queue_worker.py
 
 # Bảo đảm bảng tồn tại trước khi Blocks query giá trị khởi tạo.
 db.init_db()
@@ -313,10 +315,13 @@ def _avatar_cache_rows():
         return duration_cache[video_path]
 
     rows = []
+    now = datetime.now().timestamp()
     for e in sorted(entries, key=lambda x: (x["video_path"], -x["ctime"])):
         aid = e["avatar_id"]
+        avatar_dir = AVATAR_CACHE_ROOT / aid
+        is_test = aid.startswith("_test")
         is_live = False
-        if aid.startswith("_test"):
+        if is_test:
             status = "🧪 TEST"
         else:
             lh = live_hash(e["video_path"])
@@ -329,11 +334,24 @@ def _avatar_cache_rows():
                 status = "⚠️ STALE (video gốc đã đổi)"
         dur = duration_of(e["video_path"])
         source_name = _avatar_source_name(e["video_path"]) if is_live else None
+
+        used = avatar_cache_gc.last_used(avatar_dir)
+        last_used_str = datetime.fromtimestamp(used).strftime("%Y-%m-%d %H:%M") if used else "?"
+        if is_test:
+            auto_delete = "— (test, không tự xóa)"
+        elif used is None:
+            auto_delete = "?"
+        else:
+            days_left = avatar_cache_gc.DEFAULT_MAX_AGE_DAYS - (now - used) / 86400
+            auto_delete = ("⏳ sẽ xóa ở lần dọn kế tiếp" if days_left <= 0
+                           else f"còn {days_left:.1f} ngày")
+
         rows.append([
             Path(e["video_path"]).name, source_name or "? (không rõ / trước khi có tính năng này)",
             _fmt_secs(dur) if dur is not None else "?",
             aid, round(e["size_bytes"] / 1e9, 2),
-            datetime.fromtimestamp(e["ctime"]).strftime("%Y-%m-%d %H:%M"), status,
+            datetime.fromtimestamp(e["ctime"]).strftime("%Y-%m-%d %H:%M"),
+            last_used_str, auto_delete, status,
         ])
     return rows
 
@@ -341,15 +359,18 @@ def _avatar_cache_rows():
 def refresh_avatar_cache():
     rows = _avatar_cache_rows()
     total = sum(r[4] for r in rows)
-    stale = sum(r[4] for r in rows if r[6].startswith("⚠️"))
-    summary = f"**Tổng {total:.1f} GB** trên {len(rows)} bản cache — trong đó **{stale:.1f} GB STALE** có thể xóa."
+    stale = sum(r[4] for r in rows if r[8].startswith("⚠️"))
+    summary = (f"**Tổng {total:.1f} GB** trên {len(rows)} bản cache — trong đó **{stale:.1f} GB STALE** "
+               f"có thể xóa ngay. Cache không dùng để render quá "
+               f"**{avatar_cache_gc.DEFAULT_MAX_AGE_DAYS} ngày** sẽ tự động bị worker dọn "
+               f"(kiểm tra mỗi {AVATAR_GC_CHECK_HOURS}h) — không áp dụng cho bản 🧪 TEST.")
     return gr.update(value=rows), summary
 
 
 def clear_stale_avatar_cache():
     rows = _avatar_cache_rows()
     removed, freed = [], 0.0
-    for _video, _source_name, _dur, aid, size_gb, _built, status in rows:
+    for _video, _source_name, _dur, aid, size_gb, _built, _last_used, _auto_delete, status in rows:
         if status.startswith("⚠️"):
             shutil.rmtree(AVATAR_CACHE_ROOT / aid, ignore_errors=True)
             removed.append(aid)
@@ -1209,12 +1230,15 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
             "### Avatar cache MuseTalk trên đĩa\n"
             "Mỗi avatar cache được khóa theo **hash nội dung** video nguồn. Nếu video nguồn bị "
             "ghi đè (upload lại avatar mới cùng tên), hash cũ không còn khớp — bản cache đó thành "
-            "**STALE**: không bao giờ được server dùng lại nữa nhưng vẫn chiếm đĩa.")
+            "**STALE**: không bao giờ được server dùng lại nữa nhưng vẫn chiếm đĩa.\n\n"
+            f"🤖 **Tự động dọn**: `queue_worker.py` kiểm tra mỗi {AVATAR_GC_CHECK_HOURS} giờ và xóa "
+            f"mọi avatar (kể cả LIVE) không được dùng để render trong "
+            f"{avatar_cache_gc.DEFAULT_MAX_AGE_DAYS} ngày liên tiếp — trừ bản 🧪 TEST.")
         avatar_cache_summary = gr.Markdown()
         avatar_cache_table = gr.Dataframe(
             headers=["Video nguồn", "Tên gốc trước cache", "Thời lượng", "Avatar ID",
-                     "Dung lượng (GB)", "Ngày build", "Trạng thái"],
-            datatype=["str", "str", "str", "str", "number", "str", "str"],
+                     "Dung lượng (GB)", "Ngày build", "Lần dùng cuối", "Tự xóa sau", "Trạng thái"],
+            datatype=["str", "str", "str", "str", "number", "str", "str", "str", "str"],
             interactive=False, wrap=True)
         with gr.Row():
             avatar_cache_refresh_btn = gr.Button("🔄 Làm mới")

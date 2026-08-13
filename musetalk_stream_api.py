@@ -35,6 +35,7 @@ sys.path.insert(0, str(APP_ROOT))
 sys.path.insert(0, str(MUSETALK_ROOT))
 os.chdir(MUSETALK_ROOT)
 
+import avatar_cache_gc
 import cv2
 import librosa
 import numpy as np
@@ -203,6 +204,7 @@ def get_avatar(avatar_id: str, video_path: str, batch_size: int, max_seconds: fl
             AVATARS[avatar_id] = avatar
         else:
             avatar.batch_size = min(MAX_GPU_BATCH, batch_size)
+        avatar_cache_gc.touch(MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id)
         return avatar
 
 
