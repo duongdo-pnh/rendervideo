@@ -32,6 +32,9 @@ FACEBOOK_AVATAR_720 = Path(
         str(ROOT / "avatar_cache" / "facebook_live_selected_720x1280.mp4"),
     )
 )
+# Tên file gốc trước khi resize/ghi đè lên FACEBOOK_AVATAR_720 — ghi lại vì "Start stream" luôn
+# GHI ĐÈ cùng 1 đường dẫn cố định nên tên upload gốc bị mất ngay khi convert xong.
+FACEBOOK_AVATAR_SOURCE_NAME = FACEBOOK_AVATAR_720.with_suffix(".source.txt")
 SAMPLE_AUDIO_DIR = ROOT / "engines" / "MuseTalk" / "data" / "audio"
 _CURRENT_PREVIEW_SESSION = "facebook-live"
 _CURRENT_AVATAR_VIDEO = None
@@ -162,6 +165,10 @@ def _normalize_facebook_avatar(avatar_video: str) -> str:
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         temporary.unlink(missing_ok=True)
         raise gr.Error(f"Không thể resize avatar về 720×1280: {type(exc).__name__}") from None
+    try:
+        FACEBOOK_AVATAR_SOURCE_NAME.write_text(source.name, encoding="utf-8")
+    except OSError:
+        pass  # best-effort; chỉ phục vụ hiển thị tên gốc ở tab Avatar Cache
     return str(FACEBOOK_AVATAR_720.resolve())
 
 

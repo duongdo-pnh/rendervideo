@@ -7,9 +7,12 @@ Tab 2 — Trạng thái queue: bảng auto-refresh 10s + xem/tải video đã re
 
 Run with:  conda activate latentsync && python web_ui.py
 """
+import hashlib
+import json
 import os
 import re
 import shutil
+import subprocess
 import unicodedata
 import uuid
 from datetime import datetime
@@ -47,6 +50,7 @@ _TTS_DEFAULT = next((p["name"] for p in _TTS_PROVIDERS if p["is_default"]),
 
 ROOT = Path(__file__).parent
 UPLOADS_DIR = ROOT / "uploads"
+AVATAR_CACHE_ROOT = ROOT / "engines" / "MuseTalk" / "results" / "v15" / "avatars"
 
 # Bảo đảm bảng tồn tại trước khi Blocks query giá trị khởi tạo.
 db.init_db()
@@ -227,6 +231,133 @@ def _priority_choices():
     jobs = [j for j in db.list_jobs(limit=200) if j["status"] == db.STATUS_QUEUED]
     jobs.sort(key=lambda j: (-int(j.get("priority") or 0), j.get("created_at") or "", j["id"]))
     return [(f"#{j['id']} · {j['name']}", str(j["id"])) for j in jobs]
+
+
+def _hash_video(path):
+    """SHA256 nội dung file — cùng thuật toán với musetalk_adapter._video_cache_key /
+    musetalk_stream_api.video_fingerprint, để so khớp avatar cache với video nguồn hiện tại."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return f"avatar-{h.hexdigest()}"
+
+
+def _video_duration(path):
+    """Thời lượng video (giây) qua ffprobe, hoặc None nếu không đọc được."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nw=1:nk=1", str(path)],
+            capture_output=True, text=True, timeout=30,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def _avatar_source_name(video_path):
+    """Tên file gốc trước khi convert/ghi đè lên video_path (xem stream_ui._normalize_facebook_avatar).
+
+    Sidecar chỉ được ghi CÙNG LÚC với lần convert gần nhất -> chỉ đúng cho video ĐANG khớp
+    hash hiện tại (LIVE); với bản STALE thì tên gốc đã mất vĩnh viễn cùng lúc video bị ghi đè,
+    không có cách nào phục hồi.
+    """
+    sidecar = Path(video_path).with_suffix(".source.txt")
+    try:
+        return sidecar.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _avatar_cache_rows():
+    """Liệt kê avatar cache MuseTalk trên đĩa, gom theo video nguồn.
+
+    Mỗi avatar_id là hash nội dung video lúc build. Nếu video nguồn bị ghi đè sau đó,
+    hash mới không còn khớp -> cache cũ (STALE) không bao giờ được server tái sử dụng nữa,
+    nhưng cũng không tự xóa -> chiếm đĩa vô ích. Hash mỗi video CHỈ 1 lần dù nhiều avatar
+    cùng trỏ tới nó.
+    """
+    if not AVATAR_CACHE_ROOT.is_dir():
+        return []
+    entries = []
+    for d in sorted(AVATAR_CACHE_ROOT.iterdir()):
+        info_path = d / "avator_info.json"
+        if not info_path.is_file():
+            continue
+        try:
+            info = json.loads(info_path.read_text())
+        except Exception:
+            continue
+        size = sum(f.stat().st_size for f in d.rglob("*") if f.is_file())
+        entries.append({
+            "avatar_id": d.name,
+            "video_path": info.get("video_path") or "?",
+            "size_bytes": size,
+            "ctime": info_path.stat().st_mtime,
+        })
+
+    hash_cache = {}
+    duration_cache = {}
+
+    def live_hash(video_path):
+        if video_path not in hash_cache:
+            p = Path(video_path)
+            hash_cache[video_path] = _hash_video(p) if p.is_file() else None
+        return hash_cache[video_path]
+
+    def duration_of(video_path):
+        if video_path not in duration_cache:
+            p = Path(video_path)
+            duration_cache[video_path] = _video_duration(p) if p.is_file() else None
+        return duration_cache[video_path]
+
+    rows = []
+    for e in sorted(entries, key=lambda x: (x["video_path"], -x["ctime"])):
+        aid = e["avatar_id"]
+        is_live = False
+        if aid.startswith("_test"):
+            status = "🧪 TEST"
+        else:
+            lh = live_hash(e["video_path"])
+            if lh is None:
+                status = "❓ video gốc đã bị xóa"
+            elif lh.startswith(aid):
+                status = "✅ LIVE"
+                is_live = True
+            else:
+                status = "⚠️ STALE (video gốc đã đổi)"
+        dur = duration_of(e["video_path"])
+        source_name = _avatar_source_name(e["video_path"]) if is_live else None
+        rows.append([
+            Path(e["video_path"]).name, source_name or "? (không rõ / trước khi có tính năng này)",
+            _fmt_secs(dur) if dur is not None else "?",
+            aid, round(e["size_bytes"] / 1e9, 2),
+            datetime.fromtimestamp(e["ctime"]).strftime("%Y-%m-%d %H:%M"), status,
+        ])
+    return rows
+
+
+def refresh_avatar_cache():
+    rows = _avatar_cache_rows()
+    total = sum(r[4] for r in rows)
+    stale = sum(r[4] for r in rows if r[6].startswith("⚠️"))
+    summary = f"**Tổng {total:.1f} GB** trên {len(rows)} bản cache — trong đó **{stale:.1f} GB STALE** có thể xóa."
+    return gr.update(value=rows), summary
+
+
+def clear_stale_avatar_cache():
+    rows = _avatar_cache_rows()
+    removed, freed = [], 0.0
+    for _video, _source_name, _dur, aid, size_gb, _built, status in rows:
+        if status.startswith("⚠️"):
+            shutil.rmtree(AVATAR_CACHE_ROOT / aid, ignore_errors=True)
+            removed.append(aid)
+            freed += size_gb
+    gr.Info(f"Đã xóa {len(removed)} bản cache STALE, giải phóng ~{freed:.1f} GB." if removed
+            else "Không có bản cache STALE nào để xóa.")
+    table_update, summary = refresh_avatar_cache()
+    return table_update, summary
 
 
 def _video_choices():
@@ -1073,6 +1204,26 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
             stream_preview, inputs=None,
             outputs=[live_preview, live_status_md, live_status_json], queue=False)
 
+    with gr.Tab("🗄️ Avatar Cache"):
+        gr.Markdown(
+            "### Avatar cache MuseTalk trên đĩa\n"
+            "Mỗi avatar cache được khóa theo **hash nội dung** video nguồn. Nếu video nguồn bị "
+            "ghi đè (upload lại avatar mới cùng tên), hash cũ không còn khớp — bản cache đó thành "
+            "**STALE**: không bao giờ được server dùng lại nữa nhưng vẫn chiếm đĩa.")
+        avatar_cache_summary = gr.Markdown()
+        avatar_cache_table = gr.Dataframe(
+            headers=["Video nguồn", "Tên gốc trước cache", "Thời lượng", "Avatar ID",
+                     "Dung lượng (GB)", "Ngày build", "Trạng thái"],
+            datatype=["str", "str", "str", "str", "number", "str", "str"],
+            interactive=False, wrap=True)
+        with gr.Row():
+            avatar_cache_refresh_btn = gr.Button("🔄 Làm mới")
+            avatar_cache_clear_btn = gr.Button("🗑️ Xóa các bản STALE", variant="stop")
+        avatar_cache_refresh_btn.click(
+            refresh_avatar_cache, None, [avatar_cache_table, avatar_cache_summary])
+        avatar_cache_clear_btn.click(
+            clear_stale_avatar_cache, None, [avatar_cache_table, avatar_cache_summary])
+
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
             "### Cấu hình TTS\n"
@@ -1181,6 +1332,7 @@ with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo
     demo.load(refresh_status, outputs=[status_table, done_dd])
     demo.load(load_video_area, outputs=[result_dd, result_video, result_dl])
     demo.load(tts_status_md, outputs=xl_tts_status)
+    demo.load(refresh_avatar_cache, outputs=[avatar_cache_table, avatar_cache_summary])
     # Form cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
     demo.load(load_tts_config_form, outputs=[cfg_default, *cfg_inputs, cfg_status])
 

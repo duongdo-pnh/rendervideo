@@ -16,6 +16,14 @@ _envbin = os.path.dirname(sys.executable)
 if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
+# Long single-process renders (512, many chunks) grow "reserved but unallocated" CUDA memory
+# from allocator fragmentation until an alloc that would otherwise fit fails. Musetalk's
+# persistent server also holds ~7.3GB on the same card the whole time, so headroom is tight.
+# expandable_segments lets the allocator grow/shrink a segment instead of hunting for a new
+# contiguous block, which is exactly the failure mode in the OOM traces (queue_worker.log:
+# "Of the allocated memory 8.26 GiB is allocated ... 4.6+ GiB is reserved but unallocated").
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 # RTX 5090 profile (2026-07-23): keep Torch cu128/sm_120 and DO NOT enable xformers unless
 # a wheel explicitly supports Blackwell. Face detect/align should use ONNXRuntime GPU; verify with:
 #   import onnxruntime as ort; print(ort.get_available_providers())
