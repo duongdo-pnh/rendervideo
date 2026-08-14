@@ -28,6 +28,10 @@ from urllib.parse import urlparse
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+# This venv's torch 2.0.1 doesn't recognize the expandable_segments allocator option (only set
+# for the main venv's torch 2.7.1 in render_job.py) — hard-crashes on CUDA init if inherited
+# from whatever launched this process. See musetalk_render_server.py for the same guard.
+os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
 
 APP_ROOT = Path(__file__).resolve().parent
 MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
@@ -35,7 +39,6 @@ sys.path.insert(0, str(APP_ROOT))
 sys.path.insert(0, str(MUSETALK_ROOT))
 os.chdir(MUSETALK_ROOT)
 
-import avatar_cache_gc
 import cv2
 import librosa
 import numpy as np
@@ -204,7 +207,6 @@ def get_avatar(avatar_id: str, video_path: str, batch_size: int, max_seconds: fl
             AVATARS[avatar_id] = avatar
         else:
             avatar.batch_size = min(MAX_GPU_BATCH, batch_size)
-        avatar_cache_gc.touch(MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id)
         return avatar
 
 

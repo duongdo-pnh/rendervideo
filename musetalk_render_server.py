@@ -17,8 +17,15 @@ APP_ROOT = Path(__file__).resolve().parent
 MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
 sys.path.insert(0, str(MUSETALK_ROOT))
 
-import avatar_cache_gc
+# musetalk_adapter._ensure_server() spawns this with env={**os.environ, ...} — it inherits
+# whatever its caller had set. render_job.py sets PYTORCH_CUDA_ALLOC_CONF=expandable_segments
+# for the main venv's torch 2.7.1 (LatentSync), and calls musetalk_adapter.render() in-process
+# for engine=="musetalk" jobs, so that setting leaks in here too. This venv's torch 2.0.1
+# doesn't recognize that allocator option and hard-crashes on CUDA init if it's set.
+os.environ.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+
 import cv2
+import numpy as np
 import torch
 from transformers import WhisperModel
 
@@ -74,15 +81,14 @@ def _avatar_cache_complete(avatar_id):
 
 def _get_avatar(req):
     avatar_id = req["avatar_id"]
-    base = ROOT / "results" / "v15" / "avatars" / avatar_id
     with AVATAR_LOCK:
         avatar = AVATARS.get(avatar_id)
         if avatar is not None:
             avatar.batch_size = int(req.get("batch_size", 20))
             print(f"[musetalk-server] avatar {avatar_id}: HIT/memory", flush=True)
-            avatar_cache_gc.touch(base)
             return avatar
         complete = _avatar_cache_complete(avatar_id)
+        base = ROOT / "results" / "v15" / "avatars" / avatar_id
         if base.exists() and not complete:
             shutil.rmtree(base)
         print(f"[musetalk-server] avatar {avatar_id}: {'HIT' if complete else 'MISS/build'}", flush=True)
@@ -94,7 +100,6 @@ def _get_avatar(req):
             preparation=not complete,
         )
         AVATARS[avatar_id] = avatar
-        avatar_cache_gc.touch(base)
         return avatar
 
 
@@ -163,11 +168,15 @@ def _encode_job(avatar, req, frames, run_dir):
         bbox = avatar.coord_list_cycle[cycle_idx]
         x1, y1, x2, y2 = bbox
         resized = cv2.resize(result.astype("uint8"), (x2 - x1, y2 - y1))
-        return get_image_blending(
+        blended = get_image_blending(
             avatar.frame_list_cycle[cycle_idx], resized, bbox,
             avatar.mask_list_cycle[cycle_idx],
             avatar.mask_coords_list_cycle[cycle_idx],
         )
+        # get_image_blending returns image[:,:,::-1] (BGR<->RGB channel flip) — a negative-stride
+        # VIEW, not contiguous. memoryview(...).cast("B") below requires a contiguous buffer, so
+        # every frame failed here (100% of MuseTalk queue jobs, see queue_worker.log 2026-08-13).
+        return np.ascontiguousarray(blended)
 
     # One FFmpeg pass: raw blended frames -> H.264 + source audio. Avoid hundreds
     # of PNG writes and the former second remux pass.
