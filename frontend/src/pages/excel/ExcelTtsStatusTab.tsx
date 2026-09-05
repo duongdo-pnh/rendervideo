@@ -47,7 +47,7 @@ export function ExcelTtsStatusTab() {
 
   const deadLetterCount = status?.dead_letter.length ?? 0
   const groups = useMemo(() => groupByExcelFile(status?.jobs ?? []), [status])
-  const showGroupHeaders = groups.length > 1
+  const showGroupHeaders = groups.length > 0
   const failedJobs = useMemo(() => (status?.jobs ?? []).filter(isFailed), [status])
 
   const handleRequeue = async () => {

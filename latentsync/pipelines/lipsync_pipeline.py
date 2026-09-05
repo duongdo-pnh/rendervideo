@@ -647,5 +647,10 @@ class LipsyncPipeline(DiffusionPipeline):
 
         sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
 
-        command = f"ffmpeg -y -loglevel error -nostdin -i {synced_path} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -crf 18 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        # Targeted average bitrate instead of CRF (see musetalk_render_server.py for why):
+        # -b:v ~2.9Mbps average, -maxrate/-bufsize cap peaks at 3.2Mbps, staying in 2.5-3Mbps.
+        command = (
+            f"ffmpeg -y -loglevel error -nostdin -i {synced_path} -i {os.path.join(temp_dir, 'audio.wav')} "
+            f"-c:v libx264 -b:v 2900k -maxrate 3200k -bufsize 3200k -c:a aac -q:a 0 {video_out_path}"
+        )
         subprocess.run(command, shell=True)

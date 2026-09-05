@@ -19,7 +19,7 @@ import {
 } from '../../api/jobs'
 import { ApiError } from '../../api/client'
 import { streamUrl, downloadUrl } from '../../api/videos'
-import { formatDateTime, formatDuration } from '../../utils/format'
+import { formatDateTimeParts, formatDuration } from '../../utils/format'
 import { STATUS_ICON, STATUS_LABEL, STATUS_SPIN, STATUS_TONE } from './statusLabels'
 import { PriorityModal } from './PriorityModal'
 import { Badge } from '../../components/Badge'
@@ -64,7 +64,7 @@ export function QueueStatusTab() {
     [jobs],
   )
   const groups = useMemo(() => groupByExcelFile(jobs), [jobs])
-  const showGroupHeaders = groups.length > 1
+  const showGroupHeaders = groups.length > 0
 
   const withBusy = async (id: number, fn: () => Promise<void>) => {
     setBusyId(id)
@@ -214,13 +214,14 @@ export function QueueStatusTab() {
                   { label: 'Ưu tiên', tier: 'min-[1900px]:table-cell' },
                   { label: 'Thời gian render', tier: 'xl:table-cell' },
                   { label: 'Retry', tier: 'min-[1900px]:table-cell' },
-                  { label: 'Tạo lúc', tier: 'min-[1900px]:table-cell' },
+                  { label: 'Ngày tạo', tier: 'xl:table-cell' },
                   { label: 'Lỗi', tier: 'xl:table-cell' },
-                  { label: 'Drive', tier: 'min-[1900px]:table-cell' },
+                  { label: 'Drive', tier: 'xl:table-cell' },
+                  { label: 'Thao tác' },
                 ].map(({ label, tier }) => (
                   <th
                     key={label}
-                    className={`sticky top-0 z-10 whitespace-nowrap border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-2.5 text-xs font-normal uppercase tracking-wide text-slate-500 sm:px-4 ${tier ? `hidden ${tier}` : ''}`}
+                    className={`sticky top-0 z-10 whitespace-nowrap border-b border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 px-2 py-2.5 text-xs font-normal uppercase tracking-wide text-slate-500 sm:px-4 ${label === 'Tên' ? 'w-full' : ''} ${tier ? `hidden ${tier}` : ''}`}
                   >
                     {label}
                   </th>
@@ -320,11 +321,23 @@ export function QueueStatusTab() {
                         {formatDuration(renderSeconds(job), { inProgress: job.status === 'rendering' })}
                       </td>
                       <td className="hidden px-4 py-2 text-xs min-[1900px]:table-cell">{job.retries}</td>
-                      <td className="hidden whitespace-nowrap px-4 py-2 text-xs text-slate-500 min-[1900px]:table-cell">{formatDateTime(job.created_at)}</td>
+                      <td className="hidden whitespace-nowrap px-4 py-2 text-xs text-slate-500 xl:table-cell">
+                        {(() => {
+                          const p = formatDateTimeParts(job.created_at)
+                          return p ? (
+                            <div className="leading-tight">
+                              <div>{p.time}</div>
+                              <div className="text-slate-400">{p.date}</div>
+                            </div>
+                          ) : (
+                            '—'
+                          )
+                        })()}
+                      </td>
                       <td className="hidden max-w-[160px] truncate px-4 py-2 text-xs text-rose-600 dark:text-rose-400 xl:table-cell" title={job.error ?? ''}>
                         {job.error ?? ''}
                       </td>
-                      <td className="hidden px-4 py-2 min-[1900px]:table-cell">
+                      <td className="hidden px-4 py-2 xl:table-cell">
                         {job.drive_link ? (
                           <a href={job.drive_link} target="_blank" rel="noreferrer" className="text-brand-600 dark:text-brand-400">
                             <Cloud className="h-4 w-4" />

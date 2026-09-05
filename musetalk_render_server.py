@@ -254,7 +254,14 @@ def _encode_job(avatar, req, frames, run_dir):
         "-pix_fmt", "bgr24", "-s:v", f"{width}x{height}", "-r", str(fps),
         "-i", "pipe:0", "-i", req["audio_path"],
         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
-        "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+        "-preset", "veryfast",
+        # Targeted average bitrate instead of CRF: CRF lets easy/static scenes
+        # drop well under 1 Mbps, which some delivery platforms reject/flag.
+        # -b:v aims for ~2.9Mbps average; -maxrate/-bufsize cap short-term peaks
+        # at 3.2Mbps so the file stays inside the requested 2.5-3 Mbps band even
+        # for the busiest scenes (verified against a worst-case synthetic clip).
+        "-b:v", "2900k", "-maxrate", "3200k", "-bufsize", "3200k",
+        "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "128k", "-shortest", str(output_path),
     ]
     started = time.monotonic()

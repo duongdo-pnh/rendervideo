@@ -24,6 +24,17 @@ export function formatDateTime(value: string | null | undefined): string {
   })
 }
 
+/** Same as formatDateTime but split into {time, date} so callers can stack them (time on top). */
+export function formatDateTimeParts(value: string | null | undefined): { time: string; date: string } | null {
+  if (!value) return null
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return null
+  return {
+    time: d.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' }),
+    date: d.toLocaleDateString('vi-VN', { day: '2-digit', month: '2-digit', year: 'numeric' }),
+  }
+}
+
 export function formatMb(mb: number | null | undefined): string {
   if (mb == null || Number.isNaN(mb)) return '—'
   if (mb >= 1024) return `${(mb / 1024).toFixed(2)} GB`
