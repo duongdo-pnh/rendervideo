@@ -1,0 +1,119 @@
+"""Auto-starts the background daemons the desktop app needs, so the packaged
+app is genuinely zero-terminal-steps: queue_worker.py (render queue) and
+tts_worker.py (TTS queue).
+
+musetalk_render_server.py is deliberately NOT started here — it already
+auto-starts itself, lazily, the first time a render job actually needs it
+(see musetalk_adapter.py's _ensure_server(), which has its own cross-process
+lock). Duplicating that here would pin ~5.5GB of VRAM before it's needed.
+
+Both queue_worker.py and tts_worker.py already refuse to run a second
+instance (flock-based lock, see their own _acquire_worker_lock()) — so
+spawning them here is always safe to attempt, whether or not one is already
+running (manually, or from a previous launch of this app): the duplicate
+just detects the lock and exits within milliseconds.
+
+Each subprocess gets an EXPLICIT, minimal environment built from scratch
+rather than inheriting this process's via `{**os.environ}`. That blind-
+inheritance pattern is exactly what let a stray env var meant for the main
+venv leak into a MuseTalk subprocess and silently crash ~35 production
+render jobs overnight — building the env from a short allowlist here means
+whatever Tauri/the shell happens to export on THIS process never reaches
+these workers unless it's explicitly named below.
+
+Workers are intentionally fire-and-forget: once spawned they keep running
+even after this backend process exits (they're meant to run 24/7, independent
+of whether the desktop window happens to be open — closing the app should not
+abort an in-progress render). start_new_session=True detaches them from this
+process's session so they never receive a signal sent to it.
+
+That persistence has a cost: a worker holds whatever code was in memory the
+moment it started, forever — Python never hot-reloads an already-imported
+module. After ensure_source() refreshes the source tree for an app update,
+an already-running worker keeps executing the OLD code indefinitely; the
+naive "spawn if the lock is free" check above just detects the lock is
+already held and backs off, leaving the stale process in charge. See
+_kill_stale_worker() below.
+"""
+import os
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+MAIN_PYTHON = ROOT / "venv" / "bin" / "python"
+LOGS_DIR = ROOT / "logs"
+
+_PASSTHROUGH_ENV_VARS = ("HOME", "LANG", "LC_ALL", "TZ", "USER")
+
+_WORKER_SCRIPTS = ("queue_worker.py", "tts_worker.py")
+
+
+def _clean_env() -> dict:
+    env = {k: os.environ[k] for k in _PASSTHROUGH_ENV_VARS if k in os.environ}
+    env["PATH"] = f"{MAIN_PYTHON.parent}:{os.environ.get('PATH', '/usr/bin:/bin')}"
+    return env
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def _kill_stale_worker(script: str) -> None:
+    """If `script`'s currently-running instance (flock PID recorded in its
+    lock file, written by its own _acquire_worker_lock()) acquired that lock
+    before the app's source was last refreshed, it's running code from
+    before the update — SIGTERM it so the spawn below can take over the now-
+    free lock with fresh code.
+
+    Staleness is judged against .bundled-version (written by the Tauri
+    shell's ensure_source() on every source refresh — see desktop/src-tauri/
+    src/lib.rs), NOT script's own mtime: tar preserves original mtimes on
+    extract, so an unmodified file like queue_worker.py keeps an old mtime
+    even in a freshly-extracted tree, while the actual change was in a
+    module it imports (google_drive_upload.py, say) — comparing the whole
+    tree's last-refreshed marker instead of one file catches that case. In a
+    dev checkout (no .bundled-version, never extracted from a bundle) this
+    is always a no-op, which is correct — nothing to compare against.
+    """
+    lock_path = ROOT / f".{script[:-3]}.lock"
+    version_marker = ROOT / ".bundled-version"
+    try:
+        pid = int(lock_path.read_text().strip())
+        stale = version_marker.stat().st_mtime > lock_path.stat().st_mtime
+    except (FileNotFoundError, ValueError, OSError):
+        return
+    if not stale or not _pid_alive(pid):
+        return
+    print(f"[workers] {script} pid={pid} predates the current source — sending SIGTERM")
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    for _ in range(10):
+        time.sleep(0.5)
+        if not _pid_alive(pid):
+            break
+
+
+def start_all() -> None:
+    if not MAIN_PYTHON.is_file():
+        print(f"[workers] {MAIN_PYTHON} not found — skipping auto-start (not installed?)")
+        return
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    for script in _WORKER_SCRIPTS:
+        _kill_stale_worker(script)
+        log_path = LOGS_DIR / f"{script[:-3]}.log"
+        log = open(log_path, "a", buffering=1)
+        subprocess.Popen(
+            [str(MAIN_PYTHON), "-u", script],
+            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+            env=_clean_env(), start_new_session=True, close_fds=True,
+        )
+        print(f"[workers] spawned {script} (log: {log_path})")

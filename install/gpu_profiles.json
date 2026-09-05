@@ -1,0 +1,50 @@
+{
+  "_comment": "Hand-curated GPU-architecture -> venv dependency matrix. Keyed by sm_XX (see detect_gpu.py). Each entry pins BOTH venvs independently because they have separately-pinned, currently-incompatible torch builds (main venv: torch2.7+cu128 for LatentSync; engines/MuseTalk/.venv: torch2.0.1+cu118, per MuseTalk's own upstream README). ONLY add an entry here once it has actually been installed and passed install/smoke_test.py on that hardware -- setup.sh refuses to guess for anything not listed. cu118-era torch generally has no PTX for archs newer than ~Hopper, so a missing 'musetalk' entry for a new architecture is not a version-bump problem -- it likely needs real changes to engines/MuseTalk's own code, budget it as its own task rather than expecting the installer to solve it.",
+
+  "sm_86": {
+    "_label": "Ampere GA102/GA104 (RTX 3080, RTX 3080 Ti, RTX 3090 -- all compute capability 8.6, same pins)",
+    "_validated": true,
+    "_validated_on": [
+      "RTX 3090 -- this machine, full install/setup.sh + smoke_test.py run",
+      "RTX 3080 Ti -- feat/update-3080ti branch (merged 2026-08-14): real production fixes developed/tested on this card against these exact pins"
+    ],
+    "main": {
+      "torch": "2.7.1",
+      "torchvision": "0.22.1",
+      "index_url": "https://download.pytorch.org/whl/cu128"
+    },
+    "musetalk": {
+      "torch": "2.0.1",
+      "torchvision": "0.15.2",
+      "torchaudio": "2.0.2",
+      "index_url": "https://download.pytorch.org/whl/cu118"
+    }
+  },
+
+  "sm_89": {
+    "_label": "Ada Lovelace (e.g. RTX 4090) -- NOT YET VALIDATED, same pins as sm_86 as a starting point only",
+    "_validated": false,
+    "main": {
+      "torch": "2.7.1",
+      "torchvision": "0.22.1",
+      "index_url": "https://download.pytorch.org/whl/cu128"
+    },
+    "musetalk": {
+      "torch": "2.0.1",
+      "torchvision": "0.15.2",
+      "torchaudio": "2.0.2",
+      "index_url": "https://download.pytorch.org/whl/cu118"
+    }
+  },
+
+  "sm_120": {
+    "_label": "Blackwell (e.g. RTX 5090) -- main venv pin per render_job.py's 2026-07-23 comment; NO known-good musetalk pin",
+    "_validated": false,
+    "main": {
+      "torch": "2.7.1",
+      "torchvision": "0.22.1",
+      "index_url": "https://download.pytorch.org/whl/cu128"
+    },
+    "musetalk": null
+  }
+}

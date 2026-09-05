@@ -4,6 +4,7 @@ import inspect
 import math
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, List, Optional, Union
 import subprocess
 
@@ -342,7 +343,7 @@ class LipsyncPipeline(DiffusionPipeline):
                 break
         return n
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         video_path: str,
@@ -562,52 +563,73 @@ class LipsyncPipeline(DiffusionPipeline):
 
         total_written = 0
         pending = None
+
+        def _prep_chunk(global_start, chunk_len):
+            if loop_mode:
+                base_frames, base_faces, base_boxes, base_affines = loop_base
+                idxs = [(global_start + k) % video_len for k in range(chunk_len)]
+                return (base_frames[idxs], base_faces[idxs],
+                        [base_boxes[j] for j in idxs], [base_affines[j] for j in idxs])
+            return _trim_source_window(global_start, chunk_len)
+
         try:
-            for global_start in tqdm.tqdm(chunk_starts, desc="Doing inference..."):
-                if CANCEL.is_set():
-                    raise LatentSyncCancelled("cancelled by user")
-                chunk_len = min(num_frames, num_audio_frames - global_start)
+            with ThreadPoolExecutor(max_workers=1) as prefetcher:
+                if chunk_starts:
+                    current_start = chunk_starts[0]
+                    current_len = min(num_frames, num_audio_frames - current_start)
+                    current_future = prefetcher.submit(_prep_chunk, current_start, current_len)
+                    next_index = 1
 
-                if loop_mode:
-                    base_frames, base_faces, base_boxes, base_affines = loop_base
-                    idxs = [(global_start + k) % video_len for k in range(chunk_len)]
-                    frames_chunk = base_frames[idxs]
-                    faces_chunk = base_faces[idxs]
-                    boxes_chunk = [base_boxes[j] for j in idxs]
-                    affines_chunk = [base_affines[j] for j in idxs]
-                else:
-                    frames_chunk, faces_chunk, boxes_chunk, affines_chunk = _trim_source_window(
-                        global_start, chunk_len
-                    )
+                    while True:
+                        if CANCEL.is_set():
+                            raise LatentSyncCancelled("cancelled by user")
+                        frames_chunk, faces_chunk, boxes_chunk, affines_chunk = current_future.result()
 
-                restored = _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, global_start, chunk_len)
-                if pending is None:
-                    pending = restored
-                else:
-                    ov = min(chunk_overlap, len(pending), len(restored))
-                    if ov:
-                        for frame in pending[:-ov]:
-                            writer.append_data(frame)
-                        total_written += len(pending) - ov
-                        # Cosine crossfade hides the independent diffusion-window boundary.
-                        phase = np.arange(1, ov + 1, dtype=np.float32) / (ov + 1)
-                        w = (0.5 - 0.5 * np.cos(np.pi * phase))[:, None, None, None]
-                        blended = np.clip(pending[-ov:] * (1.0 - w) + restored[:ov] * w, 0, 255).astype(np.uint8)
-                        pending = np.concatenate([blended, restored[ov:]], axis=0)
-                    else:
-                        for frame in pending:
-                            writer.append_data(frame)
-                        total_written += len(pending)
-                        pending = restored
-                # Drop references so the caching allocator REUSES these blocks next chunk (every
-                # chunk allocates identical shapes => VRAM stabilizes after chunk 1, stays bounded).
-                # NOT torch.cuda.empty_cache() per chunk: that returns blocks to the driver and forces
-                # a re-allocation + sync each chunk — ~4x slowdown for no memory benefit here.
-                del restored, faces_chunk, frames_chunk
-            if pending is not None:
-                for frame in pending:
-                    writer.append_data(frame)
-                total_written += len(pending)
+                        # Start preparing N+1 before GPU inference for N. Frame decoding,
+                        # cache slicing and (without an avatar cache) face alignment now
+                        # overlap the current UNet pass without changing temporal order.
+                        next_future = None
+                        next_start = None
+                        next_len = None
+                        if next_index < len(chunk_starts):
+                            next_start = chunk_starts[next_index]
+                            next_len = min(num_frames, num_audio_frames - next_start)
+                            next_future = prefetcher.submit(_prep_chunk, next_start, next_len)
+
+                        restored = _run_chunk(faces_chunk, frames_chunk, boxes_chunk, affines_chunk, current_start, current_len)
+
+                        if pending is None:
+                            pending = restored
+                        else:
+                            ov = min(chunk_overlap, len(pending), len(restored))
+                            if ov:
+                                for frame in pending[:-ov]:
+                                    writer.append_data(frame)
+                                total_written += len(pending) - ov
+                                # Cosine crossfade hides the independent diffusion-window boundary.
+                                phase = np.arange(1, ov + 1, dtype=np.float32) / (ov + 1)
+                                w = (0.5 - 0.5 * np.cos(np.pi * phase))[:, None, None, None]
+                                blended = np.clip(pending[-ov:] * (1.0 - w) + restored[:ov] * w, 0, 255).astype(np.uint8)
+                                pending = np.concatenate([blended, restored[ov:]], axis=0)
+                            else:
+                                for frame in pending:
+                                    writer.append_data(frame)
+                                total_written += len(pending)
+                                pending = restored
+
+                        del restored, faces_chunk, frames_chunk
+
+                        if next_future is None:
+                            break
+                        current_start = next_start
+                        current_len = next_len
+                        current_future = next_future
+                        next_index += 1
+
+                if pending is not None:
+                    for frame in pending:
+                        writer.append_data(frame)
+                    total_written += len(pending)
         except Exception:
             writer.close()
             if os.path.exists(synced_path):

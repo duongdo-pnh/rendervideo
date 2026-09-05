@@ -1,0 +1,712 @@
+from __future__ import annotations
+
+import heapq
+import itertools
+import math
+import os
+import queue
+import shutil
+import tempfile
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Iterable
+
+import numpy as np
+
+from .models import SessionState, StreamConfig, StreamMetrics
+from .output import StreamOutput
+
+
+@dataclass(order=True)
+class SentenceRequest:
+    sort_key: tuple[int, int] = field(init=False, repr=False)
+    priority: int = field(compare=False)
+    sequence: int = field(compare=False)
+    request_id: str = field(compare=False)
+    audio_path: str = field(compare=False)
+    delete_after_use: bool = field(default=False, compare=False)
+    prebuffer_before_play: bool = field(default=False, compare=False)
+    queued_at: float = field(default_factory=time.monotonic, compare=False)
+    total_frames: int = field(default=0, compare=False)
+    rendered_frames: int = field(default=0, compare=False)
+    played_frames: int = field(default=0, compare=False)
+    start_frame: int = field(default=0, compare=False)
+    freeze_frame_index: int | None = field(default=None, compare=False)
+    start_driver_frame_index: int | None = field(default=None, compare=False)
+
+    def __post_init__(self) -> None:
+        self.sort_key = (-self.priority, self.sequence)
+
+
+@dataclass
+class AVPacket:
+    request_id: str
+    pcm: np.ndarray
+    frame: np.ndarray | None = None
+    frame_path: str | None = None
+    driver_frame_index: int | None = None
+
+
+Producer = Callable[
+    [SentenceRequest, Callable[[np.ndarray, np.ndarray], None], threading.Event],
+    None,
+]
+EventCallback = Callable[[str, str, dict], None]
+
+
+def half_frame_threshold(total_frames: int, fallback: int) -> int:
+    return max(1, math.ceil(total_frames / 2)) if total_frames > 0 else fallback
+
+
+class StreamSession:
+    """Owns one realtime playout clock and its bounded sentence/AV queues."""
+
+    def __init__(
+        self,
+        config: StreamConfig,
+        output: StreamOutput,
+        idle_frames: Iterable[np.ndarray],
+        producer: Producer,
+        event_callback: EventCallback | None = None,
+    ):
+        self.config = config
+        self.output = output
+        self.metrics = StreamMetrics()
+        self._idle_frames = [self._normalize_frame(frame) for frame in idle_frames]
+        if not self._idle_frames:
+            raise ValueError("at least one idle frame is required")
+        self._producer = producer
+        self._event_callback = event_callback or (lambda *_: None)
+        self._state = SessionState.CREATED
+        self._state_lock = threading.RLock()
+        self._sentence_heap: list[SentenceRequest] = []
+        self._sentence_ids: set[str] = set()
+        self._sentence_cv = threading.Condition()
+        self._sequence = itertools.count()
+        self._prebuffer_request_ids: set[str] = set()
+        # Keep rendered BGR frames in a bounded RAM queue. Spooling every frame
+        # through JPEG costs CPU, disk I/O and one lossy encode/decode cycle.
+        # The bound preserves backpressure for unusually long inputs.
+        self._packet_dir = tempfile.mkdtemp(prefix=f"musetalk-{config.session_id}-")
+        self._packet_sequence = itertools.count()
+        self._packets: queue.Queue[AVPacket] = queue.Queue(
+            maxsize=max(1, config.video_queue_frames)
+        )
+        self._stop = threading.Event()
+        self._cancel_current = threading.Event()
+        self._render_complete = threading.Event()
+        self._current: SentenceRequest | None = None
+        self._render_thread: threading.Thread | None = None
+        self._playout_thread: threading.Thread | None = None
+        self._last_frame = self._idle_frames[0]
+        self._last_driver_frame_index = 0
+        self._preview_lock = threading.Lock()
+        self._preview_frame = self._last_frame.copy()
+        self._video_pts = 0
+        self._audio_pts = 0
+        self._active_audio_request_id: str | None = None
+        self._last_audio_sample = 0
+        self._fade_in_left = 0      # còn bao nhiêu mẫu nữa mới hết vuốt-vào câu mới
+        self._fade_in_total = 0
+        # Mẫu PCM thừa của khung trước, chuyển sang khung sau. Nếu không có nó thì
+        # mỗi khung lệch 1 mẫu sẽ bị chèn số 0 hoặc bị cắt -> xung nhọn -> rè rẹt.
+        self._pcm_carry = np.empty(0, dtype=np.int16)
+        # Khung nền CUỐI CÙNG thực sự đang nằm trong hàng đợi. Câu nào không được
+        # chỉ định điểm bắt đầu thì nối tiếp ngay sau nó. KHÔNG dùng frame_cursor
+        # phía render: con trỏ đó đếm cả khung đã dựng rồi BỊ XÉN BỎ, nên câu
+        # resume nhảy vọt lên trước và sai số cộng dồn qua mỗi lần cắt ngang.
+        self._last_emitted_driver_index: int | None = None
+
+    @property
+    def state(self) -> SessionState:
+        with self._state_lock:
+            return self._state
+
+    def _set_state(self, state: SessionState) -> None:
+        with self._state_lock:
+            if self._state not in {SessionState.STOPPING, SessionState.STOPPED}:
+                self._state = state
+
+    def _normalize_frame(self, frame: np.ndarray) -> np.ndarray:
+        import cv2
+
+        if frame is None or frame.ndim != 3 or frame.shape[2] != 3:
+            raise ValueError("idle frame must be an HxWx3 numpy array")
+        if frame.shape[1] != self.config.width or frame.shape[0] != self.config.height:
+            source_h, source_w = frame.shape[:2]
+            scale = min(self.config.width / source_w, self.config.height / source_h)
+            target_w = max(2, int(round(source_w * scale)) // 2 * 2)
+            target_h = max(2, int(round(source_h * scale)) // 2 * 2)
+            resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_AREA)
+            canvas = np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
+            x = (self.config.width - target_w) // 2
+            y = (self.config.height - target_h) // 2
+            canvas[y:y + target_h, x:x + target_w] = resized
+            frame = canvas
+        return np.ascontiguousarray(frame, dtype=np.uint8)
+
+    def start(self) -> None:
+        if self.state is not SessionState.CREATED:
+            raise RuntimeError("session has already been started")
+        self._set_state(SessionState.STARTING)
+        self.output.start(
+            self.config.width, self.config.height,
+            self.config.fps, self.config.sample_rate,
+        )
+        self._render_thread = threading.Thread(
+            target=self._render_loop, name=f"render-{self.config.session_id}", daemon=True,
+        )
+        self._playout_thread = threading.Thread(
+            target=self._playout_loop, name=f"playout-{self.config.session_id}", daemon=True,
+        )
+        self._render_thread.start()
+        self._playout_thread.start()
+        self._set_state(SessionState.IDLE)
+
+    def enqueue(
+        self, request_id: str, audio_path: str, priority: int = 0, interrupt: bool = False,
+        delete_after_use: bool = False,
+    ) -> None:
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
+            raise RuntimeError("session is not accepting requests")
+        start_driver_frame_index = self._last_driver_frame_index if interrupt else None
+        if interrupt:
+            start_driver_frame_index = self.interrupt(
+                clear_pending=False, resume_current=True
+            )
+        with self._sentence_cv:
+            if request_id in self._sentence_ids or (
+                self._current is not None and self._current.request_id == request_id
+            ):
+                raise ValueError(f"duplicate request_id: {request_id}")
+            if len(self._sentence_heap) >= self.config.sentence_queue_size:
+                raise queue.Full("sentence queue is full")
+            request = SentenceRequest(
+                priority=int(priority), sequence=next(self._sequence),
+                request_id=request_id, audio_path=audio_path,
+                delete_after_use=bool(delete_after_use),
+                start_driver_frame_index=start_driver_frame_index,
+            )
+            heapq.heappush(self._sentence_heap, request)
+            self._sentence_ids.add(request_id)
+            self._sentence_cv.notify()
+        self._event_callback(request_id, "queued", {})
+
+    def enqueue_batch(self, requests: list[tuple[str, str, int, bool]], interrupt: bool = False) -> None:
+        """Queue ordered voice chunks for pipelined render and continuous playout."""
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED, SessionState.FAILED}:
+            raise RuntimeError("session is not accepting requests")
+        start_driver_frame_index = self._last_driver_frame_index if interrupt else None
+        if interrupt:
+            start_driver_frame_index = self.interrupt(
+                clear_pending=False, resume_current=True
+            )
+        with self._sentence_cv:
+            ids = [request_id for request_id, _, _, _ in requests]
+            if not ids or len(ids) != len(set(ids)):
+                raise ValueError("invalid batch request_ids")
+            if any(request_id in self._sentence_ids or (
+                self._current is not None and self._current.request_id == request_id
+            ) for request_id in ids):
+                raise ValueError("duplicate request_id")
+            if len(self._sentence_heap) + len(requests) > self.config.sentence_queue_size:
+                raise queue.Full("sentence queue is full")
+            for request_id, audio_path, priority, delete_after_use in requests:
+                request = SentenceRequest(
+                    priority=int(priority), sequence=next(self._sequence), request_id=request_id,
+                    audio_path=audio_path, delete_after_use=bool(delete_after_use),
+                    prebuffer_before_play=False,
+                    start_driver_frame_index=start_driver_frame_index,
+                )
+                heapq.heappush(self._sentence_heap, request)
+                self._sentence_ids.add(request_id)
+            self._sentence_cv.notify_all()
+        for request_id in ids:
+            self._event_callback(request_id, "queued", {"prebuffer": False})
+
+    @staticmethod
+    def _cleanup_request(request: SentenceRequest) -> None:
+        if request.delete_after_use:
+            try:
+                os.unlink(request.audio_path)
+            except FileNotFoundError:
+                pass
+
+    def interrupt(
+        self, clear_pending: bool = True, resume_current: bool = False
+    ) -> int | None:
+        next_driver_frame_index: int | None = None
+        with self._sentence_cv:
+            pending = list(self._sentence_heap) if clear_pending else []
+            if clear_pending:
+                self._sentence_heap.clear()
+                for request in pending:
+                    self._sentence_ids.discard(request.request_id)
+            current = self._current
+            buffered_current_frames = 0
+            if resume_current and current is not None:
+                # Xén TRƯỚC khi đếm: chỉ những frame còn sống mới thực sự được
+                # phát, nên câu resume phải nối tiếp đúng sau chúng.
+                # Không bao giờ xén xuống dưới warmup_frames: dưới ngưỡng đó
+                # playout coi như chưa đủ đệm, ngừng lấy frame và chiếu idle.
+                self._trim_packets(
+                    max(self.config.interrupt_cover_frames, self.config.warmup_frames)
+                )
+                queued_driver_indices = []
+                with self._packets.mutex:
+                    for packet in self._packets.queue:
+                        # Khung nền cho câu mới phải nối tiếp khung CUỐI CÙNG còn
+                        # trong hàng đợi, BẤT KỂ của câu nào. Lọc theo _current là
+                        # sai: _current là câu đang RENDER, còn hàng đợi chứa câu
+                        # đang PHÁT — hai thứ lệch nhau suốt 5s cuối mỗi câu (lúc
+                        # render đã xong và nhảy sang bài kế). Lọc trúng lúc đó ra
+                        # rỗng -> tụt về _last_driver_frame_index -> thân người
+                        # giật lùi đúng bằng số khung nền che.
+                        if packet.driver_frame_index is not None:
+                            queued_driver_indices.append(packet.driver_frame_index)
+                        if packet.request_id == current.request_id:
+                            buffered_current_frames += 1
+                if queued_driver_indices:
+                    next_driver_frame_index = queued_driver_indices[-1] + 1
+                else:
+                    next_driver_frame_index = self._last_driver_frame_index + 1
+            if (
+                resume_current
+                and current is not None
+                and (
+                    current.total_frames == 0
+                    or current.played_frames < current.total_frames
+                )
+            ):
+                # Keep ownership of the uploaded audio with the resumed request.
+                # The interrupted render must not delete it in its finally block.
+                delete_after_resume = current.delete_after_use
+                current.delete_after_use = False
+                resume_sequence = next(self._sequence)
+                resume_id = f"{current.request_id}:resume-{resume_sequence}"
+                resumed = SentenceRequest(
+                    priority=current.priority,
+                    sequence=resume_sequence,
+                    request_id=resume_id,
+                    audio_path=current.audio_path,
+                    delete_after_use=delete_after_resume,
+                    start_frame=max(
+                        current.start_frame,
+                        current.start_frame + current.played_frames + buffered_current_frames,
+                    ),
+                )
+                heapq.heappush(self._sentence_heap, resumed)
+                self._sentence_ids.add(resume_id)
+                self._event_callback(
+                    current.request_id,
+                    "paused",
+                    {
+                        "played_frames": current.played_frames,
+                        "resume_request_id": resume_id,
+                    },
+                )
+            self._cancel_current.set()
+            self._prebuffer_request_ids.clear()
+            if not resume_current:
+                self._discard_packets()
+            self._sentence_cv.notify_all()
+        for request in pending:
+            self._cleanup_request(request)
+            self._event_callback(request.request_id, "interrupted", {"pending": True})
+        return next_driver_frame_index
+
+    def _trim_packets(self, keep: int) -> None:
+        """Giữ lại ``keep`` packet ĐẦU hàng đợi, bỏ phần còn lại.
+
+        Dùng khi comment cắt ngang: phần giữ lại đủ che hình/tiếng trong lúc câu
+        trả lời đang dựng (~0,5s), còn phát nốt cả buffer thì người xem phải đợi
+        hết mới nghe được câu trả lời.
+        """
+        drained: list[AVPacket] = []
+        while True:
+            try:
+                drained.append(self._packets.get_nowait())
+            except queue.Empty:
+                break
+        kept = drained[:keep]
+        # VUỐT NHỎ DẦN đuôi phần giữ lại: câu nền tắt êm thay vì đứt phựt giữa từ.
+        fade = max(1, self.config.sample_rate * self.config.transition_fade_ms // 1000)
+        offset = 0                             # số mẫu nằm SAU packet này, tính từ cuối phần giữ lại
+        for packet in reversed(kept):          # đi ngược từ packet cuối về trước
+            if offset >= fade:
+                break                          # ra khỏi vùng vuốt -> giữ nguyên âm lượng
+            size = packet.pcm.size
+            if not size:
+                continue
+            # mẫu càng gần CUỐI thì càng nhỏ: khoảng cách tới cuối / fade
+            distance = offset + np.arange(size - 1, -1, -1, dtype=np.float32)
+            gain = np.clip(distance / fade, 0.0, 1.0)
+            packet.pcm = np.rint(packet.pcm.astype(np.float32) * gain).astype(np.int16)
+            offset += size
+        for index, packet in enumerate(drained):
+            # Luồng playout có thể đã lấp lại chỗ trong lúc ta rút ra; put_nowait
+            # thất bại thì bỏ luôn packet đó chứ không chặn ở đây.
+            if index < keep:
+                try:
+                    self._packets.put_nowait(packet)
+                    continue
+                except queue.Full:
+                    pass
+            frame_path = getattr(packet, "frame_path", None)
+            if frame_path:
+                try:
+                    os.unlink(frame_path)
+                except FileNotFoundError:
+                    pass
+            self.metrics.increment("dropped_frames")
+        self._resync_driver_cursor()
+
+    def _resync_driver_cursor(self) -> None:
+        """Đưa con trỏ khung nền về đúng frame CUỐI còn sống trong hàng đợi.
+
+        Bắt buộc gọi sau mỗi lần xén/xả, nếu không câu kế sẽ nối tiếp từ những
+        frame vừa bị vứt -> avatar nhảy vọt, và lệch cộng dồn qua từng lần cắt.
+        """
+        with self._packets.mutex:
+            tail = [
+                packet.driver_frame_index for packet in self._packets.queue
+                if packet.driver_frame_index is not None
+            ]
+        self._last_emitted_driver_index = tail[-1] if tail else self._last_driver_frame_index
+
+    def _discard_packets(self) -> None:
+        while True:
+            try:
+                packet = self._packets.get_nowait()
+                frame_path = getattr(packet, "frame_path", None)
+                if frame_path:
+                    try:
+                        os.unlink(frame_path)
+                    except FileNotFoundError:
+                        pass
+                self.metrics.increment("dropped_frames")
+            except queue.Empty:
+                break
+        self._resync_driver_cursor()
+
+    def _emit(
+        self, frame: np.ndarray, pcm: np.ndarray, driver_frame_index: int | None = None
+    ) -> None:
+        if self._current is None:
+            return
+        frame = self._normalize_frame(frame)
+        pcm = np.ascontiguousarray(pcm, dtype=np.int16).reshape(-1)
+        if self._stop.is_set() or self._cancel_current.is_set():
+            return
+        packet = AVPacket(
+            request_id=self._current.request_id,
+            pcm=pcm,
+            frame=frame,
+            driver_frame_index=driver_frame_index,
+        )
+        while not self._stop.is_set() and not self._cancel_current.is_set():
+            try:
+                self._packets.put(packet, timeout=0.2)
+                break
+            except queue.Full:
+                continue
+        else:
+            return
+        if driver_frame_index is not None:
+            self._last_emitted_driver_index = driver_frame_index
+        buffered = self._packets.qsize()
+        self._current.rendered_frames += 1
+        self.metrics.update(
+            video_buffer_frames=buffered,
+            audio_buffer_ms=buffered * 1000 / self.config.fps,
+        )
+
+    def _render_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._sentence_cv:
+                while not self._sentence_heap and not self._stop.is_set():
+                    self._sentence_cv.wait(timeout=0.5)
+                if self._stop.is_set():
+                    return
+                request = heapq.heappop(self._sentence_heap)
+                self._sentence_ids.discard(request.request_id)
+            # Câu chưa được chỉ định điểm bắt đầu (các câu resume) thì nối tiếp
+            # ngay sau frame CUỐI còn trong hàng đợi — không để producer tự lấy
+            # frame_cursor, vì con trỏ đó tính cả frame đã bị xén bỏ.
+            if (request.start_driver_frame_index is None
+                    and self._last_emitted_driver_index is not None):
+                request.start_driver_frame_index = self._last_emitted_driver_index + 1
+            self._current = request
+            self._cancel_current.clear()
+            self._render_complete.clear()
+            self._set_state(SessionState.BUFFERING)
+            self._event_callback(request.request_id, "buffering", {})
+            started = time.monotonic()
+            try:
+                result = self._producer(request, self._emit, self._cancel_current) or {}
+                if isinstance(result, dict):
+                    self.metrics.update(
+                        inference_frames=self.metrics.inference_frames + int(result.get("frames", 0)),
+                        gpu_batch_ms=float(result.get("gpu_batch_ms", 0.0)),
+                        blend_ms=float(result.get("blend_ms", 0.0)),
+                        gpu_memory_bytes=int(result.get("gpu_memory_bytes", 0)),
+                    )
+                event = "interrupted" if self._cancel_current.is_set() else "completed"
+                self._event_callback(request.request_id, event, {})
+            except Exception as exc:
+                self._event_callback(
+                    request.request_id, "failed",
+                    {"error": f"{type(exc).__name__}: {exc}"},
+                )
+            finally:
+                elapsed = time.monotonic() - started
+                self.metrics.update(inference_seconds=self.metrics.inference_seconds + elapsed)
+                self._render_complete.set()
+                self._cleanup_request(request)
+                if request.prebuffer_before_play:
+                    with self._sentence_cv:
+                        self._prebuffer_request_ids.discard(request.request_id)
+                # Safe pre-render: as soon as A has generated every frame, the
+                # GPU immediately starts B.  OBS keeps consuming A's packets in
+                # parallel.  Waiting for A to finish playing wastes the only
+                # available overlap; switching at 70% generation would drop
+                # A's missing 30% frames and visibly freeze the mouth.
+                self._current = None
+                self._cancel_current.clear()
+                if not self._stop.is_set():
+                    self._set_state(SessionState.IDLE)
+
+    def _ready_to_play(self) -> bool:
+        with self._sentence_cv:
+            if self._prebuffer_request_ids:
+                return False
+        # Realtime mode starts as soon as the configured small frame buffer is
+        # available. It no longer waits for half of the complete sentence.
+        threshold = max(1, self.config.warmup_frames)
+        return (
+            self._packets.qsize() >= threshold
+            or (self._render_complete.is_set() and not self._packets.empty())
+        )
+
+    def _playout_loop(self) -> None:
+        epoch = time.monotonic()
+        idle_index = 0
+        active_request_id: str | None = None
+        ended_request_id: str | None = None
+        while not self._stop.is_set():
+            deadline = epoch + self._video_pts / self.config.fps
+            delay = deadline - time.monotonic()
+            if delay > 0 and self._stop.wait(delay):
+                break
+            packet = None
+            # warmup_frames CHỈ để chờ đủ đệm lúc BẮT ĐẦU, không được áp lại giữa
+            # chừng. Sau khi cắt ngang, hàng đợi bị xén còn ~45 và trạng thái đã
+            # chuyển BUFFERING, nên khi vơi xuống dưới 30 thì cả hai điều kiện cũ
+            # đều sai -> vòng phát NGỪNG lấy khung dù trong hàng đợi vẫn còn.
+            # Đo trên live: đứng hình 0,16-0,22s ở CẢ 3/3 lần cắt ngang.
+            # Đã phát rồi (active_request_id khác None) thì cứ lấy tiếp: còn khung
+            # nào phát khung đó, hết thật thì nhánh dưới tự giữ khung cuối.
+            if (self._ready_to_play() or self.state is SessionState.PLAYING
+                    or active_request_id is not None):
+                try:
+                    packet = self._packets.get_nowait()
+                except queue.Empty:
+                    packet = None
+            if packet is not None:
+                if active_request_id != packet.request_id:
+                    active_request_id = packet.request_id
+                    ended_request_id = None
+                    self.output.begin_request(packet.request_id)
+                    self._set_state(SessionState.PLAYING)
+                    self.metrics.update(
+                        time_to_first_frame_ms=round(
+                            (time.monotonic() - (
+                                self._current.queued_at if self._current else time.monotonic()
+                            )) * 1000, 2
+                        )
+                    )
+                    self._event_callback(packet.request_id, "started", {})
+                frame = getattr(packet, "frame", None)
+                frame_path = getattr(packet, "frame_path", None)
+                if frame is None and frame_path:
+                    import cv2
+
+                    frame = cv2.imread(frame_path, cv2.IMREAD_COLOR)
+                if frame_path:
+                    try:
+                        os.unlink(frame_path)
+                    except FileNotFoundError:
+                        pass
+                if frame is None:
+                    self.metrics.increment("dropped_frames")
+                    continue
+                pcm = packet.pcm
+                if packet.driver_frame_index is not None:
+                    self._last_driver_frame_index = packet.driver_frame_index
+                if self._current is not None and self._current.request_id == packet.request_id:
+                    self._current.played_frames += 1
+                self._last_frame = frame
+            else:
+                # Keep the last live frame whenever playout has already begun.
+                # Rendering the next sentence can briefly leave the packet
+                # queue empty after the previous render has completed (and
+                # ``_current`` may already point at the next request or be
+                # None). Falling back to idle here creates a visible flash and
+                # can make OBS treat the source as disconnected/default scene.
+                # Đã phát được rồi thì TUYỆT ĐỐI không quay lại idle_frames giữa
+                # chừng — idle là khung đầu video mẫu, chiếu vào là avatar nhảy
+                # sang tư thế khác. Giữ khung cuối (đứng hình) luôn đỡ hơn nhảy.
+                # Không xét state ở đây: lúc render nhận câu mới state đã chuyển
+                # BUFFERING dù playout vẫn đang phát bình thường.
+                if active_request_id is not None:
+                    frame = self._last_frame
+                else:
+                    frame = self._idle_frames[idle_index % len(self._idle_frames)]
+                    idle_index += 1
+                    active_request_id = None
+                    if (
+                        self.state is SessionState.PLAYING
+                        and self._current is None
+                        and self._packets.empty()
+                    ):
+                        self._set_state(SessionState.IDLE)
+                pcm = np.empty(0, dtype=np.int16)
+            # A 16 kHz clock does not divide evenly by every video FPS (15 FPS
+            # alternates 1067/1066 samples). Fit each audio packet to the exact
+            # rational boundary so long sessions cannot drift out of sync.
+            expected_audio_pts = round(
+                (self._video_pts + 1) * self.config.sample_rate / self.config.fps
+            )
+            expected_samples = max(1, expected_audio_pts - self._audio_pts)
+            # produce_sentence cắt PCM theo chỉ số TRONG CÂU, còn chỗ này đòi theo
+            # bộ đếm TOÀN CỤC — hai pha lệch nhau ở 2/3 số câu, mỗi giây lệch ~20
+            # khung. Cắt/chèn-0 theo từng khung như trước là tạo 20 xung nhọn mỗi
+            # giây => nghe rè rẹt tạch tạch. Giữ phần thừa lại cho khung sau thì
+            # dòng tiếng liền mạch, không mất và không thêm mẫu nào.
+            if self._pcm_carry.size:
+                pcm = np.concatenate((self._pcm_carry, pcm))
+                self._pcm_carry = np.empty(0, dtype=np.int16)
+            if pcm.size > expected_samples:
+                self._pcm_carry = pcm[expected_samples:].copy()
+                pcm = pcm[:expected_samples]
+            elif pcm.size < expected_samples:
+                # thiếu thật (đang đói khung / im lặng) -> đành đệm 0
+                pcm = np.pad(pcm, (0, expected_samples - pcm.size))
+            # Đổi câu -> VUỐT VÀO cho câu mới. Câu bị cắt thường dừng ở khoảng
+            # lặng, còn câu mới mở đầu bằng âm tiết nhấn rất to; ghép thẳng nghe
+            # như bị "nhảy". Vuốt trải dài nhiều packet nên phải giữ trạng thái
+            # qua từng vòng, không gói gọn trong 1 packet như bản cũ.
+            request_id = packet.request_id if packet is not None else None
+            if request_id is not None:
+                # CHỈ vuốt khi sang câu THỰC SỰ KHÁC. Hai bẫy phải tránh:
+                #  - "X:resume-5" / "X:resume-5:resume-9" vẫn là ĐANG ĐỌC TIẾP câu X
+                #    (bị comment cắt nhiều lần). Vuốt ở đây là giọng nhỏ đi giữa từ.
+                #  - packet None (hàng đợi hụt 1 nhịp) KHÔNG phải đổi câu; tính vào
+                #    là mỗi lần hụt lại vuốt thêm một lần nữa.
+                base = request_id.split(":resume-")[0]
+                if base != self._active_audio_request_id:
+                    self._fade_in_total = max(
+                        1, self.config.sample_rate * self.config.transition_fade_ms // 1000
+                    )
+                    self._fade_in_left = self._fade_in_total
+                    self._active_audio_request_id = base
+            if self._fade_in_left > 0 and pcm.size:
+                n = min(pcm.size, self._fade_in_left)
+                done = self._fade_in_total - self._fade_in_left
+                weights = (
+                    np.arange(done + 1, done + n + 1, dtype=np.float32)
+                    / self._fade_in_total
+                )
+                pcm = pcm.copy()
+                pcm[:n] = np.rint(pcm[:n].astype(np.float32) * weights).astype(np.int16)
+                self._fade_in_left -= n
+            self._last_audio_sample = int(pcm[-1]) if pcm.size else 0
+            with self._preview_lock:
+                self._preview_frame = frame.copy()
+            try:
+                self.output.push_video_frame(frame, pts=self._video_pts)
+                self.output.push_audio_frame(pcm, pts=self._audio_pts)
+            except Exception:
+                self._set_state(SessionState.RECONNECTING)
+            self._video_pts += 1
+            self._audio_pts += pcm.size
+            if (packet is not None and self._render_complete.is_set()
+                    and self._packets.empty() and ended_request_id != packet.request_id):
+                self.output.end_request(packet.request_id)
+                ended_request_id = packet.request_id
+            buffered = self._packets.qsize()
+            drift = (
+                self._video_pts / self.config.fps
+                - self._audio_pts / self.config.sample_rate
+            ) * 1000
+            self.metrics.increment("output_frames")
+            self.metrics.update(
+                video_buffer_frames=buffered,
+                audio_buffer_ms=buffered * 1000 / self.config.fps,
+                av_drift_ms=drift,
+                reconnect_count=self.output.get_status().get("reconnect_count", 0),
+            )
+
+    def get_preview_frame(self) -> np.ndarray:
+        """Return the latest frame sent to the streaming output."""
+        with self._preview_lock:
+            return self._preview_frame.copy()
+
+    def get_status(self) -> dict:
+        transport = self.output.get_status()
+        current = self._current.request_id if self._current else None
+        total = self._current.total_frames if self._current else 0
+        rendered = self._current.rendered_frames if self._current else 0
+        played = self._current.played_frames if self._current else 0
+        progress = round(played * 100 / total, 1) if total else 0.0
+        return {
+            "session_id": self.config.session_id,
+            "status": self.state.value,
+            "avatar_id": self.config.avatar_id,
+            "width": self.config.width,
+            "height": self.config.height,
+            "fps": self.config.fps,
+            "output_fps_target": self.config.output_fps or self.config.fps,
+            "transport": (
+                "relive" if self.output.__class__.__name__ == "ReLiveClipOutput"
+                else getattr(self.output, "_scheme", "rtmp")
+            ),
+            "transport_running": bool(transport.get("running")),
+            "transport_reconnecting": bool(transport.get("reconnecting")),
+            "transport_last_error": transport.get("last_error"),
+            "audio_delay_ms": self.config.audio_delay_ms,
+            "current_request_id": current,
+            "audio_total_frames": total,
+            "audio_rendered_frames": rendered,
+            "audio_played_frames": played,
+            "audio_progress_percent": progress,
+            "audio_total_seconds": round(total / self.config.fps, 2) if total else 0.0,
+            "audio_played_seconds": round(played / self.config.fps, 2),
+            "sentence_queue_size": len(self._sentence_heap),
+            "prebuffer_requests": len(self._prebuffer_request_ids),
+            **self.metrics.snapshot(),
+        }
+
+    def stop(self) -> None:
+        if self.state in {SessionState.STOPPING, SessionState.STOPPED}:
+            return
+        with self._state_lock:
+            self._state = SessionState.STOPPING
+        self._stop.set()
+        self._cancel_current.set()
+        with self._sentence_cv:
+            pending = list(self._sentence_heap)
+            self._sentence_heap.clear()
+            self._sentence_ids.clear()
+            self._sentence_cv.notify_all()
+        for request in pending:
+            self._cleanup_request(request)
+        for thread in (self._render_thread, self._playout_thread):
+            if thread is not None and thread is not threading.current_thread():
+                thread.join(timeout=5)
+        self._discard_packets()
+        shutil.rmtree(self._packet_dir, ignore_errors=True)
+        self.output.stop()
+        with self._state_lock:
+            self._state = SessionState.STOPPED

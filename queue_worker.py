@@ -9,6 +9,7 @@ Run with:  conda activate latentsync && python queue_worker.py
 """
 import fcntl
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -16,6 +17,7 @@ import sys
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +28,7 @@ if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
 import database as db
+import dashboard_reporter
 
 # Google Drive auto-upload là tùy chọn: thiếu thư viện google-* thì worker vẫn chạy bình thường.
 try:
@@ -44,10 +47,22 @@ WORKER_LOCK_PATH = ROOT / ".queue_worker.lock"
 POLL_SECONDS = 5            # idle poll interval when the queue is empty
 BACKUP_INTERVAL = 6 * 3600  # SQLite backup cadence
 BACKUP_KEEP = 8             # keep this many most-recent backups
+RENDER_CLEANUP_INTERVAL = 24 * 3600  # how often to sweep for stale renders
+RENDER_RETENTION_DAYS = 10           # delete 'done' output video this long after finished_at
+MUSETALK_AVATARS_VIDEO_DIR = ROOT / "engines" / "MuseTalk" / "results" / "v15" / "avatars_video"
+MUSETALK_CACHE_RETENTION_DAYS = 3    # delete a video-render avatar cache this long after last use
 GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claiming a job
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
 RENDER_IDLE_TIMEOUT = 20 * 60  # no new log output this long means the renderer is genuinely stuck
 RENDER_POLL_SECONDS = 5
+MUSETALK_BATCH_COLLECT_SECONDS = 10
+MUSETALK_BATCH_POLL_SECONDS = 0.5
+
+
+class JobCancelled(Exception):
+    """Raised out of _run_render() when the DB's cancel_requested flag is seen mid-render —
+    caught separately from a real render failure so the job lands as 'cancelled', not
+    retried/'failed'."""
 
 _RUNNING = True
 _WORKER_LOCK_FILE = None
@@ -127,18 +142,28 @@ def _ffprobe_duration(path):
         return 0.0
 
 
-def normalize_video(src, work_dir):
+def normalize_video(src, work_dir, out_res=None):
     """Re-encode to 25fps via NVENC (GPU). Falls back to libx264 if NVENC fails."""
     dst = str(Path(work_dir) / "norm_video.mp4")
+    target = {"1080": 1080, "720": 720, "480 Nhanh": 480}.get(out_res)
+    vf = []
+    if target:
+        vf.append(
+            f"scale=\x27if(gt(iw,ih),-2,min(iw,{target}))\x27:"
+            f"\x27if(gt(iw,ih),min(ih,{target}),-2)\x27"
+        )
+    vf.append("fps=25")
+    video_filter = ",".join(vf)
     nvenc = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-             "-r", "25", "-c:v", "h264_nvenc", "-preset", "p4", "-cq", "19",
+             "-vf", video_filter, "-c:v", "h264_nvenc", "-preset", "p1",
+             "-tune", "ll", "-cq", "19",
              "-pix_fmt", "yuv420p", "-an", dst]
     r = subprocess.run(nvenc, capture_output=True, text=True)
     if r.returncode == 0:
         return dst
     _log(f"NVENC failed ({r.stderr.strip()[:200]}); falling back to libx264")
     x264 = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
-            "-r", "25", "-c:v", "libx264", "-crf", "18", "-preset", "medium",
+            "-vf", video_filter, "-c:v", "libx264", "-crf", "18", "-preset", "veryfast",
             "-pix_fmt", "yuv420p", "-an", dst]
     subprocess.run(x264, check=True)
     return dst
@@ -169,7 +194,7 @@ def _stop_process_tree(proc):
         pass
 
 
-def _run_render(cmd, log_path, idle_timeout=RENDER_IDLE_TIMEOUT):
+def _run_render(cmd, log_path, job_id=None, idle_timeout=RENDER_IDLE_TIMEOUT):
     """Run a render while distinguishing slow-but-progressing work from a real stall."""
     last_progress = time.monotonic()
     last_size = -1
@@ -186,6 +211,12 @@ def _run_render(cmd, log_path, idle_timeout=RENDER_IDLE_TIMEOUT):
                 returncode = proc.poll()
                 if returncode is not None:
                     return returncode
+
+                # Backend (FastAPI) chỉ đặt được cờ trong DB — nó không có cách nào signal
+                # trực tiếp subprocess của tiến trình worker này. Poll cờ ở đây, cùng nhịp
+                # với stall-check, nên hủy có hiệu lực trong vòng RENDER_POLL_SECONDS.
+                if job_id is not None and db.is_cancel_requested(job_id):
+                    raise JobCancelled(f"job #{job_id} cancel requested")
 
                 now = time.monotonic()
                 try:
@@ -204,6 +235,20 @@ def _run_render(cmd, log_path, idle_timeout=RENDER_IDLE_TIMEOUT):
         except BaseException:
             _stop_process_tree(proc)
             raise
+
+
+def trim_video_for_musetalk(video_path, work_dir, seconds=30):
+    """Create a stable, audio-independent avatar carrier for MuseTalk caching."""
+    if _ffprobe_duration(video_path) <= seconds:
+        return str(video_path)
+    out = str(Path(work_dir) / "musetalk_carrier.mp4")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", str(video_path),
+                        "-t", str(seconds), "-c", "copy", "-an", out], check=True)
+        return out
+    except Exception as e:
+        _log(f"MuseTalk fixed carrier trim failed ({e}); using full video")
+        return str(video_path)
 
 
 def trim_video_to_audio(video_path, audio_path, work_dir, margin=2.0):
@@ -256,6 +301,60 @@ def backup_db():
         old.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- render cleanup
+
+def cleanup_old_renders():
+    """Xóa khỏi đĩa các video 'done' đã render xong quá RENDER_RETENTION_DAYS ngày.
+
+    Chỉ xóa file + gỡ output_path trong DB — job vẫn giữ nguyên 'done' làm lịch sử.
+    Không điều kiện theo trạng thái Drive: video đã lên Drive hay chưa đều bị dọn như
+    nhau sau hạn, đúng như yêu cầu (chỉ tính theo thời gian render xong)."""
+    stale = db.list_stale_done_jobs(RENDER_RETENTION_DAYS)
+    removed = 0
+    for job in stale:
+        path = Path(job["output_path"])
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            _log(f"cleanup: failed to remove {path} (job #{job['id']}): {e}")
+            continue
+        db.clear_output_path(job["id"])
+        removed += 1
+    if removed:
+        _log(f"cleanup: removed {removed} render(s) older than {RENDER_RETENTION_DAYS} days")
+
+
+def cleanup_old_musetalk_avatar_cache():
+    """Xóa avatar cache MuseTalk (video render, results/v15/avatars_video) không được
+    dùng lại quá MUSETALK_CACHE_RETENTION_DAYS ngày.
+
+    avatar_id ở đây là hash nội dung video của một job cụ thể (musetalk_adapter.
+    _video_cache_key) nên hiếm khi được job khác tái sử dụng — khác với cache
+    realtime (dùng lại liên tục qua nhiều phiên live, dọn thủ công qua tab
+    "Avatar Cache"), cache này cần tự hết hạn để khỏi phình vô hạn trên đĩa.
+    musetalk_render_server.py touch lại avator_info.json mỗi lần avatar được
+    dùng, nên mtime của file đó phản ánh đúng lần dùng gần nhất, không phải
+    lần build."""
+    if not MUSETALK_AVATARS_VIDEO_DIR.is_dir():
+        return
+    cutoff = time.time() - MUSETALK_CACHE_RETENTION_DAYS * 86400
+    removed = 0
+    for entry in MUSETALK_AVATARS_VIDEO_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        marker = entry / "avator_info.json"
+        stat_target = marker if marker.is_file() else entry
+        try:
+            if stat_target.stat().st_mtime >= cutoff:
+                continue
+            shutil.rmtree(entry)
+            removed += 1
+        except OSError as e:
+            _log(f"cleanup: failed to remove musetalk cache {entry.name}: {e}")
+    if removed:
+        _log(f"cleanup: removed {removed} musetalk avatar cache(s) older than {MUSETALK_CACHE_RETENTION_DAYS} days")
+
+
 # ---------------------------------------------------------------- one job
 
 def _safe_name(name):
@@ -277,6 +376,17 @@ def _safe_name(name):
     return safe[:140] or "job"
 
 
+def _drive_safe_name(path):
+    """ASCII-only Drive filename with one underscore between name segments."""
+    path = Path(path)
+    ascii_stem = unicodedata.normalize("NFKD", path.stem).encode(
+        "ascii", "ignore"
+    ).decode("ascii")
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", ascii_stem).strip("_") or "video"
+    suffix = re.sub(r"[^A-Za-z0-9]", "", path.suffix.lstrip("."))
+    return f"{stem[:140]}.{suffix}" if suffix else stem[:140]
+
+
 def process_job(job):
     job_id = job["id"]
     _log(f"claim job #{job_id} '{job['name']}' model={job['model_res']}")
@@ -284,10 +394,12 @@ def process_job(job):
     work.mkdir(parents=True, exist_ok=True)
     log_path = LOGS_DIR / f"job_{job_id}.log"
 
-    # Trim a too-long carrier to ~audio length first (cheap) so NVENC normalize + the renderer's
-    # downscale/scenedetect don't churn through video that gets discarded. Short videos pass through.
-    src_video = trim_video_to_audio(job["video_path"], job["audio_path"], work)
-    nv = normalize_video(src_video, work)
+    # Keep MuseTalk video stable across different audio lengths so its avatar cache is reusable.
+    if job.get("engine", "musetalk") == "musetalk":
+        src_video = trim_video_for_musetalk(job["video_path"], work)
+    else:
+        src_video = trim_video_to_audio(job["video_path"], job["audio_path"], work)
+    nv = normalize_video(src_video, work, job["out_res"])
     na = normalize_audio(job["audio_path"], work)
     out_path = work / "out.mp4"
     # Do not impose a wall-clock limit. Long 512 renders can legitimately take many hours;
@@ -306,8 +418,9 @@ def process_job(job):
         "--seed", str(job["seed"]), "--enhance_mouth", str(job["enhance_mouth"]),
         "--enhance_region", job["enhance_region"], "--out_res", job["out_res"],
         "--input_type", job.get("input_type", "real"),
+        "--engine", job.get("engine", "musetalk"),
     ]
-    returncode = _run_render(cmd, log_path)
+    returncode = _run_render(cmd, log_path, job_id=job_id)
 
     if returncode != 0 or not out_path.exists():
         tail = _tail(log_path)
@@ -328,6 +441,8 @@ def process_job(job):
 def _start_drive_upload(job_id, path, subfolder=None):
     """Đẩy video lên Drive ở thread nền — mạng chậm không được giữ GPU chờ job kế tiếp.
 
+    Tên file trên Drive được chuẩn hóa ASCII; mọi khoảng trắng/dấu câu/ký tự đặc
+    biệt được gộp thành một dấu gạch dưới. Tên file local không bị thay đổi.
     Thư mục con trong folder Drive chính (tự tạo nếu chưa có):
       - job import Excel: tên file Excel (cột drive_folder);
       - job render tay (không có drive_folder): gom theo ngày render 'dd-mm-yyyy'
@@ -343,12 +458,18 @@ def _start_drive_upload(job_id, path, subfolder=None):
         return
     if not subfolder:
         subfolder = datetime.now().strftime("%d-%m-%Y")
-    threading.Thread(target=_drive_upload, args=(job_id, path, subfolder), daemon=True).start()
+    threading.Thread(
+        target=_drive_upload,
+        args=(job_id, path, subfolder),
+        daemon=True,
+    ).start()
 
 
 def _drive_upload(job_id, path, subfolder=None):
     try:
-        info = gdrive.upload_file(path, subfolder=subfolder)
+        info = gdrive.upload_file(
+            path, name=_drive_safe_name(path), subfolder=subfolder
+        )
         db.set_drive_result(job_id, link=info.get("webViewLink"))
         where = f" [{subfolder}]" if subfolder else ""
         _log(f"job #{job_id} Drive upload OK{where} -> {info.get('webViewLink')}")
@@ -362,6 +483,40 @@ def _tail(path, n=15):
         return "\n".join(path.read_text(errors="replace").splitlines()[-n:])
     except Exception:
         return "(no log)"
+
+
+def _process_claimed_job(job):
+    job_id = job["id"]
+    try:
+        process_job(job)
+    except JobCancelled:
+        db.mark_cancelled(job_id)
+        _log(f"job #{job_id} cancelled by user")
+    except Exception as exc:
+        retries = job["retries"]
+        if retries < db.MAX_RETRIES:
+            db.requeue_for_retry(job_id, exc)
+            _log("job #{} failed (retry {}/{}): {}".format(
+                job_id, retries + 1, db.MAX_RETRIES, exc))
+        else:
+            db.mark_failed(job_id, exc)
+            _log("job #{} FAILED permanently: {}".format(job_id, exc))
+
+def _collect_musetalk_pair(anchor):
+    """Wait briefly for a second matching job created asynchronously by Excel/TTS."""
+    if anchor.get("engine") != "musetalk" or not db.has_completed_matching_avatar(anchor):
+        return []
+    deadline = time.monotonic() + MUSETALK_BATCH_COLLECT_SECONDS
+    while _RUNNING:
+        matches = db.claim_matching_jobs(anchor, limit=1)
+        if matches:
+            waited = MUSETALK_BATCH_COLLECT_SECONDS - max(0.0, deadline - time.monotonic())
+            _log(f"batch avatar: collected #{matches[0]['id']} after {waited:.1f}s")
+            return matches
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return []
+        time.sleep(min(MUSETALK_BATCH_POLL_SECONDS, remaining))
 
 
 # ---------------------------------------------------------------- main loop
@@ -386,7 +541,16 @@ def main():
         _log(f"requeued {n} stuck 'rendering' job(s) from a previous run")
     _log("worker started; polling for jobs...")
 
+    # Own thread, not the main claim loop below: that loop blocks for a render's full
+    # duration (can be 1h+), which would starve dashboard pushes right when the GPU/job
+    # status is most worth reporting. No-ops on every push until DASHBOARD_URL is set
+    # in .env (see dashboard_reporter.py), so this is always safe to start.
+    threading.Thread(
+        target=dashboard_reporter.run_forever, args=(lambda: _RUNNING,), daemon=True
+    ).start()
+
     last_backup = time.time()
+    last_cleanup = time.time()
     while _RUNNING:
         try:
             if not gpu_healthy():
@@ -397,20 +561,27 @@ def main():
                 backup_db()
                 last_backup = time.time()
 
+            if time.time() - last_cleanup >= RENDER_CLEANUP_INTERVAL:
+                cleanup_old_renders()
+                cleanup_old_musetalk_avatar_cache()
+                last_cleanup = time.time()
+
             job = db.claim_next_job()
             if not job:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            try:
-                process_job(job)
-            except Exception as e:
-                if job["retries"] < db.MAX_RETRIES:
-                    db.requeue_for_retry(job["id"], e)
-                    _log(f"job #{job['id']} failed (retry {job['retries']+1}/{db.MAX_RETRIES}): {e}")
-                else:
-                    db.mark_failed(job["id"], e)
-                    _log(f"job #{job['id']} FAILED permanently: {e}")
+            # Warm a new avatar with one job first. Once warm, briefly collect a matching
+            # partner that Excel/TTS may still be creating asynchronously.
+            jobs = [job]
+            jobs += _collect_musetalk_pair(job)
+            if len(jobs) > 1:
+                _log(f"batch avatar: running {len(jobs)} jobs concurrently: " +
+                     ", ".join(f"#{item['id']}" for item in jobs))
+            with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                futures = [pool.submit(_process_claimed_job, item) for item in jobs]
+                for future in as_completed(futures):
+                    future.result()
         except Exception as loop_err:
             # Never let the loop die — log and keep going.
             _log(f"loop error (continuing): {loop_err}")

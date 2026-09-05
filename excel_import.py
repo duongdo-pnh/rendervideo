@@ -25,6 +25,7 @@ import pandas as pd
 import database as db
 import tts_db
 from tts_voice import normalize_voice
+from latentsync.tts.autovoice import MAX_CHARS as AUTOVOICE_MAX_CHARS
 from latentsync.tts.factory import DEFAULT_PROVIDER
 
 ROOT = Path(__file__).parent
@@ -77,12 +78,15 @@ TTS_PROVIDER_ALIASES = {
 
 
 def _voice_options():
-    """Mã giọng cố định của hệ (4 vbee + 4 ausynclab) cho dropdown tts_voice."""
+    """Voice IDs configured by each provider, including dynamic AutoVoice IDs."""
     try:
         from latentsync.tts.vbee import VbeeTTS
         from latentsync.tts.ausynclab import AusynclabTTS
-        return [code for _, code in VbeeTTS.CURATED_VOICES] + \
-               [code for _, code in AusynclabTTS.CURATED_VOICES]
+        from latentsync.tts import factory
+        voices = [code for _, code in VbeeTTS.CURATED_VOICES] + \
+                 [code for _, code in AusynclabTTS.CURATED_VOICES]
+        voices.extend(factory.list_voices("autovoice"))
+        return list(dict.fromkeys(v for v in voices if v))
     except Exception:
         return []
 
@@ -195,13 +199,13 @@ _COL_HELP = {
     "video_path": "Đường dẫn local video avatar (không bắt buộc). TRỐNG = dùng video mặc định.",
     "video_url": "(Hệ không xử lý) — để trống.",
     "video_done": "HỆ TỰ ĐIỀN sau khi render xong (đường dẫn local video). Khách để TRỐNG.",
-    "tts_provider": "Chọn từ dropdown: vbee / ausynclab / autovoice / local. TRỐNG = mặc định.",
-    "tts_voice": "Chọn giọng từ dropdown hoặc nhập voice_name. TRỐNG = giọng mặc định của provider.",
+    "tts_provider": "Chọn từ dropdown: vbee / ausynclab / autovoice / local. BẮT BUỘC — để trống sẽ bị lỗi.",
+    "tts_voice": "Chọn giọng từ dropdown hoặc nhập voice_name. BẮT BUỘC — để trống sẽ bị lỗi.",
 }
 
 # Default render config for jobs created from Excel (matches the web UI defaults).
 RENDER_DEFAULTS = dict(model_res="512", guidance=1.5, steps=24, seed=1247,
-                       enhance_mouth=1, enhance_region="mouth", out_res="720")
+                       enhance_mouth=1, enhance_region="mouth", out_res="720", engine="musetalk")
 
 IMPORT_LOG = ROOT / "logs" / "import_tts.log"
 
@@ -244,16 +248,18 @@ def make_template(path, max_rows=1000):
         return [kw.get(c, "") for c in COLUMNS]
     examples = [
         row(product_name="23525384022", subText="Chào cả nhà, hôm nay shop có sản phẩm cực hot!",
-            video_type="gioi_thieu", tts_provider="vbee"),
+            video_type="gioi_thieu", tts_provider="vbee",
+            tts_voice="n_hanoi_female_quangcao02_advertise_vc"),
         row(product_name="23525384022", keyword="Giá bán & Chương trình khuyến mãi",
             question_text="Giá của sản phẩm này là bao nhiêu?",
             subText="Dạ giá chỉ 299k ạ, đang sale cực mạnh!",
-            video_type="tra_loi", question_type="ASK_PRICE", tts_provider="vbee"),
+            video_type="tra_loi", question_type="ASK_PRICE", tts_provider="vbee",
+            tts_voice="n_hanoi_female_quangcao02_advertise_vc"),
         row(product_name="khau trang y te", keyword="Thông tin sản phẩm",
             question_text="Khẩu trang có dùng được khi đi nắng không?",
             subText="Dạ khẩu trang nhà em dùng thoải mái khi đi ngoài trời hằng ngày ạ.",
             video_type="tra_loi", question_type="ASK_OTHER", other_key="khautrang",
-            tts_provider="local"),
+            tts_provider="local", tts_voice="vi_VN-thuy-medium"),
     ]
     for r in examples:
         ws.append(r)
@@ -352,24 +358,57 @@ def _get(raw, names):
     return None
 
 
-def process_excel(excel_path, default_video=None, default_provider=None, shopee_item_id=None):
-    """Read + validate. Returns (ready_rows, errors). No TTS, no DB writes."""
+def _name_key(s):
+    """_ascii() rồi bỏ luôn mọi ký tự phân cách (space/_/-/.) để so khớp tên.
+
+    Tên sản phẩm trong Excel thường có dấu cách ("Sản phẩm A"), còn tên file
+    avatar thường dùng gạch dưới/gạch ngang ("San_pham_A.mp4", "san-pham-a") —
+    _ascii() một mình để nguyên các ký tự này nên "san pham a" != "san_pham_a",
+    exact/contains match luôn trượt và _resolve_avatar() rơi tọt về round-robin
+    (chọn avatar gần như ngẫu nhiên so với sản phẩm thật). Bỏ hết ký tự không
+    phải chữ/số thì hai tên trên đều thành "sanphama" -> khớp đúng.
+    """
+    return re.sub(r"[^a-z0-9]", "", _ascii(s))
+
+
+def _resolve_avatar(product, avatars, row_index):
+    """Chọn avatar cho 1 dòng khi Excel không tự ghi video_path.
+
+    Mỗi avatar trong `avatars` (list các {"name","path"}, name = tên file gốc không
+    đuôi) coi như gắn với ĐÚNG 1 sản phẩm — khớp theo tên (không dấu/hoa-thường,
+    không phân biệt cách viết-liền/gạch dưới/gạch ngang, exact trước, chứa nhau
+    sau) để tránh render nhầm avatar giữa các sản phẩm khác nhau. Không khớp
+    được (hoặc dòng không có product, vd câu trả lời chung) thì xoay vòng
+    round-robin qua danh sách — với đúng 1 avatar, round-robin luôn trả về nó,
+    tức hành vi y hệt "video mặc định" cũ.
+    """
+    if not avatars:
+        return None
+    if product:
+        target = _name_key(product)
+        for av in avatars:  # exact match trước — ưu tiên hơn 1 khớp-chứa yếu ở avatar khác
+            if _name_key(av["name"]) == target:
+                return av["path"]
+        for av in avatars:
+            name = _name_key(av["name"])
+            if name and (name in target or target in name):
+                return av["path"]
+    return avatars[row_index % len(avatars)]["path"]
+
+
+def process_excel(excel_path, default_videos=None, default_provider=None, shopee_item_id=None):
+    """Read + validate. Returns (ready_rows, errors). No TTS, no DB writes.
+
+    default_videos: list các {"name","path"} (name = tên file gốc không đuôi) — xem
+    _resolve_avatar() cho cách chọn avatar theo từng dòng.
+    """
     df = pd.read_excel(excel_path)
     rows, errors = [], []
+    default_videos = default_videos or []
 
     for i, raw in df.iterrows():
         excel_row = i + 2  # 1-based + header
         try:
-            video = _clean(raw.get("video_path")) or default_video
-            if not video or not os.path.exists(video):
-                raise ValueError(f"Video không tồn tại: {video!r}")
-
-            text = _get(raw, COL_TEXT)                                       # subText (alias text)
-            if not text:
-                raise ValueError("subText rỗng")
-
-            provider = normalize_provider(_clean(raw.get("tts_provider"))) or default_provider  # None -> factory default
-            voice = _clean(raw.get("tts_voice"))                            # None -> provider default
             keyword = _get(raw, COL_KEYWORD)
             question_text = _get(raw, COL_QUESTION_TEXT)
             other_key = _get(raw, COL_OTHER_KEY)
@@ -383,6 +422,25 @@ def process_excel(excel_path, default_video=None, default_provider=None, shopee_
             product = None if is_common else (
                 _get(raw, COL_PRODUCT) or (str(shopee_item_id).strip() if shopee_item_id else None)
             )
+
+            video = _clean(raw.get("video_path")) or _resolve_avatar(product, default_videos, i)
+            if not video or not os.path.exists(video):
+                raise ValueError(f"Video không tồn tại: {video!r}")
+
+            text = _get(raw, COL_TEXT)                                       # subText (alias text)
+            if not text:
+                raise ValueError("subText rỗng")
+
+            provider = normalize_provider(_clean(raw.get("tts_provider"))) or default_provider
+            if not provider:
+                raise ValueError("tts_provider rỗng — không còn tự dùng mặc định, phải chọn rõ trong Excel.")
+            voice = _clean(raw.get("tts_voice"))
+            if not voice:
+                raise ValueError("tts_voice rỗng — không còn tự dùng giọng mặc định, phải chọn rõ trong Excel.")
+            if provider == "autovoice" and len(text) > AUTOVOICE_MAX_CHARS:
+                raise ValueError(
+                    f"subText quá dài cho Voice hệ thống: {len(text)} ký tự (tối đa {AUTOVOICE_MAX_CHARS})."
+                )
 
             # Trả lời câu hỏi -> bắt buộc có loại câu hỏi hợp lệ (để dựng <sp>__ASK_*).
             if not is_intro(video_type, question_type):
@@ -445,11 +503,13 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
         if warn:
             warnings.append({"row": row["row"], "warn": warn})
             _log_import_error(row["row"], f"voice guard: {warn}")
-        # Chống trùng: cùng (sản phẩm+loại+text) đã có job đang chờ/đang chạy -> bỏ qua.
+        # Chống trùng: cùng (sản phẩm+loại+text) VÀ cùng file Excel này đã có job
+        # đang chờ/đang chạy -> bỏ qua. Giới hạn theo excel_path để nội dung trùng
+        # tình cờ giữa 2 file KHÁC NHAU (vd câu trả lời chung dùng lại) không bị lọc.
         if dedup:
             dup = tts_db.find_duplicate(row["product"], row["video_type"],
                                         row["question_type"], row["text"],
-                                        other_key=row.get("other_key"))
+                                        other_key=row.get("other_key"), excel_path=excel_path)
             if dup:
                 skipped.append({"row": row["row"], "dup_id": dup,
                                 "name": build_name_excel(row["product"], row["video_type"],

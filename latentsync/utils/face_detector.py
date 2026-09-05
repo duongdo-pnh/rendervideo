@@ -3,6 +3,14 @@ import numpy as np
 import torch
 
 INSIGHTFACE_DETECT_SIZE = 512
+# Reject face boxes smaller than this fraction of the frame instead of a fixed
+# pixel size, so the gate behaves the same whether the source video is 480p or
+# 1080p — a fixed pixel threshold only ever matched whatever resolution it was
+# tuned against (720x1280) and wrongly rejected same-framing shots at other
+# resolutions. Values below the observed valid range for a normal shoulders-up
+# shot at ~6-9% of frame width/height, still filtering decorative/background faces.
+MIN_FACE_WIDTH_RATIO = 0.06
+MIN_FACE_HEIGHT_RATIO = 0.05
 
 
 class FaceDetector:
@@ -28,7 +36,7 @@ class FaceDetector:
             for face in faces:
                 bbox = face.bbox.astype(np.int_).tolist()
                 w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
-                if w < 50 or h < 80:
+                if w < f_w * MIN_FACE_WIDTH_RATIO or h < f_h * MIN_FACE_HEIGHT_RATIO:
                     continue
                 if w / h > 1.5 or w / h < 0.2:
                     continue

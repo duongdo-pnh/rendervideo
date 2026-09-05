@@ -5,6 +5,7 @@ contended operation is claim_next_job(), which MUST be atomic so two workers
 never grab the same job — see that function for the BEGIN IMMEDIATE pattern.
 """
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 
 DB_PATH = Path(__file__).parent / "jobs.db"
@@ -25,6 +26,7 @@ STATUS_QUEUED = "queued"
 STATUS_RENDERING = "rendering"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
+STATUS_CANCELLED = "cancelled"
 
 MAX_RETRIES = 2  # render attempts beyond the first before a job is marked failed
 
@@ -41,6 +43,7 @@ def _connect():
 # Render config columns added after the first schema version, with their SQL defaults.
 # init_db() ALTERs them in for older DBs so upgrades never lose existing jobs.
 _CONFIG_COLUMNS = {
+    "engine":         "TEXT    NOT NULL DEFAULT 'musetalk'",
     "guidance":       "REAL    NOT NULL DEFAULT 1.5",
     "steps":          "INTEGER NOT NULL DEFAULT 24",
     "seed":           "INTEGER NOT NULL DEFAULT 1247",
@@ -52,12 +55,55 @@ _CONFIG_COLUMNS = {
     "drive_link":     "TEXT",
     "drive_error":    "TEXT",
     "drive_folder":   "TEXT",   # tên thư mục con trong folder Drive chính (job từ Excel = tên file Excel); NULL = lên thẳng folder chính
+    # (không có drive_name: file trên Drive luôn giữ đúng tên file đã lưu ở máy)
+    "priority":       "INTEGER NOT NULL DEFAULT 0",  # lớn hơn = chạy trước
+    # Backend (FastAPI) và worker (queue_worker.py) là 2 tiến trình khác nhau — backend
+    # không thể kill trực tiếp subprocess render_job.py của worker. Đặt cờ này, worker tự
+    # kiểm tra ở mỗi vòng poll (_run_render) rồi tự dừng subprocess của chính nó.
+    "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
 }
+
+
+def _ensure_app_config_table(con):
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS app_config (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+        """
+    )
+
+
+def get_config(key, default=None):
+    """Per-install key/value state (e.g. the Drive OAuth refresh token).
+
+    Lives in jobs.db, not .env: jobs.db is created fresh on every install and
+    never bundled into the .deb, while .env can end up copied wholesale
+    between machines (dev checkout copies, config backups) — which would
+    silently carry the machine that built the app's Google account over to
+    every install instead of each one authorizing its own.
+    """
+    with _connect() as con:
+        _ensure_app_config_table(con)
+        row = con.execute("SELECT value FROM app_config WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def set_config(key, value):
+    with _connect() as con:
+        _ensure_app_config_table(con)
+        con.execute(
+            "INSERT INTO app_config (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
 
 
 def init_db():
     """Create the jobs table if missing + migrate config columns. Idempotent."""
     with _connect() as con:
+        _ensure_app_config_table(con)
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS jobs (
@@ -83,16 +129,19 @@ def init_db():
         for col, decl in _CONFIG_COLUMNS.items():
             if col not in existing:
                 con.execute(f"ALTER TABLE jobs ADD COLUMN {col} {decl}")
-        # Speeds up the claim_next_job lookup (status filter + creation order).
+        # Speeds up claim_next_job: trạng thái + ưu tiên giảm dần + thứ tự tạo.
         con.execute(
-            "CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at, id)"
+            "CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, priority DESC, created_at, id)"
         )
 
 
 def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, seed=1247,
             enhance_mouth=1, enhance_region="mouth", out_res="720", input_type="real",
-            drive_folder=None):
-    """Insert a new queued job with its full render config. Resolves model_res -> config/checkpoint."""
+            drive_folder=None, engine="musetalk"):
+    """Insert a new render job with its full render config."""
+    engine = str(engine)
+    if engine not in ("musetalk", "latentsync"):
+        raise ValueError(f"unknown engine {engine!r} (expected 'musetalk' or 'latentsync')")
     model_res = str(model_res)
     if model_res not in MODELS:
         raise ValueError(f"unknown model_res {model_res!r} (expected one of {list(MODELS)})")
@@ -100,12 +149,12 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
     with _connect() as con:
         cur = con.execute(
             """
-            INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path,
+            INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path, engine,
                               guidance, steps, seed, enhance_mouth, enhance_region, out_res, input_type,
                               drive_folder)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path,
+            (name, str(video_path), str(audio_path), model_res, config_path, checkpoint_path, str(engine),
              float(guidance), int(steps), int(seed), int(bool(enhance_mouth)),
              str(enhance_region), str(out_res), "ai" if input_type == "ai" else "real",
              str(drive_folder) if drive_folder else None),
@@ -133,7 +182,7 @@ def claim_next_job():
              WHERE id = (
                    SELECT id FROM jobs
                     WHERE status = 'queued'
-                    ORDER BY created_at, id
+                    ORDER BY priority DESC, created_at, id
                     LIMIT 1
              )
             RETURNING *
@@ -141,6 +190,48 @@ def claim_next_job():
         ).fetchone()
         con.commit()
         return dict(row) if row else None
+    except Exception:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+
+
+def has_completed_matching_avatar(anchor):
+    """True after one successful MuseTalk render has warmed this avatar/resolution."""
+    if anchor.get("engine") != "musetalk":
+        return False
+    with _connect() as con:
+        return con.execute(
+            "SELECT 1 FROM jobs WHERE status='done' AND engine='musetalk' "
+            "AND video_path=? AND out_res=? LIMIT 1",
+            (anchor["video_path"], anchor["out_res"]),
+        ).fetchone() is not None
+
+
+def claim_matching_jobs(anchor, limit=2):
+    """Atomically claim queued MuseTalk jobs that can share the anchor avatar."""
+    if limit <= 0 or anchor.get("engine") != "musetalk":
+        return []
+    con = _connect()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            "SELECT id FROM jobs WHERE status=\x27queued\x27 AND engine=\x27musetalk\x27 "
+            "AND video_path=? AND out_res=? ORDER BY created_at,id LIMIT ?",
+            (anchor["video_path"], anchor["out_res"], int(limit)),
+        ).fetchall()
+        claimed = []
+        for row in rows:
+            item = con.execute(
+                "UPDATE jobs SET status=\x27rendering\x27, started_at=datetime(\x27now\x27,\x27localtime\x27), "
+                "finished_at=NULL,error=NULL WHERE id=? AND status=\x27queued\x27 RETURNING *",
+                (row["id"],),
+            ).fetchone()
+            if item:
+                claimed.append(dict(item))
+        con.commit()
+        return claimed
     except Exception:
         con.rollback()
         raise
@@ -166,6 +257,69 @@ def mark_failed(job_id, error):
         )
 
 
+def mark_cancelled(job_id, error=None):
+    """Worker gọi sau khi thật sự dừng xong subprocess của 1 job 'rendering' bị hủy."""
+    with _connect() as con:
+        con.execute(
+            "UPDATE jobs SET status='cancelled', error=?, cancel_requested=0, "
+            "finished_at=datetime('now','localtime') WHERE id=?",
+            (str(error) if error else "Đã hủy theo yêu cầu người dùng.", job_id),
+        )
+
+
+def request_cancel(job_id):
+    """Hủy 1 job theo yêu cầu người dùng.
+
+    'queued' -> hủy NGAY (chưa render gì, không cần worker). 'rendering' -> chỉ đặt cờ
+    cancel_requested; worker tự phát hiện ở vòng poll kế tiếp (tối đa vài giây) rồi mới
+    thật sự dừng subprocess và gọi mark_cancelled(). Job đã done/failed/cancelled thì
+    không còn gì để hủy — raise ValueError.
+
+    Trả về status TRƯỚC khi hủy ('queued' hoặc 'rendering'), để caller biết hủy ngay hay
+    phải chờ worker.
+    """
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Không thấy job #{job_id}.")
+        status = row["status"]
+        if status == STATUS_QUEUED:
+            con.execute(
+                "UPDATE jobs SET status='cancelled', error='Đã hủy theo yêu cầu người dùng.', "
+                "finished_at=datetime('now','localtime') WHERE id=?",
+                (job_id,),
+            )
+        elif status == STATUS_RENDERING:
+            con.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
+        else:
+            raise ValueError(f"Job #{job_id} đã ở trạng thái '{status}' — không có gì để hủy.")
+        return status
+
+
+def is_cancel_requested(job_id):
+    with _connect() as con:
+        row = con.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+        return bool(row and row["cancel_requested"])
+
+
+def cancel_all_active():
+    """Hủy TẤT CẢ job đang chờ (ngay lập tức) + đặt cờ cho job đang render (worker tự dừng).
+
+    Trả về (n_queued, n_rendering) — số job hủy ngay và số job vừa được đặt cờ.
+    """
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        n_queued = con.execute(
+            "UPDATE jobs SET status='cancelled', error='Đã hủy theo yêu cầu người dùng.', "
+            "finished_at=datetime('now','localtime') WHERE status='queued'"
+        ).rowcount
+        n_rendering = con.execute(
+            "UPDATE jobs SET cancel_requested=1 WHERE status='rendering' AND cancel_requested=0"
+        ).rowcount
+        return n_queued, n_rendering
+
+
 def set_drive_result(job_id, link=None, error=None):
     """Ghi kết quả upload Google Drive của 1 job done: link khi thành công, error khi hỏng."""
     with _connect() as con:
@@ -185,6 +339,75 @@ def requeue_for_retry(job_id, error):
         )
 
 
+def prioritize_job(job_id):
+    """Đưa một job đang chờ lên đầu queue. Job đang render hoặc đã xong bị từ chối."""
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Không thấy job #{job_id}.")
+        if row["status"] != STATUS_QUEUED:
+            raise ValueError(
+                f"Job #{job_id} không ở trạng thái chờ (hiện tại: {row['status']})."
+            )
+        next_priority = con.execute(
+            "SELECT COALESCE(MAX(priority), 0) + 1 FROM jobs WHERE status=?",
+            (STATUS_QUEUED,),
+        ).fetchone()[0]
+        con.execute("UPDATE jobs SET priority=? WHERE id=?", (next_priority, job_id))
+        return {**dict(row), "priority": next_priority}
+
+
+def prioritize_jobs(job_ids):
+    """Xếp nhiều job queued theo thứ tự truyền vào; phần tử đầu chạy trước."""
+    ordered_ids = list(dict.fromkeys(int(job_id) for job_id in (job_ids or [])))
+    if not ordered_ids:
+        raise ValueError("Hãy chọn ít nhất một job đang chờ.")
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        placeholders = ",".join("?" for _ in ordered_ids)
+        rows = con.execute(
+            f"SELECT id, status FROM jobs WHERE id IN ({placeholders})", ordered_ids
+        ).fetchall()
+        found = {row["id"]: row["status"] for row in rows}
+        missing = [job_id for job_id in ordered_ids if job_id not in found]
+        if missing:
+            raise ValueError(f"Không thấy job: {missing}.")
+        invalid = [job_id for job_id in ordered_ids if found[job_id] != STATUS_QUEUED]
+        if invalid:
+            raise ValueError(f"Job không còn ở trạng thái chờ: {invalid}.")
+        base = con.execute(
+            "SELECT COALESCE(MAX(priority), 0) FROM jobs WHERE status=?",
+            (STATUS_QUEUED,),
+        ).fetchone()[0]
+        total = len(ordered_ids)
+        for position, job_id in enumerate(ordered_ids):
+            con.execute(
+                "UPDATE jobs SET priority=? WHERE id=?",
+                (base + total - position, job_id),
+            )
+    return ordered_ids
+
+
+def retry_job(job_id):
+    """Đưa 1 job 'failed' về 'queued' để worker thử lại — reset retries về 0 vì đây là
+    lần thử mới do người dùng chủ động yêu cầu (thường sau khi đã sửa nguyên nhân gốc,
+    vd. thiếu checkpoint), không phải tiếp tục đếm retry tự động cũ."""
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"Không thấy job #{job_id}.")
+        if row["status"] != STATUS_FAILED:
+            raise ValueError(f"Job #{job_id} không ở trạng thái lỗi (hiện tại: {row['status']}).")
+        updated = con.execute(
+            "UPDATE jobs SET status='queued', retries=0, error=NULL, "
+            "started_at=NULL, finished_at=NULL WHERE id=? RETURNING *",
+            (job_id,),
+        ).fetchone()
+        return dict(updated)
+
+
 def get_job(job_id):
     with _connect() as con:
         row = con.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -199,6 +422,19 @@ def list_jobs(limit=200):
         return [dict(r) for r in rows]
 
 
+def list_rendering_jobs():
+    """Job(s) actually in progress right now — queried by status directly, not by
+    recency, because list_jobs(limit=N)'s `ORDER BY id DESC` can push a long-running
+    render out of the window once N+ newer 'queued' rows land from a big Excel batch
+    (single GPU means the in-progress job is usually the OLDEST 'rendering'/'queued'
+    row, not a recent one)."""
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT * FROM jobs WHERE status = ? ORDER BY id", (STATUS_RENDERING,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def list_done_jobs(limit=200):
     with _connect() as con:
         rows = con.execute(
@@ -207,6 +443,69 @@ def list_done_jobs(limit=200):
             (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+def stats_summary():
+    """done/failed hôm nay/7 ngày/tháng này/năm nay + trend 14 ngày gần nhất — dùng để
+    push lên dashboard fleet (xem doc_api/API_INTEGRATION.md). Dashboard tự cộng dồn
+    qua mọi node nên đây chỉ cần đúng số liệu của MÁY NÀY."""
+    def _count(con, where_extra, args=()):
+        rows = con.execute(
+            f"SELECT status, COUNT(*) c FROM jobs WHERE status IN ('done','failed') "
+            f"AND finished_at IS NOT NULL {where_extra} GROUP BY status",
+            args,
+        ).fetchall()
+        counts = {"done": 0, "failed": 0}
+        for r in rows:
+            counts[r["status"]] = r["c"]
+        return counts
+
+    with _connect() as con:
+        today = _count(con, "AND date(finished_at) = date('now','localtime')")
+        this_week = _count(con, "AND date(finished_at) >= date('now','localtime','-6 days')")
+        this_month = _count(con, "AND strftime('%Y-%m', finished_at) = strftime('%Y-%m','now','localtime')")
+        this_year = _count(con, "AND strftime('%Y', finished_at) = strftime('%Y','now','localtime')")
+        trend_rows = con.execute(
+            "SELECT date(finished_at) d, status, COUNT(*) c FROM jobs "
+            "WHERE status IN ('done','failed') AND finished_at IS NOT NULL "
+            "AND date(finished_at) >= date('now','localtime','-13 days') "
+            "GROUP BY d, status"
+        ).fetchall()
+
+    by_date = {}
+    for r in trend_rows:
+        by_date.setdefault(r["d"], {"done": 0, "failed": 0})[r["status"]] = r["c"]
+    today_date = datetime.now().date()
+    daily_trend = []
+    for i in range(13, -1, -1):
+        d = today_date - timedelta(days=i)
+        entry = by_date.get(d.isoformat(), {"done": 0, "failed": 0})
+        daily_trend.append({"date": d.strftime("%d/%m"), "done": entry["done"], "failed": entry["failed"]})
+
+    return {
+        "today": today, "this_week": this_week, "this_month": this_month, "this_year": this_year,
+        "daily_trend": daily_trend,
+    }
+
+
+def list_stale_done_jobs(older_than_days):
+    """Job 'done' đã render xong quá `older_than_days` ngày (theo finished_at) và còn
+    output_path — dùng để dọn video cũ khỏi ổ đĩa định kỳ (queue_worker.cleanup_old_renders)."""
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT * FROM jobs WHERE status='done' AND output_path IS NOT NULL "
+            "AND finished_at IS NOT NULL "
+            "AND finished_at < datetime('now', 'localtime', ?)",
+            (f"-{int(older_than_days)} days",),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def clear_output_path(job_id):
+    """Gỡ tham chiếu output_path sau khi file đã bị dọn khỏi đĩa — job vẫn giữ 'done',
+    chỉ không còn trỏ tới file không còn tồn tại."""
+    with _connect() as con:
+        con.execute("UPDATE jobs SET output_path=NULL WHERE id=?", (job_id,))
 
 
 def reset_stuck_jobs():

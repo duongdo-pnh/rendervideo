@@ -89,6 +89,8 @@ temp_*.wav
 API_Shopee.txt
 .gpu.lock
 .queue_worker.lock
+.tts_worker.lock
+.musetalk_stream_api.pid
 *.env
 secrets*.py
 
@@ -105,3 +107,15 @@ client_secret*.json
 service_account*.json
 credentials*.json
 token*.json
+
+# MuseTalk server runtime artifacts
+.musetalk.sock
+.musetalk_spawn.lock
+.musetalk_start.lock
+
+# Local Python runtimes
+venv/
+.venv/
+/venv.backup/
+__pycache__/
+*.pyc

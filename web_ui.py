@@ -7,9 +7,12 @@ Tab 2 — Trạng thái queue: bảng auto-refresh 10s + xem/tải video đã re
 
 Run with:  conda activate latentsync && python web_ui.py
 """
+import hashlib
+import json
 import os
 import re
 import shutil
+import subprocess
 import unicodedata
 import uuid
 from datetime import datetime
@@ -17,13 +20,30 @@ from pathlib import Path
 
 import gradio as gr
 
+import avatar_cache
 import database as db
 import excel_import
+import job_files
+import rendered_videos
 import tts_config
+from job_naming import KIND_INTRO, KIND_ANSWER, INTENT_CHOICES, build_name
+from job_naming import slug_key as _slug_key
+from job_naming import manual_intent as _manual_intent
 from latentsync.tts.factory import available_providers, list_voices
 from latentsync.tts.vbee import VbeeTTS
 from latentsync.tts.ausynclab import AusynclabTTS
 from render_job import OUT_RES  # bảng độ phân giải; render THỰC do queue_worker chạy nền
+from stream_ui import (
+    enqueue_audio as stream_enqueue_audio,
+    enqueue_audio_playlist as stream_enqueue_audio_playlist,
+    enqueue_sample_audio as stream_enqueue_sample_audio,
+    interrupt_stream as stream_interrupt,
+    preview_stream as stream_preview,
+    refresh_stream as stream_refresh,
+    start_stream as stream_start,
+    stop_stream as stream_stop,
+    _sample_audio_choices,
+)
 
 # Provider list for the Import-Excel tab dropdowns (label shows config status).
 _TTS_PROVIDERS = available_providers()
@@ -35,11 +55,10 @@ _TTS_DEFAULT = next((p["name"] for p in _TTS_PROVIDERS if p["is_default"]),
                     (_TTS_PROVIDERS[0]["name"] if _TTS_PROVIDERS else None))
 
 ROOT = Path(__file__).parent
-UPLOADS_DIR = ROOT / "uploads"
+UPLOADS_DIR = job_files.UPLOADS_DIR
 
 # Bảo đảm bảng tồn tại trước khi Blocks query giá trị khởi tạo.
 db.init_db()
-UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 STATUS_LABEL = {
     "queued": "⏳ Chờ",
@@ -53,54 +72,6 @@ def _safe_stem(name):
     # NFC trước: gộp dấu tổ hợp tiếng Việt -> ký tự dựng sẵn để \w giữ được chữ có dấu (khớp _safe_name).
     name = unicodedata.normalize("NFC", (name or "").strip())
     return re.sub(r"[^\w.-]+", "_", name) or "job"
-
-
-# Quy tắc đặt tên chuẩn để hệ live tự match video↔sản phẩm khi import.
-# Tên file xuất = "<sản phẩm>__<INTENT>"  (bỏ __INTENT = video giới thiệu).
-KIND_INTRO = "Giới thiệu sản phẩm"
-KIND_ANSWER = "Trả lời câu hỏi"
-# (nhãn hiển thị, mã intent). Mã PHẢI trùng intents bên hệ live (ASK_*).
-INTENT_CHOICES = [
-    ("Hỏi giá", "ASK_PRICE"),
-    ("Hỏi chất lượng / review", "ASK_QUALITY"),
-    ("Hỏi cách dùng", "ASK_USAGE"),
-    ("Còn hàng / còn size-màu", "ASK_STOCK"),
-    ("Cách mua / chốt đơn", "ASK_BUY"),
-    ("Phí ship / giao hàng", "ASK_SHIPPING"),
-    ("Voucher / giảm giá", "ASK_VOUCHER"),
-    ("Đổi trả / bảo hành", "ASK_RETURN"),
-    ("Xem sản phẩm", "ASK_PRODUCT"),
-    ("Chất liệu / lớp / quai đeo", "ASK_MATERIAL"),
-    ("Size / form / cân nặng", "ASK_SIZE_FIT"),
-    ("Hạn sử dụng", "ASK_EXPIRY"),
-    ("Dành cho trẻ em", "ASK_CHILDREN"),
-    ("Màu sắc / mix màu", "ASK_COLOR"),
-    ("Kiểm hàng", "ASK_CHECK"),
-    ("Khác (other_key)", "ASK_OTHER"),
-]
-
-
-def _slug_key(value):
-    key = excel_import._ascii(value).replace(" ", "_").replace("-", "_")
-    key = re.sub(r"[^a-z0-9_]+", "_", key)
-    key = re.sub(r"_+", "_", key).strip("_")
-    return key or None
-
-
-def _manual_intent(intent, other_key=None):
-    if intent == "ASK_OTHER":
-        key = _slug_key(other_key)
-        return f"ASK_OTHER_{key}" if key else "ASK_OTHER"
-    return intent
-
-
-def build_name(product, kind, intent, other_key=None):
-    """Dựng tên chuẩn từ ô nhập: '<sản phẩm>__<INTENT>' (Trả lời) hoặc '<sản phẩm>' (Giới thiệu)."""
-    product = (product or "").strip()
-    if kind == KIND_ANSWER and intent:
-        intent = _manual_intent(intent, other_key)
-        return f"{product}__{intent}" if product else f"__{intent}"
-    return product or "video"
 
 
 def name_preview(product, kind, intent, other_key=None):
@@ -118,26 +89,30 @@ def input_type_preset(input_type):
     return gr.update(value=1.5), gr.update(value=24), gr.update(value=True)
 
 
+ENGINE_CHOICES = [("MuseTalk 1.5", "musetalk"), ("LatentSync", "latentsync")]
+ENGINE_LABEL = {"musetalk": "MuseTalk 1.5", "latentsync": "LatentSync"}
+
+
+def engine_model_visibility(engine):
+    """256/512 checkpoint choice only applies to LatentSync — hide it for MuseTalk."""
+    return gr.update(visible=(engine == "latentsync"))
+
+
 # ---------------------------------------------------------------- Thêm vào queue
 
 def add_to_queue(video_path, audio_path, product, kind, intent, other_key, model_res, guidance, steps, seed,
-                 enhance_mouth, enhance_region, out_res, input_type):
+                 enhance_mouth, enhance_region, out_res, input_type, engine):
     if not video_path or not audio_path:
         raise gr.Error("Cần cả video và audio.")
     if kind == KIND_ANSWER and intent == "ASK_OTHER" and not _slug_key(other_key):
         raise gr.Error("Chọn ASK_OTHER thì cần điền other_key, ví dụ: khautrang.")
     name = build_name(product, kind, intent, other_key)   # tên chuẩn <sp>__<INTENT>
-    job_dir = UPLOADS_DIR / uuid.uuid4().hex[:12]
-    job_dir.mkdir(parents=True, exist_ok=True)
-    # Copy uploads tới chỗ ổn định (file temp của Gradio bị dọn khi thoát).
-    v_dst = job_dir / ("video" + Path(video_path).suffix)
-    a_dst = job_dir / ("audio" + Path(audio_path).suffix)
-    shutil.copy(video_path, v_dst)
-    shutil.copy(audio_path, a_dst)
+    v_dst, a_dst = job_files.save_upload_pair(video_path, audio_path)
     job_id = db.add_job(name, v_dst, a_dst, model_res, guidance, steps, seed,
-                        int(bool(enhance_mouth)), enhance_region, out_res, input_type)
+                        int(bool(enhance_mouth)), enhance_region, out_res, input_type,
+                        engine=engine)
     gr.Info(f"✅ Đã thêm job #{job_id} vào queue.")   # toast thông báo
-    return f"✅ Đã thêm **job #{job_id}** ('{name}', model {model_res}) vào queue."
+    return f"✅ Đã thêm **job #{job_id}** ('{name}') vào hàng đợi **{ENGINE_LABEL[engine]}**."
 
 
 # ---------------------------------------------------------------- Tab 2 helpers
@@ -179,36 +154,96 @@ def _job_duration(j):
     return ""
 
 
-def _table_rows():
+def _table_rows(prioritized_id=None):
     rows = []
-    for j in db.list_jobs(limit=200):
+    jobs = db.list_jobs(limit=200)
+    rendering = [j for j in jobs if j["status"] == db.STATUS_RENDERING]
+    queued = sorted(
+        (j for j in jobs if j["status"] == db.STATUS_QUEUED),
+        key=lambda j: (-int(j.get("priority") or 0), j.get("created_at") or "", j["id"]),
+    )
+    history = [j for j in jobs if j["status"] not in (db.STATUS_RENDERING, db.STATUS_QUEUED)]
+    for j in [*rendering, *queued, *history]:
         rows.append([
             j["id"], j["name"], j["model_res"],
             STATUS_LABEL.get(j["status"], j["status"]),
-            _job_duration(j),
+            int(j.get("priority") or 0), _job_duration(j),
             j["retries"], j["created_at"] or "",
             (j["error"] or "")[:80],
+            ("✅ Đã ưu tiên" if j["id"] == prioritized_id else "⚡ Ưu tiên")
+            if j["status"] == db.STATUS_QUEUED else "",
         ])
     return rows
 
 
-def _video_choices():
-    """Video đã render trong thư mục Desktop — nguồn XEM LẠI, đọc THẲNG từ ổ đĩa nên KHÔNG mất
-    khi xóa job khỏi queue. Mới nhất lên đầu (theo mtime). label = tên file (không .mp4)."""
-    d = db.RENDERS_DIR
-    if not d.exists():
-        return {}
-    files = sorted(d.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return {p.stem: str(p) for p in files}
+def _priority_choices():
+    """Các job đang chờ theo đúng thứ tự queue hiện tại."""
+    jobs = [j for j in db.list_jobs(limit=200) if j["status"] == db.STATUS_QUEUED]
+    jobs.sort(key=lambda j: (-int(j.get("priority") or 0), j.get("created_at") or "", j["id"]))
+    return [(f"#{j['id']} · {j['name']}", str(j["id"])) for j in jobs]
 
 
-def _latest_video():
-    """(label, path) của video mới render nhất, hoặc (None, None) nếu chưa có."""
-    ch = _video_choices()
-    if not ch:
-        return None, None
-    label = next(iter(ch))
-    return label, ch[label]
+_AVATAR_STATUS_LABEL = {
+    "LIVE": "✅ LIVE", "STALE": "⚠️ STALE (video gốc đã đổi)",
+    "TEST": "🧪 TEST", "MISSING": "❓ video gốc đã bị xóa",
+}
+
+
+def _avatar_cache_rows():
+    """Bảng avatar cache MuseTalk cho Gradio Dataframe — xem avatar_cache.list_entries()
+    cho phần logic dùng chung với backend FastAPI."""
+    rows = []
+    for e in avatar_cache.list_entries():
+        dur = e["duration_secs"]
+        rows.append([
+            e["video_name"], e["source_name"] or "? (không rõ / trước khi có tính năng này)",
+            _fmt_secs(dur) if dur is not None else "?",
+            e["avatar_id"], round(e["size_bytes"] / 1e9, 2),
+            datetime.fromisoformat(e["built_at"]).strftime("%Y-%m-%d %H:%M"),
+            _AVATAR_STATUS_LABEL.get(e["status"], e["status"]),
+        ])
+    return rows
+
+
+def refresh_avatar_cache():
+    rows = _avatar_cache_rows()
+    total = sum(r[4] for r in rows)
+    stale = sum(r[4] for r in rows if r[6].startswith("⚠️"))
+    summary = f"**Tổng {total:.1f} GB** trên {len(rows)} bản cache — trong đó **{stale:.1f} GB STALE** có thể xóa."
+    return gr.update(value=rows), summary
+
+
+def clear_stale_avatar_cache():
+    removed, freed_bytes = avatar_cache.clear_stale()
+    freed = freed_bytes / 1e9
+    gr.Info(f"Đã xóa {len(removed)} bản cache STALE, giải phóng ~{freed:.1f} GB." if removed
+            else "Không có bản cache STALE nào để xóa.")
+    table_update, summary = refresh_avatar_cache()
+    return table_update, summary
+
+
+_video_choices = rendered_videos.video_choices
+_latest_video = rendered_videos.latest_video
+_video_list_rows = rendered_videos.list_rows
+
+
+def pick_video_from_list(table_data, evt: gr.SelectData):
+    """Bấm 1 dòng trong list video -> nạp preview + file tải + nhớ tên đang chọn (để xóa)."""
+    try:
+        index = evt.index if isinstance(evt.index, (list, tuple)) else ()
+        row_index = int(index[0]) if len(index) >= 1 else None
+        if row_index is None:
+            raise ValueError("Không xác định được dòng đã chọn.")
+        if hasattr(table_data, "iloc"):
+            label = table_data.iloc[row_index, 0]
+        elif isinstance(table_data, dict):
+            label = table_data.get("data", [])[row_index][0]
+        else:
+            label = table_data[row_index][0]
+        path = _video_choices().get(label)
+    except (TypeError, ValueError, IndexError, KeyError):
+        return gr.update(), gr.update(), gr.update()
+    return path, path, label
 
 
 def refresh_status():
@@ -225,24 +260,91 @@ def pick_done(label=None):
 
 
 def load_video_area():
-    """demo.load: nạp video MỚI NHẤT vào khu xem lại của Tab 1 (để không để trống)."""
+    """demo.load: nạp lại list + video MỚI NHẤT vào tab xem lại (để không để trống)."""
     label, path = _latest_video()
-    return gr.update(choices=list(_video_choices().keys()), value=label), path, path
+    return gr.update(value=_video_list_rows()), path, path, label
 
 
-def _cleanup_job_files(row):
-    """Best-effort: dọn file input đã upload của job (GIỮ lại video kết quả trên Desktop)."""
+def delete_current_video(label):
+    """Xóa hẳn file video ĐANG CHỌN khỏi Desktop/Renders. Chỉ xóa file trên đĩa — không đụng
+    tới job trong DB (khác với 'Xóa job này', vốn cố tình GIỮ lại video). Không thể hoàn tác."""
+    if not label:
+        gr.Warning("Chưa chọn video nào để xóa.")
+        return load_video_area()
     try:
-        vp = Path(row.get("video_path") or "")
-        if (
-            vp.exists()
-            and UPLOADS_DIR in vp.parents
-            and vp.parent.parent == UPLOADS_DIR
-            and vp.parent.name not in {"videos", "tts"}
-        ):   # uploads/<hex>/video.ext -> xóa cả thư mục tạm; không xóa uploads/videos hoặc uploads/tts
-            shutil.rmtree(vp.parent, ignore_errors=True)
-    except Exception:
-        pass
+        rendered_videos.delete_video(label)
+    except rendered_videos.VideoNotFound as e:
+        gr.Warning(str(e))
+        return load_video_area()
+    except OSError as e:
+        gr.Warning(f"Không xóa được '{label}': {e}")
+        return load_video_area()
+    gr.Info(f"🗑️ Đã xóa '{label}'.")
+    return load_video_area()
+
+
+_cleanup_job_files = job_files.cleanup_job_files
+
+
+def prioritize_from_table(table_data, evt: gr.SelectData):
+    """Bấm ô thao tác ở dòng queued để ưu tiên ngay, không cần nhập ID."""
+    try:
+        index = evt.index if isinstance(evt.index, (list, tuple)) else ()
+        row_index = int(index[0]) if len(index) > 1 else None
+        col = int(index[1]) if len(index) > 1 else None
+        if col != 9 or evt.value != "⚡ Ưu tiên":
+            return gr.update(), gr.update()
+
+        # Gradio 5 không cung cấp row_value cho Dataframe.select; đọc ID từ
+        # chính dữ liệu bảng theo chỉ số dòng mà sự kiện gửi về.
+        if row_index is None:
+            raise ValueError("Không xác định được dòng job.")
+        if hasattr(table_data, "iloc"):
+            job_id = table_data.iloc[row_index, 0]
+        elif isinstance(table_data, dict):
+            job_id = table_data.get("data", [])[row_index][0]
+        else:
+            job_id = table_data[row_index][0]
+        row = db.prioritize_job(int(job_id))
+    except (TypeError, ValueError, IndexError, KeyError) as e:
+        gr.Warning(str(e))
+        return gr.update(), f"⚠ Không thể ưu tiên job: {e}"
+    gr.Info(f"✅ Đã ưu tiên job #{row['id']}.")
+    return gr.update(value=_table_rows(prioritized_id=row["id"])), (
+        f"### ✅ Đã ưu tiên job #{row['id']}\n"
+        "Job này đã được đưa lên đầu hàng chờ và sẽ chạy ngay sau job đang render."
+    )
+
+
+def apply_priority_list(job_ids):
+    """Áp dụng thứ tự ưu tiên đã chọn. Outputs: bảng, thông báo, dropdown."""
+    try:
+        ordered_ids = db.prioritize_jobs(job_ids)
+    except (TypeError, ValueError) as e:
+        gr.Warning(str(e))
+        return gr.update(), f"⚠ {e}", gr.update(choices=_priority_choices())
+    order_text = " → ".join(f"#{job_id}" for job_id in ordered_ids)
+    gr.Info("✅ Đã lưu danh sách ưu tiên.")
+    return (
+        gr.update(value=_table_rows(prioritized_id=ordered_ids[0])),
+        f"### ✅ Đã lưu danh sách ưu tiên\nThứ tự chạy: **{order_text}**",
+        gr.update(choices=_priority_choices(), value=[str(job_id) for job_id in ordered_ids]),
+    )
+
+
+def do_prioritize_job(job_id):
+    """Đưa job queued lên đầu hàng đợi. Outputs: [status_table, done_dd, message]."""
+    if not job_id:
+        gr.Warning("Nhập ID job cần ưu tiên.")
+        return gr.update(), gr.update(), "⚠ Nhập ID job cần ưu tiên."
+    try:
+        row = db.prioritize_job(int(job_id))
+    except (TypeError, ValueError) as e:
+        gr.Warning(str(e))
+        return gr.update(), gr.update(), f"⚠ {e}"
+    gr.Info(f"⚡ Job #{row['id']} sẽ được render kế tiếp.")
+    table, dd = refresh_status()
+    return table, dd, f"⚡ Đã đưa job #{row['id']} ('{row['name']}') lên đầu queue."
 
 
 def do_delete_job(job_id):
@@ -311,37 +413,8 @@ def _preview_rows_table(rows, errors, shopee_item_id=None):
     return table
 
 
-def _stabilize_video(path):
-    """Video tải lên qua Gradio là file TẠM (bị dọn). Copy vào uploads/videos/ để worker render sau còn đọc được."""
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        return str(p)
-    vids = UPLOADS_DIR / "videos"
-    vids.mkdir(parents=True, exist_ok=True)
-    if vids in p.parents:                       # đã nằm trong kho bền rồi
-        return str(p)
-    dst = vids / (uuid.uuid4().hex[:12] + (p.suffix or ".mp4"))
-    shutil.copy(p, dst)
-    return str(dst)
-
-
-def _stabilize_excel(path):
-    """Copy file Excel tải lên (Gradio temp) -> uploads/imports/ để sau xuất kết quả còn đọc được.
-
-    GIỮ NGUYÊN tên file gốc (chống trùng bằng thư mục con uuid) — basename này chính là
-    tên thư mục con trên Google Drive của batch (drive_folder), đổi thành uuid là sai tên."""
-    if not path:
-        return None
-    p = Path(path)
-    if not p.exists():
-        return str(p)
-    d = UPLOADS_DIR / "imports" / uuid.uuid4().hex[:12]
-    d.mkdir(parents=True, exist_ok=True)
-    dst = d / (p.name or "import.xlsx")
-    shutil.copy(p, dst)
-    return str(dst)
+_stabilize_video = job_files.stabilize_video
+_stabilize_excel = job_files.stabilize_excel
 
 
 def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
@@ -361,14 +434,15 @@ def preview_excel(excel_file, default_video, default_provider, shopee_item_id):
 
 
 def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, region, input_type,
-                 dedup, progress=gr.Progress()):
+                 dedup, engine, progress=gr.Progress()):
     if not state or not state.get("rows"):
         raise gr.Error("Chưa có dòng sẵn sàng — bấm Preview trước.")
     rows = state["rows"]
     shopee = state.get("shopee")
     render_config = dict(model_res=str(model), out_res=str(out_res),
                          enhance_mouth=int(bool(enhance_mouth)), enhance_region=region,
-                         guidance=float(guidance), steps=int(steps), seed=int(seed), input_type=input_type)
+                         guidance=float(guidance), steps=int(steps), seed=int(seed), input_type=input_type,
+                         engine=engine)
 
     def _cb(done, total, label):
         progress(done / max(1, total), desc=label)
@@ -377,7 +451,7 @@ def submit_excel(state, model, out_res, enhance_mouth, guidance, steps, seed, re
         rows, shopee_item_id=shopee, progress=_cb, excel_path=state.get("excel_path"),
         render_config=render_config, dedup=bool(dedup))
     lines = [f"### ✅ Đã đưa **{len(enqueued)}** dòng vào TTS queue (batch `{batch_id}`).",
-             f"⚙️ Cấu hình render: **model {model} · {out_res} · "
+             f"⚙️ Engine **{ENGINE_LABEL[engine]}** · đầu ra **{out_res}** · "
              f"{'làm nét '+region if enhance_mouth else 'KHÔNG làm nét'} · guidance {guidance} · {steps} steps**.",
              "TTS worker sẽ tạo giọng (rate-limit + tự retry khi nghẽn) rồi đẩy sang hàng đợi render — "
              "không còn rớt dòng vì lỗi tạm thời. Theo dõi ở mục **Trạng thái TTS** bên dưới."]
@@ -563,9 +637,82 @@ CSS = """
 }
 #name-box label { font-weight: 600; }
 #name-preview { font-size: 1.1rem; }
+#priority-list {
+  margin: 8px 0 14px;
+  padding: 14px;
+  border: 1px solid rgba(37, 99, 235, 0.35);
+  border-radius: 12px;
+  background: rgba(37, 99, 235, 0.06);
+}
+#priority-feedback:not(:empty) {
+  margin: 8px 0 12px;
+  padding: 12px 16px;
+  border: 1px solid #16a34a;
+  border-radius: 10px;
+  background: rgba(22, 163, 74, 0.12);
+  color: #15803d;
+}
+#queue-table table tbody tr td:last-child {
+  text-align: center;
+  cursor: pointer;
+  white-space: nowrap;
+}
+#queue-table table tbody tr td:last-child span:not(:empty) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 92px;
+  padding: 6px 12px;
+  color: #9a3412;
+  background: linear-gradient(180deg, #fff7ed 0%, #ffedd5 100%);
+  border: 1px solid #fdba74;
+  border-radius: 999px;
+  font-size: 0.84rem;
+  font-weight: 700;
+  line-height: 1.2;
+  box-shadow: 0 1px 2px rgba(154, 52, 18, 0.10);
+  transition: all 140ms ease;
+}
+#queue-table table tbody tr td:last-child:hover span:not(:empty) {
+  color: #ffffff;
+  background: linear-gradient(180deg, #f97316 0%, #ea580c 100%);
+  border-color: #ea580c;
+  box-shadow: 0 4px 10px rgba(234, 88, 12, 0.25);
+  transform: translateY(-1px);
+}
+#queue-table table tbody tr td:last-child:active span:not(:empty) {
+  box-shadow: 0 1px 3px rgba(234, 88, 12, 0.20);
+  transform: translateY(0) scale(0.98);
+}
 """
 
-with gr.Blocks(title="Render Queue", css=CSS) as demo:
+UPLOAD_PROGRESS_FIX_JS = r"""
+() => {
+  if (window.__renderVideoUploadFix) return;
+  window.__renderVideoUploadFix = true;
+  const originalFetch = window.fetch.bind(window);
+  let uploadId = null;
+  window.fetch = (input, init) => {
+    const raw = typeof input === "string" ? input : (input instanceof URL ? input.href : input.url);
+    const url = new URL(raw, window.location.href);
+    if (url.pathname.endsWith("/gradio_api/upload_progress") && url.searchParams.get("upload_id") === "undefined") {
+      uploadId = uploadId || Math.random().toString(36).slice(2, 15);
+      url.searchParams.set("upload_id", uploadId);
+      input = input instanceof Request ? new Request(url.toString(), input) : url.toString();
+    } else if (url.pathname.endsWith("/gradio_api/upload") && url.searchParams.has("upload_id")) {
+      if (uploadId) {
+        url.searchParams.set("upload_id", uploadId);
+        input = input instanceof Request ? new Request(url.toString(), input) : url.toString();
+      } else {
+        uploadId = url.searchParams.get("upload_id");
+      }
+    }
+    return originalFetch(input, init);
+  };
+}
+"""
+
+with gr.Blocks(title="Render Queue", css=CSS, js=UPLOAD_PROGRESS_FIX_JS) as demo:
     gr.Markdown("<h1 align='center'>Render Queue 24/7</h1>")
 
     with gr.Tab("🎬 Render / Tạo job"):
@@ -597,15 +744,20 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                 input_type_in = gr.Radio(
                     choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
                     label="Loại input (Video AI dùng mask môi hẹp, không GFPGAN)")
+                engine_in = gr.Radio(
+                    choices=ENGINE_CHOICES, value="musetalk",
+                    label="Engine render")
                 with gr.Row():
                     model_in = gr.Radio(
                         choices=["256", "512"], value="512",
-                        label="Model: 256 (nhanh ~2×) | 512 (nét/tự nhiên, chậm)",
+                        label="LatentSync checkpoint: 256 (nhanh ~2×) | 512 (nét/tự nhiên, chậm)",
+                        visible=False,
                     )
                     out_res_in = gr.Radio(
                         choices=list(OUT_RES.keys()), value="720",
                         label="Độ phân giải (cạnh ngắn)",
                     )
+                engine_in.change(engine_model_visibility, engine_in, model_in)
                 with gr.Row():
                     guidance_in = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
                     steps_in = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
@@ -622,20 +774,8 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                     queue_btn = gr.Button("➕ Thêm vào hàng đợi", variant="secondary")
                 msg = gr.Markdown()
 
-            with gr.Column():
-                gr.Markdown(
-                    "### 📺 Video đã render — xem lại\n"
-                    "Job chạy **tuần tự qua hàng đợi** (tiến trình ở tab **Trạng thái queue**). "
-                    "Video xong **luôn lưu** ở `Desktop/Renders` — chọn bên dưới để xem lại.")
-                _lbl0, _path0 = _latest_video()
-                result_dd = gr.Dropdown(label="Chọn video (mới nhất ở đầu)",
-                                        choices=list(_video_choices().keys()), value=_lbl0)
-                result_video = gr.Video(label="Xem lại", value=_path0)
-                result_dl = gr.File(label="Tải về", value=_path0)
-                result_refresh = gr.Button("🔄 Cập nhật danh sách (hiện video mới render xong)")
-
         cfg_inputs = [video_in, audio_in, product_in, kind_in, intent_in, other_key_in, model_in, guidance_in,
-                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in, input_type_in]
+                      steps_in, seed_in, enhance_mouth_in, region_in, out_res_in, input_type_in, engine_in]
         # Hiện ô câu hỏi chỉ khi chọn "Trả lời".
         kind_in.change(lambda k: gr.update(visible=(k == KIND_ANSWER)), kind_in, intent_in)
         kind_in.change(other_key_visibility, [kind_in, intent_in], other_key_in)
@@ -650,16 +790,25 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         # nên không tranh GPU). Báo NGAY "đang thêm" rồi mới copy file + thêm DB (kèm toast).
         render_btn.click(lambda: "⏳ Đang thêm vào hàng đợi…", None, msg).then(add_to_queue, cfg_inputs, msg)
         queue_btn.click(lambda: "⏳ Đang thêm vào hàng đợi…", None, msg).then(add_to_queue, cfg_inputs, msg)
-        # Khu xem lại: chọn video -> phát + cho tải; nút 🔄 cập nhật danh sách + hiện video mới nhất.
-        result_dd.input(pick_done, result_dd, [result_video, result_dl])
-        result_refresh.click(load_video_area, None, [result_dd, result_video, result_dl])
 
     with gr.Tab("📊 Trạng thái queue"):
         gr.Markdown("Tự refresh mỗi 10 giây.")
+        with gr.Group(elem_id="priority-list"):
+            gr.Markdown("#### 📌 Tạo danh sách ưu tiên\nChọn các job theo thứ tự muốn chạy — job chọn đầu tiên sẽ chạy trước.")
+            priority_list = gr.Dropdown(
+                label="Thứ tự job ưu tiên", choices=_priority_choices(),
+                multiselect=True, info="Có thể chọn nhiều job đang chờ.",
+            )
+            with gr.Row():
+                priority_apply = gr.Button("✅ Áp dụng danh sách", variant="primary")
+                priority_reload = gr.Button("🔄 Cập nhật job đang chờ")
+        priority_msg = gr.Markdown(elem_id="priority-feedback")
+
         status_table = gr.Dataframe(
-            headers=["ID", "Tên", "Model", "Trạng thái", "⏱ Thời gian render", "Retry", "Tạo lúc", "Lỗi"],
-            datatype=["number", "str", "str", "str", "str", "number", "str", "str"],
+            headers=["ID", "Tên", "Model", "Trạng thái", "⚡ Ưu tiên", "⏱ Thời gian render", "Retry", "Tạo lúc", "Lỗi", "Thao tác"],
+            datatype=["number", "str", "str", "str", "number", "str", "number", "str", "str", "str"],
             value=_table_rows(), interactive=False, wrap=True,
+            elem_id="queue-table",
         )
         with gr.Row():
             done_dd = gr.Dropdown(label="Video đã render (xem / tải)",
@@ -669,6 +818,14 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         # .input (not .change): chỉ kích hoạt khi NGƯỜI DÙNG chọn, tránh trigger rỗng
         # khi timer/load cập nhật lại choices (gây lỗi "got: 0").
         done_dd.input(pick_done, done_dd, [done_video, download_file])
+
+        status_table.select(prioritize_from_table, status_table, [status_table, priority_msg])
+        priority_apply.click(
+            apply_priority_list, priority_list, [status_table, priority_msg, priority_list]
+        )
+        priority_reload.click(
+            lambda: gr.update(choices=_priority_choices()), None, priority_list
+        )
 
         gr.Markdown("#### 🗑 Thao tác — xóa job")
         with gr.Row():
@@ -684,8 +841,32 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 
         timer = gr.Timer(10)
         timer.tick(refresh_status, outputs=[status_table, done_dd])
-        # Cập nhật danh sách video ở khu xem lại Tab 1 (chỉ choices -> không cắt ngang video đang phát).
-        timer.tick(lambda: gr.update(choices=list(_video_choices().keys())), None, result_dd)
+        timer.tick(lambda: gr.update(choices=_priority_choices()), None, priority_list)
+
+    with gr.Tab("📺 Video đã render"):
+        gr.Markdown(
+            "### Video đã render — xem lại\n"
+            "Job chạy **tuần tự qua hàng đợi** (tiến trình ở tab **Trạng thái queue**). "
+            "Video xong **luôn lưu** ở `Desktop/Renders` — bấm 1 dòng bên trái để xem lại.")
+        _lbl0, _path0 = _latest_video()
+        result_selected = gr.State(value=_lbl0)
+        with gr.Row():
+            with gr.Column(scale=1):
+                result_list = gr.Dataframe(
+                    headers=["Tên video", "Ngày render", "Dung lượng (MB)"],
+                    datatype=["str", "str", "number"],
+                    value=_video_list_rows(), interactive=False, wrap=True)
+                result_dl = gr.File(label="Tải về", value=_path0)
+                result_refresh = gr.Button("🔄 Cập nhật danh sách (hiện video mới render xong)")
+                result_delete_btn = gr.Button("🗑️ Xóa video này", variant="stop")
+            with gr.Column(scale=2):
+                result_video = gr.Video(label="Xem lại", value=_path0, height=720)
+        result_list.select(pick_video_from_list, result_list, [result_video, result_dl, result_selected])
+        result_refresh.click(load_video_area, None, [result_list, result_video, result_dl, result_selected])
+        result_delete_btn.click(delete_current_video, result_selected,
+                                [result_list, result_video, result_dl, result_selected])
+        # Cập nhật danh sách khi có job render xong (không cắt ngang video đang phát).
+        timer.tick(lambda: gr.update(value=_video_list_rows()), None, result_list)
 
     with gr.Tab("📥 Import Excel"):
         gr.Markdown(
@@ -717,13 +898,16 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_input_type = gr.Radio(
             choices=[("Người thật", "real"), ("Video AI", "ai")], value="real",
             label="Loại input")
+        xl_engine = gr.Radio(choices=ENGINE_CHOICES, value="musetalk", label="Engine render")
         with gr.Row():
             xl_model = gr.Radio(["256", "512"], value="512",
-                                label="Model: 256 (nhanh) | 512 (nét/tự nhiên, chậm)")
+                                label="LatentSync checkpoint: 256 (nhanh) | 512 (nét/tự nhiên, chậm)",
+                                visible=False)
             xl_out_res = gr.Radio(choices=list(OUT_RES.keys()), value="720",
                                   label="Độ phân giải (cạnh ngắn): Gốc | 1080 | 720")
             xl_enhance = gr.Checkbox(value=True, label="Làm nét miệng (GFPGAN)")
             xl_region = gr.Radio(["mouth", "face"], value="mouth", label="Vùng làm nét")
+        xl_engine.change(engine_model_visibility, xl_engine, xl_model)
         with gr.Row():
             xl_guidance = gr.Slider(1.0, 3.0, value=1.5, step=0.1, label="Guidance Scale")
             xl_steps = gr.Slider(8, 50, value=24, step=1, label="Inference Steps")
@@ -765,11 +949,132 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
         xl_submit_btn.click(
             submit_excel,
             [xl_state, xl_model, xl_out_res, xl_enhance, xl_guidance, xl_steps, xl_seed,
-             xl_region, xl_input_type, xl_dedup],
+             xl_region, xl_input_type, xl_dedup, xl_engine],
             [xl_result, status_table, xl_batch_state])
         xl_tts_requeue.click(requeue_dead_letter, None, xl_tts_status)
         xl_export_btn.click(export_excel_results, xl_batch_state, xl_export_file)
         timer.tick(tts_status_md, outputs=xl_tts_status)   # 'timer' định nghĩa ở tab Trạng thái queue
+
+    with gr.Tab("📡 Livestream"):
+        gr.Markdown(
+            "### MuseTalk → OBS\n"
+            "Video avatar được render realtime và phát thẳng sang OBS qua UDP."
+        )
+        with gr.Row():
+            with gr.Column():
+                live_session = gr.Textbox(
+                    label="Session ID", value="facebook-live",
+                    placeholder="vd: facebook-live")
+                live_avatar = gr.File(
+                    label="Avatar video (MP4)", file_types=["video"], type="filepath")
+                # Facebook Live is sent to OBS over local UDP. Keep empty
+                # callback values as state instead of exposing obsolete RTMP
+                # credentials in the UI.
+                live_server_url = gr.State(value="")
+                live_stream_key = gr.State(value="")
+                with gr.Row():
+                    live_warmup = gr.Slider(0, 10, value=10, step=0.5, label="Render-ahead (giây)")
+                    live_batch = gr.Slider(1, 32, value=32, step=1, label="MuseTalk batch size")
+                live_obs_fps = gr.Slider(30, 30, value=30, step=1, label="OBS output FPS")
+                live_audio_delay = gr.Slider(
+                    0, 3000, value=0, step=100,
+                    label="Audio delay (ms) — tiếng chờ hình")
+                with gr.Row():
+                    live_start_btn = gr.Button("▶ Start OBS", variant="primary")
+                    live_reload_avatar_btn = gr.Button(
+                        "🔄 Đổi mẫu & nạp lại cache", variant="secondary")
+                    live_stop_btn = gr.Button("⏹ Stop stream", variant="stop")
+                live_cache_progress = gr.Markdown(
+                    "#### Tiến trình tạo cache\n"
+                    "`░░░░░░░░░░░░░░░░░░░░` **0%**  \n"
+                    "Chưa bắt đầu.")
+
+            with gr.Column():
+                live_preview = gr.Image(
+                    label="Preview đang phát", interactive=False, height=480)
+                live_audio = gr.File(
+                    label="Audio câu tiếp theo", file_types=["audio"], type="filepath")
+                live_sample_audio = gr.Dropdown(
+                    label="Voice mẫu",
+                    choices=_sample_audio_choices(),
+                    value=(
+                        _sample_audio_choices()[0][1]
+                        if _sample_audio_choices() else None
+                    ),
+                    allow_custom_value=False,
+                )
+                live_request = gr.Textbox(
+                    label="Request ID (có thể để trống)", placeholder="vd: sentence-001")
+                with gr.Row():
+                    live_priority = gr.Number(label="Priority", value=10, precision=0)
+                    live_interrupt_next = gr.Checkbox(
+                        label="Ngắt câu hiện tại trước khi phát", value=False)
+                with gr.Row():
+                    live_enqueue_btn = gr.Button("🔊 Phát audio", variant="primary")
+                    live_sample_enqueue_btn = gr.Button("⭐ Gửi voice mẫu", variant="secondary")
+                    live_interrupt_btn = gr.Button("⏭ Ngắt câu", variant="secondary")
+                    live_refresh_btn = gr.Button("🔄 Status")
+                gr.Markdown("#### Voice playlist giới thiệu sản phẩm")
+                live_voice_playlist = gr.File(
+                    label="Chọn nhiều MP3/WAV theo thứ tự phát",
+                    file_types=["audio"], file_count="multiple", type="filepath")
+                live_voice_playlist_btn = gr.Button(
+                    "➕ Thêm vào Voice playlist", variant="secondary")
+                live_status_md = gr.Markdown("### Trạng thái: chưa chạy")
+                live_status_json = gr.JSON(label="Streaming metrics")
+                live_preview_timer = gr.Timer(1.0)
+
+        live_start_btn.click(
+            stream_start,
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_obs_fps, live_audio_delay],
+            [live_status_md, live_status_json, live_stream_key, live_cache_progress],
+        )
+        live_reload_avatar_btn.click(
+            stream_start,
+            [live_session, live_avatar, live_server_url, live_stream_key, live_warmup, live_batch, live_obs_fps, live_audio_delay],
+            [live_status_md, live_status_json, live_stream_key, live_cache_progress],
+        )
+        live_enqueue_btn.click(
+            stream_enqueue_audio,
+            [live_session, live_request, live_audio, live_priority, live_interrupt_next],
+            [live_status_md, live_status_json],
+        )
+        live_sample_enqueue_btn.click(
+            stream_enqueue_sample_audio,
+            [live_session, live_sample_audio, live_request, live_priority, live_interrupt_next],
+            [live_status_md, live_status_json],
+        )
+        live_voice_playlist_btn.click(
+            stream_enqueue_audio_playlist,
+            [live_session, live_voice_playlist],
+            [live_status_md, live_status_json],
+        )
+        live_refresh_btn.click(stream_refresh, live_session, [live_status_md, live_status_json])
+        live_interrupt_btn.click(stream_interrupt, live_session, [live_status_md, live_status_json])
+        live_stop_btn.click(stream_stop, live_session, [live_status_md, live_status_json])
+        live_preview_timer.tick(
+            stream_preview, inputs=None,
+            outputs=[live_preview, live_status_md, live_status_json], queue=False)
+
+    with gr.Tab("🗄️ Avatar Cache"):
+        gr.Markdown(
+            "### Avatar cache MuseTalk trên đĩa\n"
+            "Mỗi avatar cache được khóa theo **hash nội dung** video nguồn. Nếu video nguồn bị "
+            "ghi đè (upload lại avatar mới cùng tên), hash cũ không còn khớp — bản cache đó thành "
+            "**STALE**: không bao giờ được server dùng lại nữa nhưng vẫn chiếm đĩa.")
+        avatar_cache_summary = gr.Markdown()
+        avatar_cache_table = gr.Dataframe(
+            headers=["Video nguồn", "Tên gốc trước cache", "Thời lượng", "Avatar ID",
+                     "Dung lượng (GB)", "Ngày build", "Trạng thái"],
+            datatype=["str", "str", "str", "str", "number", "str", "str"],
+            interactive=False, wrap=True)
+        with gr.Row():
+            avatar_cache_refresh_btn = gr.Button("🔄 Làm mới")
+            avatar_cache_clear_btn = gr.Button("🗑️ Xóa các bản STALE", variant="stop")
+        avatar_cache_refresh_btn.click(
+            refresh_avatar_cache, None, [avatar_cache_table, avatar_cache_summary])
+        avatar_cache_clear_btn.click(
+            clear_stale_avatar_cache, None, [avatar_cache_table, avatar_cache_summary])
 
     with gr.Tab("⚙️ Cấu hình TTS"):
         gr.Markdown(
@@ -847,7 +1152,7 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
                         autovoice_load_btn = gr.Button("🔌 Kết nối & tải giọng")
                         autovoice_status = gr.Markdown()
                     autovoice_voices_dd = gr.Dropdown(
-                        label="Voice hệ thống (chọn hoặc nhập voice_name)",
+                        label="Voice hệ thống (chọn hoặc nhập voiceId)",
                         choices=[],
                         value=_cur.get("AUTOVOICE_DEFAULT_VOICE", ""),
                         allow_custom_value=True)
@@ -877,11 +1182,15 @@ with gr.Blocks(title="Render Queue", css=CSS) as demo:
 
     # Khi mở/refresh trang: nạp bảng + danh sách video; khu Tab 1 tự hiện video mới nhất.
     demo.load(refresh_status, outputs=[status_table, done_dd])
-    demo.load(load_video_area, outputs=[result_dd, result_video, result_dl])
+    demo.load(load_video_area, outputs=[result_list, result_video, result_dl, result_selected])
     demo.load(tts_status_md, outputs=xl_tts_status)
+    demo.load(refresh_avatar_cache, outputs=[avatar_cache_table, avatar_cache_summary])
     # Form cấu hình TTS luôn phản ánh .env đã lưu (kể cả sau khi lưu rồi mở lại trang).
     demo.load(load_tts_config_form, outputs=[cfg_default, *cfg_inputs, cfg_status])
 
+
+# Gradio always injects a manifest link; enable its built-in PWA route to avoid 404.
+demo.pwa = True
 
 if __name__ == "__main__":
     demo.queue()  # cho render đồng bộ chạy tuần tự, không nghẽn server
@@ -892,5 +1201,6 @@ if __name__ == "__main__":
         server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
         inbrowser=False,
         share=os.environ.get("GRADIO_SHARE", "0") == "1",
+        pwa=True,
         allowed_paths=[str(db.RENDERS_DIR)],
     )

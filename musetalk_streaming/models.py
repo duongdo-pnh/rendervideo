@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any
+
+
+class SessionState(str, Enum):
+    CREATED = "created"
+    STARTING = "starting"
+    IDLE = "idle"
+    BUFFERING = "buffering"
+    PLAYING = "playing"
+    RECONNECTING = "reconnecting"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class StreamConfig:
+    session_id: str
+    avatar_id: str
+    avatar_video: str
+    push_url: str
+    width: int = 1280
+    height: int = 720
+    fps: int = 25
+    output_fps: int | None = None
+    sample_rate: int = 16_000
+    output_sample_rate: int = 44_100
+    video_bitrate: str = "3500k"
+    audio_bitrate: str = "128k"
+    # Frames and PCM are generated as matching 40 ms pairs.  A non-zero delay
+    # intentionally makes the voice late, so default to exact lip-sync.
+    audio_delay_ms: int = 0
+    warmup_frames: int = 30
+    # Đệm chống hụt frame khi GPU khựng. KHÔNG còn quyết định độ trễ trả lời
+    # comment nữa — interrupt_cover_frames lo việc đó — nên cứ để rộng rãi.
+    # Đo trên máy 5090 (2026-08-04): buffer chạm đáy ~0,9s trong 60s chạy liên
+    # tục, nên 5 giây là biên an toàn thoải mái.
+    video_queue_frames: int = 150
+    # Khi cắt ngang để trả lời comment: giữ lại chừng này frame làm nền che
+    # trong lúc câu mới đang dựng, bỏ phần còn lại thay vì phát cho hết.
+    # PHẢI >= warmup_frames. Xén xuống dưới ngưỡng warmup thì _ready_to_play()
+    # thành False đúng lúc state vừa chuyển BUFFERING -> playout ngừng lấy frame
+    # và rơi sang idle_frames, tức CHIẾU KHUNG ĐẦU VIDEO MẪU vài chục frame:
+    # người xem thấy avatar nhảy sang tư thế khác rồi nhảy về.
+    interrupt_cover_frames: int = 45
+    # Vuốt tiếng khi đổi câu. Mọi file voice đều mở đầu bằng ~100ms gần lặng rồi
+    # bật lên âm tiết nhấn (đo trên 5090: RMS 440 -> 8147 trong 20ms). Ghép thẳng
+    # vào khoảng lặng của câu bị cắt nghe như "nhảy một cái mạnh"; 10ms cũ chỉ đủ
+    # chống lách tách, không đủ che. Vuốt ra + vuốt vào ~180ms là liền mạch.
+    transition_fade_ms: int = 180
+    sentence_queue_size: int = 100
+
+    def __post_init__(self) -> None:
+        if self.fps < 10 or self.fps > 30:
+            raise ValueError("stream FPS must be between 10 and 30")
+        if self.output_fps is not None and (self.output_fps < self.fps or self.output_fps > 60):
+            raise ValueError("output_fps must be between stream FPS and 60")
+        if self.width <= 0 or self.height <= 0:
+            raise ValueError("stream dimensions must be positive")
+        if self.sample_rate != 16_000:
+            raise ValueError("MuseTalk stream input must be 16 kHz")
+        if self.warmup_frames < 0 or self.warmup_frames > self.video_queue_frames:
+            raise ValueError("warmup_frames must fit inside video_queue_frames")
+        if not 1 <= self.interrupt_cover_frames <= self.video_queue_frames:
+            raise ValueError("interrupt_cover_frames must fit inside video_queue_frames")
+
+
+@dataclass
+class StreamMetrics:
+    created_at: float = field(default_factory=time.monotonic)
+    inference_frames: int = 0
+    inference_seconds: float = 0.0
+    output_frames: int = 0
+    gpu_batch_ms: float = 0.0
+    blend_ms: float = 0.0
+    video_buffer_frames: int = 0
+    audio_buffer_ms: float = 0.0
+    av_drift_ms: float = 0.0
+    dropped_frames: int = 0
+    reconnect_count: int = 0
+    time_to_first_frame_ms: float | None = None
+    gpu_memory_bytes: int = 0
+    _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+
+    def update(self, **values: Any) -> None:
+        with self._lock:
+            for name, value in values.items():
+                setattr(self, name, value)
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        with self._lock:
+            setattr(self, name, getattr(self, name) + amount)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            elapsed = max(time.monotonic() - self.created_at, 1e-9)
+            inference_fps = (
+                self.inference_frames / self.inference_seconds
+                if self.inference_seconds > 0 else 0.0
+            )
+            return {
+                "render_fps": round(inference_fps, 2),
+                "output_fps": round(self.output_frames / elapsed, 2),
+                "gpu_batch_ms": round(self.gpu_batch_ms, 2),
+                "blend_ms": round(self.blend_ms, 2),
+                "video_buffer_frames": self.video_buffer_frames,
+                "audio_buffer_ms": round(self.audio_buffer_ms, 2),
+                "av_drift_ms": round(self.av_drift_ms, 2),
+                "dropped_frames": self.dropped_frames,
+                "reconnect_count": self.reconnect_count,
+                "time_to_first_frame_ms": self.time_to_first_frame_ms,
+                "gpu_memory_bytes": self.gpu_memory_bytes,
+                "uptime_seconds": round(elapsed, 2),
+            }

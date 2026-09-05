@@ -15,6 +15,7 @@ State của tts_jobs:
 tts_rate_limit: 1 dòng/provider, điều phối chung mọi process qua BEGIN IMMEDIATE.
 """
 import time
+from pathlib import Path
 
 import sqlite3
 
@@ -101,6 +102,41 @@ def get_batch_excel(batch_id):
         return r["excel_path"] if r else None
 
 
+def batch_filenames(batch_ids):
+    """batch_id -> tên file Excel gốc (basename) — dùng để nhóm job theo file khi hiển thị."""
+    ids = [b for b in {*batch_ids} if b]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    with _connect() as con:
+        rows = con.execute(
+            f"SELECT batch_id, excel_path FROM tts_batch WHERE batch_id IN ({placeholders})", ids,
+        ).fetchall()
+    return {r["batch_id"]: (Path(r["excel_path"]).name if r["excel_path"] else r["batch_id"]) for r in rows}
+
+
+def batches_for_render_jobs(render_job_ids):
+    """render_job_id -> {"batch_id","excel_file"} cho render job sinh ra từ 1 batch Excel/TTS."""
+    ids = [i for i in {*render_job_ids} if i]
+    if not ids:
+        return {}
+    placeholders = ",".join("?" * len(ids))
+    with _connect() as con:
+        rows = con.execute(
+            f"""SELECT t.render_job_id, t.batch_id, b.excel_path
+                FROM tts_jobs t JOIN tts_batch b ON b.batch_id = t.batch_id
+                WHERE t.render_job_id IN ({placeholders})""",
+            ids,
+        ).fetchall()
+    return {
+        r["render_job_id"]: {
+            "batch_id": r["batch_id"],
+            "excel_file": Path(r["excel_path"]).name if r["excel_path"] else r["batch_id"],
+        }
+        for r in rows
+    }
+
+
 def latest_batch():
     with _connect() as con:
         r = con.execute("SELECT batch_id, excel_path FROM tts_batch ORDER BY created_at DESC, rowid DESC LIMIT 1").fetchone()
@@ -146,19 +182,31 @@ def enqueue(batch_id, excel_row, text, provider, voice_id,
 DEDUP_STATUSES = ("pending", "submitting", "retry_wait")
 
 
-def find_duplicate(product, video_type, question_type, text, statuses=DEDUP_STATUSES, other_key=None):
-    """Trả id tts_job trùng (cùng sản phẩm + loại + other_key + text) ĐANG trong hàng đợi."""
+def find_duplicate(product, video_type, question_type, text, statuses=DEDUP_STATUSES, other_key=None,
+                   excel_path=None):
+    """Trả id tts_job trùng (cùng sản phẩm + loại + other_key + text) ĐANG trong hàng đợi,
+    VÀ đến từ cùng file Excel nguồn (excel_path, qua tts_batch).
+
+    Không giới hạn theo excel_path thì 2 file KHÁC NHAU nhưng tình cờ có cùng nội dung
+    (vd câu trả lời chung ASK_QUALITY/ASK_SHIPPING... dùng lại giữa nhiều lô sản phẩm)
+    sẽ bị coi là trùng và lô sau bị lọc mất trong lúc lô trước còn đang chờ TTS — đúng
+    kiểu "thiếu câu trả lời từ excel thứ 2" chứ không phải bấm trùng file. So theo
+    excel_path (không phải batch_id) vì submit_jobs() luôn sinh batch_id MỚI mỗi lần
+    gọi kể cả cùng 1 file — so theo batch_id sẽ không bắt được ca double-click nộp lại
+    đúng file đó."""
     ph = ",".join("?" * len(statuses))
     with _connect() as con:
         r = con.execute(
-            f"""SELECT id FROM tts_jobs
-                 WHERE COALESCE(product,'')=COALESCE(?,'')
-                   AND COALESCE(video_type,'')=COALESCE(?,'')
-                   AND COALESCE(question_type,'')=COALESCE(?,'')
-                   AND COALESCE(other_key,'')=COALESCE(?,'')
-                   AND text=? AND status IN ({ph})
+            f"""SELECT t.id FROM tts_jobs t
+                 JOIN tts_batch b ON b.batch_id = t.batch_id
+                 WHERE COALESCE(t.product,'')=COALESCE(?,'')
+                   AND COALESCE(t.video_type,'')=COALESCE(?,'')
+                   AND COALESCE(t.question_type,'')=COALESCE(?,'')
+                   AND COALESCE(t.other_key,'')=COALESCE(?,'')
+                   AND t.text=? AND t.status IN ({ph})
+                   AND COALESCE(b.excel_path,'')=COALESCE(?,'')
                  LIMIT 1""",
-            (product, video_type, question_type, other_key, text, *statuses),
+            (product, video_type, question_type, other_key, text, *statuses, excel_path),
         ).fetchone()
         return r["id"] if r else None
 
@@ -257,6 +305,43 @@ def list_jobs(limit=200, status=None):
         return [dict(r) for r in con.execute(q, args)]
 
 
+def list_rate_limits():
+    """Trạng thái rate-limit hiện tại của từng provider — dùng để push lên dashboard
+    fleet (xem doc_api/API_INTEGRATION.md), không phải để điều phối request thật
+    (đó là _ensure_provider/note_rate_limited ở dưới)."""
+    now = time.time()
+    with _connect() as con:
+        rows = con.execute("SELECT * FROM tts_rate_limit").fetchall()
+    out = []
+    for r in rows:
+        throttled = r["throttle_until"] > now or r["interval_until"] > now
+        note = f"{r['recent_429']} lỗi 429 gần đây" if r["recent_429"] else None
+        out.append({"provider": r["provider"], "throttled": bool(throttled), "note": note})
+    return out
+
+
+def list_batch_ids():
+    with _connect() as con:
+        return [r["batch_id"] for r in con.execute(
+            "SELECT batch_id FROM tts_batch ORDER BY created_at DESC"
+        )]
+
+
+def batch_progress(batch_id):
+    """total/done/failed/pending cho PHẦN của batch này (không phải tổng cả file nếu
+    nhiều node cùng xử lý) — dùng để push % hoàn thành lên dashboard fleet. 'done' cần
+    cả TTS lẫn render xong; 'failed' tính cả lỗi cứng TTS lẫn render fail."""
+    rows = results_for_batch(batch_id).values()
+    total = len(rows)
+    done = failed = 0
+    for r in rows:
+        if r["tts_status"] == "failed_permanent" or r["render_status"] == "failed":
+            failed += 1
+        elif r["render_status"] == "done":
+            done += 1
+    return {"total": total, "done": done, "failed": failed, "pending": total - done - failed}
+
+
 def requeue_dead_letter(batch_id=None):
     """Đưa failed_retryable (dead-letter) về pending để chạy lại có kiểm soát. Trả số dòng."""
     q = ("UPDATE tts_jobs SET status='pending', next_attempt_at=0, attempt_count=0, "
@@ -267,6 +352,40 @@ def requeue_dead_letter(batch_id=None):
         args = (batch_id,)
     with _connect() as con:
         return con.execute(q, args).rowcount
+
+
+def requeue_failed_permanent(ids):
+    """Thử lại tay các dòng failed_permanent (lỗi cứng: voice/quyền/payload) theo id.
+
+    Không tự động/bulk-toàn-bộ như dead-letter vì nguyên nhân thường không tự hết
+    (sai cấu hình, thiếu quyền...) — nhiều dòng lỗi cứng trong cùng batch có thể vẫn
+    còn sai, retry hết sẽ chỉ tốn công. Người dùng chọn đúng dòng đã sửa nguyên nhân
+    gốc (vd. đổi voice, cấp lại quyền) rồi mới đẩy lại — ids rỗng thì không làm gì.
+    """
+    ids = [int(i) for i in (ids or [])]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    q = (f"UPDATE tts_jobs SET status='pending', next_attempt_at=0, attempt_count=0, "
+         f"updated_at=datetime('now','localtime') "
+         f"WHERE status='failed_permanent' AND id IN ({placeholders})")
+    with _connect() as con:
+        return con.execute(q, ids).rowcount
+
+
+def requeue_by_ids(ids):
+    """Thử lại tay các dòng lỗi (failed_retryable lẫn failed_permanent) theo id cụ thể —
+    dùng cho nút retry theo 1 video/1 file trên UI (người dùng đã khoanh đúng phạm vi
+    muốn thử lại, khác với requeue_dead_letter() bulk-toàn-batch)."""
+    ids = [int(i) for i in (ids or [])]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    q = (f"UPDATE tts_jobs SET status='pending', next_attempt_at=0, attempt_count=0, "
+         f"updated_at=datetime('now','localtime') "
+         f"WHERE status IN ('failed_retryable','failed_permanent') AND id IN ({placeholders})")
+    with _connect() as con:
+        return con.execute(q, ids).rowcount
 
 
 # ------------------------------------------------------------------ global rate limiter

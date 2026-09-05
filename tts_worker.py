@@ -8,6 +8,7 @@ Cấu hình (env):
   AUSYNC_THROTTLED_MS     = 3000   (nhịp khi đang bị giãn do 429)
   AUSYNC_MAX_RETRY        = 5      (số lần retry mỗi dòng)
 """
+import fcntl
 import json
 import os
 import random
@@ -17,6 +18,7 @@ import sys
 import time
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 # Ensure ffprobe/ffmpeg from the current conda env are visible even when the
 # worker is launched directly by absolute python path.
@@ -31,6 +33,34 @@ import excel_import as xi
 from latentsync.tts import factory
 
 POLL_SECONDS = 2.0
+
+ROOT = Path(__file__).parent
+WORKER_LOCK_PATH = ROOT / ".tts_worker.lock"
+_WORKER_LOCK_FILE = None
+
+
+def _acquire_worker_lock():
+    """Allow exactly one TTS worker for this project — mirrors queue_worker.py's
+    _acquire_worker_lock(). Without this, two workers would both claim_next()
+    concurrently and double-charge/double-synthesize the same TTS provider call.
+    """
+    global _WORKER_LOCK_FILE
+    lock_file = open(WORKER_LOCK_PATH, "a+")
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.seek(0)
+        owner = lock_file.read().strip() or "unknown"
+        lock_file.close()
+        _log(f"another tts worker is already running (pid={owner}); exiting")
+        return False
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+    _WORKER_LOCK_FILE = lock_file
+    return True
 
 
 def _num_env(name, default, cast=float):
@@ -148,15 +178,19 @@ def _process(job):
         duration = _validate_tts_audio(job, audio_path)
     except Exception as e:
         retryable = tts_errors.is_retryable(e)
+        # last_error đi thẳng ra UI (xem /api/tts/status) -- người dùng không đọc
+        # hiểu JSON/traceback gốc từ provider, nên lưu bản dịch tiếng Việt; bản
+        # gốc đầy đủ vẫn còn trong log dòng dưới để debug sâu khi cần.
+        user_message = tts_errors.describe(e, provider)
         if tts_errors.parse_status(e) == 429:
             tts_db.note_rate_limited(provider)        # adaptive: giãn nhịp / pause
         if retryable and attempt < MAX_RETRY:
             ra = tts_errors.parse_retry_after(e)
             delay = (ra + random.uniform(0, 1.5)) if ra is not None else _backoff_delay(attempt)
-            tts_db.schedule_retry(job["id"], e, delay)
+            tts_db.schedule_retry(job["id"], user_message, delay)
             _log(f"#{job['id']} lỗi tạm thời (retry {attempt + 1}/{MAX_RETRY} sau {delay:.1f}s): {e}")
         else:
-            tts_db.mark_failed(job["id"], e, permanent=not retryable)
+            tts_db.mark_failed(job["id"], user_message, permanent=not retryable)
             kind = "lỗi cứng" if not retryable else f"hết {MAX_RETRY} lượt retry"
             _log(f"#{job['id']} FAILED ({kind}) -> dead-letter: {e}")
         return
@@ -183,6 +217,8 @@ def _process(job):
 
 
 def main():
+    if not _acquire_worker_lock():
+        return
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     db.init_db()

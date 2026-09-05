@@ -1,23 +1,31 @@
-"""Voice he thong (voice.autovideo.vn) TTS provider.
+"""Voice he thong (autovoice.vn) TTS provider.
 
 API shape, ported from lives.git:
   POST {AUTOVOICE_URL} with X-API-Key and JSON
-  {"text": "...", "voice_name": "...", "speed": 1.2}
+  {"text": "...", "voiceId": "...", "speed": 1.0}
 
 The response can be audio bytes, JSON with an audio URL, or JSON with base64 audio.
 This provider always writes to the requested output_path, transcoding to WAV when needed.
 """
 import base64
+import json
+import logging
 import os
 import subprocess
 import tempfile
+import time
 
 import requests
 
 from .base import TTSProvider
 
-DEFAULT_URL = "https://voice.autovideo.vn/v1/tts"
-MAX_CHARS = 2000
+DEFAULT_URL = "https://autovoice.vn/rest/tts/synthesize"
+DEFAULT_TIMEOUT = 300
+DEFAULT_503_RETRIES = 3
+DEFAULT_RETRY_AFTER = 5
+MAX_CHARS = 5000  # gioi han cung cua autovoice.vn (xac nhan qua probing HTTP truc tiep)
+
+logger = logging.getLogger(__name__)
 
 
 def _float_value(value, default):
@@ -26,10 +34,48 @@ def _float_value(value, default):
 
 
 class AutoVoiceError(RuntimeError):
-    def __init__(self, message, status_code=None, retry_after=None):
+    def __init__(self, message, status_code=None, retry_after=None, retryable=None, reason=None):
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
+        self.retryable = retryable
+        self.reason = reason
+
+
+def _configured_voices(value):
+    """Parse AUTOVOICE_VOICES as JSON or comma/newline-separated voice IDs.
+
+    JSON may be a list of IDs, a {label: voiceId} mapping, or a list of objects
+    containing voiceId/code/id and optional name/label/language fields.
+    """
+    value = (value or "").strip()
+    if not value:
+        return []
+    try:
+        data = json.loads(value)
+    except (TypeError, ValueError):
+        data = [part.strip() for part in value.replace("\n", ",").split(",") if part.strip()]
+
+    if isinstance(data, dict):
+        data = [{"code": code, "name": label} for label, code in data.items()]
+    if not isinstance(data, list):
+        raise AutoVoiceError("AUTOVOICE_VOICES phai la JSON list/object hoac danh sach ID cach nhau boi dau phay.")
+
+    voices, seen = [], set()
+    for item in data:
+        if isinstance(item, str):
+            code, name, language = item.strip(), item.strip(), ""
+        elif isinstance(item, dict):
+            code = item.get("voiceId") or item.get("voice_id") or item.get("code") or item.get("id")
+            name = item.get("name") or item.get("label") or item.get("displayName") or code
+            language = item.get("language") or item.get("lang") or ""
+            code = str(code).strip() if code else ""
+        else:
+            continue
+        if code and code not in seen:
+            seen.add(code)
+            voices.append({"code": code, "name": str(name or code), "language": str(language)})
+    return voices
 
 
 def _dig_audio_url(obj):
@@ -92,7 +138,7 @@ class AutoVoiceTTS(TTSProvider):
     label = "Voice he thong"
 
     def __init__(self, api_key=None, default_voice=None, url=None, voices_url=None,
-                 speed=None, timeout=None):
+                 speed=None, timeout=None, configured_voices=None, retries_503=None):
         self.api_key = api_key if api_key is not None else os.getenv("AUTOVOICE_API_KEY", "")
         self.default_voice = default_voice or os.getenv("AUTOVOICE_DEFAULT_VOICE", "")
         self.url = (url or os.getenv("AUTOVOICE_URL", DEFAULT_URL)).strip() or DEFAULT_URL
@@ -100,7 +146,14 @@ class AutoVoiceTTS(TTSProvider):
         self.speed = _float_value(speed if speed is not None else (
             os.getenv("AUTOVOICE_SPEED") or os.getenv("TTS_SPEED")
         ), 1.2)
-        self.timeout = _float_value(timeout if timeout is not None else os.getenv("AUTOVOICE_TIMEOUT"), 60)
+        self.timeout = max(30, _float_value(
+            timeout if timeout is not None else os.getenv("AUTOVOICE_TIMEOUT"), DEFAULT_TIMEOUT
+        ))
+        self.configured_voices = _configured_voices(
+            configured_voices if configured_voices is not None else os.getenv("AUTOVOICE_VOICES")
+        )
+        retry_value = retries_503 if retries_503 is not None else os.getenv("AUTOVOICE_503_RETRIES")
+        self.retries_503 = max(0, int(_float_value(retry_value, DEFAULT_503_RETRIES)))
 
     def _headers(self):
         if not self.api_key:
@@ -117,27 +170,66 @@ class AutoVoiceTTS(TTSProvider):
     def synthesize(self, text, output_path, voice=None):
         voice = (voice or self.default_voice or "").strip()
         if not voice:
-            raise AutoVoiceError("Chua nhap ma giong AUTOVOICE_DEFAULT_VOICE / voice_name.")
+            raise AutoVoiceError("Chua nhap ma giong AUTOVOICE_DEFAULT_VOICE / voiceId.")
         text = (text or "").strip()
         if not text:
             raise AutoVoiceError("Text rong.")
         if len(text) > MAX_CHARS:
-            text = text[:MAX_CHARS].rsplit(" ", 1)[0] or text[:MAX_CHARS]
+            raise AutoVoiceError(
+                f"Nội dung dòng này dài {len(text)} ký tự, vượt quá giới hạn {MAX_CHARS} ký tự "
+                "cho phép — rút ngắn nội dung trong Excel rồi thử lại.",
+                retryable=False, reason="text_too_long",
+            )
 
         self._ensure_parent(output_path)
-        payload = {"text": text, "voice_name": voice, "speed": self.speed}
-        try:
-            r = requests.post(self.url, headers=self._headers(), json=payload, timeout=self.timeout)
-        except Exception as e:
-            raise AutoVoiceError(f"Khong goi duoc Voice he thong: {e}") from e
+        payload = {"text": text, "voiceId": voice, "speed": self.speed}
+        headers = self._headers()
+        r = None
+        for attempt in range(self.retries_503 + 1):
+            started = time.monotonic()
+            logger.warning(
+                "AutoVoice request url=%s voiceId=%s speed=%s text_chars=%d attempt=%d/%d timeout=%ss",
+                self.url, voice, self.speed, len(text), attempt + 1, self.retries_503 + 1, self.timeout,
+            )
+            try:
+                r = requests.post(self.url, headers=headers, json=payload, timeout=self.timeout)
+            except requests.RequestException as e:
+                raise AutoVoiceError(
+                    f"Khong goi duoc Voice he thong: {e}", retryable=False
+                ) from e
+
+            ctype = r.headers.get("Content-Type", "")
+            retry_after = r.headers.get("Retry-After")
+            logger.warning(
+                "AutoVoice response voiceId=%s status=%d content_type=%s bytes=%d "
+                "retry_after=%s elapsed=%.2fs",
+                voice, r.status_code, ctype or "-", len(r.content), retry_after or "-",
+                time.monotonic() - started,
+            )
+            if r.status_code != 503:
+                break
+            if attempt >= self.retries_503:
+                raise AutoVoiceError(
+                    f"Voice he thong HTTP 503 sau {attempt + 1} lan goi: {r.text[:200]}",
+                    status_code=503, retry_after=retry_after, retryable=False,
+                )
+            try:
+                delay = max(0, float(retry_after))
+            except (TypeError, ValueError):
+                delay = DEFAULT_RETRY_AFTER
+            logger.warning("AutoVoice 503 voiceId=%s; retry in %.1fs", voice, delay)
+            time.sleep(delay)
 
         if r.status_code in (401, 403):
-            raise AutoVoiceError(f"Sai AUTOVOICE_API_KEY ({r.status_code}).", status_code=r.status_code)
+            raise AutoVoiceError(
+                f"Sai AUTOVOICE_API_KEY ({r.status_code}).",
+                status_code=r.status_code, retryable=False,
+            )
         if r.status_code >= 400:
             raise AutoVoiceError(f"Voice he thong HTTP {r.status_code}: {r.text[:200]}",
-                                 status_code=r.status_code, retry_after=r.headers.get("Retry-After"))
+                                 status_code=r.status_code, retry_after=r.headers.get("Retry-After"),
+                                 retryable=False)
 
-        ctype = r.headers.get("Content-Type", "")
         if _looks_like_audio(r.content, ctype):
             return self._save_audio(r.content, output_path)
 
@@ -188,7 +280,10 @@ class AutoVoiceTTS(TTSProvider):
         return output_path
 
     def voices(self):
-        return [self.default_voice] if self.default_voice else []
+        codes = [v["code"] for v in self.configured_voices]
+        if self.default_voice and self.default_voice not in codes:
+            codes.insert(0, self.default_voice)
+        return codes
 
     def fetch_voices(self):
         r = requests.get(self._voices_url(), headers={"X-API-Key": self.api_key}, timeout=self.timeout)
@@ -210,8 +305,10 @@ class AutoVoiceTTS(TTSProvider):
                 if isinstance(v, str):
                     code, name, gender, lang = v, v, "", ""
                 elif isinstance(v, dict):
-                    code = v.get("voice_name") or v.get("code") or v.get("id") or v.get("name")
-                    name = v.get("name") or v.get("title") or v.get("display_name") or code
+                    code = (v.get("voiceId") or v.get("voice_id") or v.get("voice_name")
+                            or v.get("code") or v.get("id") or v.get("name"))
+                    name = (v.get("displayName") or v.get("display_name") or v.get("name")
+                            or v.get("title") or code)
                     gender = v.get("gender") or ""
                     lang = v.get("language") or v.get("lang") or v.get("language_code") or ""
                 else:

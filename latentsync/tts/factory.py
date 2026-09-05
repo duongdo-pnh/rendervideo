@@ -5,7 +5,10 @@ Loads .env (repo root) on import so the providers' os.getenv() calls see it.
 import os
 from pathlib import Path
 
-ENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+from env_path import resolve_env_path
+
+# Repo root = two levels up from this file (latentsync/tts/factory.py).
+ENV_PATH = resolve_env_path(Path(__file__).resolve().parents[2] / ".env")
 _env_mtime = None
 
 try:

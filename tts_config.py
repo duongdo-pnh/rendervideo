@@ -7,8 +7,10 @@ new settings take effect immediately (no restart).
 import os
 from pathlib import Path
 
+from env_path import resolve_env_path
+
 ROOT = Path(__file__).parent
-ENV_PATH = ROOT / ".env"
+ENV_PATH = resolve_env_path(ROOT / ".env")
 
 COMMON_FIELDS = [
     ("TTS_SPEED", "Tốc độ đọc chung (mặc định 1.2)", False),
@@ -34,10 +36,13 @@ PROVIDER_FIELDS = {
     ],
     "autovoice": [
         ("AUTOVOICE_API_KEY", "API Key Voice hệ thống (X-API-Key)", True),
-        ("AUTOVOICE_DEFAULT_VOICE", "Mã giọng (voice_name)", False),
+        ("AUTOVOICE_DEFAULT_VOICE", "Mã giọng (voiceId)", False),
+        ("AUTOVOICE_VOICES", "Danh sách voiceId (JSON hoặc cách nhau bằng dấu phẩy)", False),
         ("AUTOVOICE_URL", "Endpoint TTS", False),
         ("AUTOVOICE_VOICES_URL", "Endpoint danh sách giọng (tuỳ chọn)", False),
         ("AUTOVOICE_SPEED", "Tốc độ riêng Voice hệ thống (trống = dùng TTS_SPEED)", False),
+        ("AUTOVOICE_TIMEOUT", "Timeout request, giây (tối thiểu 30, mặc định 60)", False),
+        ("AUTOVOICE_503_RETRIES", "Số lần retry khi HTTP 503 (mặc định 3)", False),
     ],
     "api": [
         ("TTS_API_KEY", "API Key", True),
@@ -92,6 +97,7 @@ def save_config(values: dict, default_provider: str):
     """
     from dotenv import set_key, load_dotenv
 
+    ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
     ENV_PATH.touch(exist_ok=True)
     # Persist (set_key giữ nguyên các dòng khác, cập nhật/thêm key cần thiết).
     set_key(str(ENV_PATH), "DEFAULT_TTS_PROVIDER", (default_provider or "vbee").strip())
@@ -106,6 +112,10 @@ def save_config(values: dict, default_provider: str):
             v = "90"
         if k == "AUSYNCLAB_MODEL" and not v:
             v = "myna-1-turbo"
+        if k == "AUTOVOICE_TIMEOUT" and not v:
+            v = "60"
+        if k == "AUTOVOICE_503_RETRIES" and not v:
+            v = "3"
         set_key(str(ENV_PATH), k, v)
         os.environ[k] = v                       # áp dụng ngay cho tiến trình hiện tại
     os.environ["DEFAULT_TTS_PROVIDER"] = (default_provider or "vbee").strip()
