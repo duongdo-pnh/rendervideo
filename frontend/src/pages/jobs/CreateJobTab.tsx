@@ -12,6 +12,7 @@ import { NativeFileField } from '../../components/form/NativeFileField'
 import { useNotify } from '../../components/notifications/NotificationProvider'
 import { createJob } from '../../api/jobs'
 import { ApiError } from '../../api/client'
+import { useEngineChoices } from '../../hooks/useEngineChoices'
 import { buildName, INTENT_CHOICES, KIND_ANSWER, KIND_INTRO, slugKey } from '../../utils/jobNaming'
 import type { Engine, InputType, ModelRes, OutRes } from '../../types/api'
 
@@ -19,6 +20,7 @@ const OUT_RES_CHOICES: OutRes[] = ['Gốc', '1080', '720', '480 Nhanh']
 
 export function CreateJobTab() {
   const notify = useNotify()
+  const engineChoices = useEngineChoices()
 
   const [video, setVideo] = useState<File | null>(null)
   const [audio, setAudio] = useState<File | null>(null)
@@ -157,10 +159,7 @@ export function CreateJobTab() {
             label="Engine"
             value={engine}
             onChange={(v) => setEngine(v as Engine)}
-            options={[
-              { label: 'MuseTalk 1.5', value: 'musetalk' },
-              { label: 'LatentSync', value: 'latentsync' },
-            ]}
+            options={engineChoices}
           />
           <SelectField
             label="Độ phân giải"

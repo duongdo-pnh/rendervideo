@@ -297,6 +297,38 @@ def request_cancel(job_id):
         return status
 
 
+def request_cancel_by_drive_folder(drive_folder):
+    """Huỷ MỌI render job đang queued/rendering của một batch, tìm theo drive_folder.
+    Trả list id đã tác động. Không raise nếu không có gì để huỷ.
+
+    drive_folder là tên file Excel bỏ đuôi (tts_worker.py đặt lúc tạo render job),
+    và akali_bridge chèn '__job<akali_job_id>' vào tên Excel nên nó là khoá DUY NHẤT
+    cho một batch akali. Dùng khoá này thay vì đi từ tts_jobs vì nó bắt được cả
+    render job "mồ côi": tts_worker gọi add_job() TRƯỚC mark_done(), nên một dòng
+    tts_jobs bị xoá đúng lúc worker kẹt giữa hai lệnh đó vẫn để lại render job mà
+    không còn dòng nào trỏ tới — đi từ tts_jobs sẽ bỏ sót đúng job đang đốt GPU.
+
+    Cùng quy ước với request_cancel(): 'queued' huỷ ngay tại chỗ, 'rendering' chỉ
+    đặt cờ để queue_worker tự dừng subprocess của chính nó ở vòng poll kế tiếp.
+    """
+    with _connect() as con:
+        con.execute("BEGIN IMMEDIATE")
+        rows = con.execute(
+            "SELECT id, status FROM jobs WHERE drive_folder=? AND status IN (?, ?)",
+            (drive_folder, STATUS_QUEUED, STATUS_RENDERING),
+        ).fetchall()
+        for row in rows:
+            if row["status"] == STATUS_QUEUED:
+                con.execute(
+                    "UPDATE jobs SET status='cancelled', error='Batch bị huỷ từ akali.', "
+                    "finished_at=datetime('now','localtime') WHERE id=?",
+                    (row["id"],),
+                )
+            else:
+                con.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (row["id"],))
+        return [row["id"] for row in rows]
+
+
 def is_cancel_requested(job_id):
     with _connect() as con:
         row = con.execute("SELECT cancel_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
@@ -494,6 +526,23 @@ def list_stale_done_jobs(older_than_days):
     with _connect() as con:
         rows = con.execute(
             "SELECT * FROM jobs WHERE status='done' AND output_path IS NOT NULL "
+            "AND finished_at IS NOT NULL "
+            "AND finished_at < datetime('now', 'localtime', ?)",
+            (f"-{int(older_than_days)} days",),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def list_stale_upload_jobs(older_than_days):
+    """Job đã kết thúc (done/failed/cancelled) quá `older_than_days` ngày (theo
+    finished_at) — dùng để dọn file input đã upload khỏi ổ đĩa định kỳ
+    (queue_worker.cleanup_old_uploads). failed/cancelled cũng tính vào đây: retry
+    chỉ còn tự động khi job vẫn 'queued' (MAX_RETRIES đã dùng hết mới thành
+    'failed' thật sự), nút Retry thủ công trên 1 job failed lâu ngày vẫn hoạt
+    động nhưng sẽ báo lỗi thiếu file input nếu bấm sau khi hạn này đã qua."""
+    with _connect() as con:
+        rows = con.execute(
+            "SELECT * FROM jobs WHERE status IN ('done','failed','cancelled') "
             "AND finished_at IS NOT NULL "
             "AND finished_at < datetime('now', 'localtime', ?)",
             (f"-{int(older_than_days)} days",),

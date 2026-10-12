@@ -70,9 +70,12 @@ def drive_files(folder_id: str | None = Query(None)):
     )
 
 
+REAUTH_TIMEOUT_SECONDS = 60
+
+
 def _run_reauth():
     try:
-        gdrive.run_oauth_flow(open_browser=True)
+        gdrive.run_oauth_flow(open_browser=True, timeout_seconds=REAUTH_TIMEOUT_SECONDS)
         with _reauth_lock:
             _reauth_state.update(status="success", message="Đã lấy token mới, Drive đã sẵn sàng.")
     except Exception as e:
@@ -85,7 +88,10 @@ def start_reauth():
     with _reauth_lock:
         if _reauth_state["status"] == "pending":
             raise HTTPException(409, "Đang có một phiên xác thực khác chạy — hoàn tất trên trình duyệt trước.")
-        _reauth_state.update(status="pending", message="Đã mở trình duyệt — hoàn tất đăng nhập & đồng ý quyền truy cập.")
+        _reauth_state.update(
+            status="pending",
+            message=f"Đã mở trình duyệt — hoàn tất đăng nhập & đồng ý quyền truy cập trong {REAUTH_TIMEOUT_SECONDS}s.",
+        )
     threading.Thread(target=_run_reauth, daemon=True).start()
     return DriveReauthStatus(**_reauth_state)
 

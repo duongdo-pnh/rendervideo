@@ -7,8 +7,7 @@ import {
   UserRound,
   Radio,
   Cloud,
-  AudioLines,
-  LayoutDashboard,
+  Settings,
   Moon,
   Sun,
   Menu,
@@ -31,8 +30,7 @@ export const NAV: NavItem[] = [
   { to: '/avatar-cache', label: 'Avatar Cache', icon: UserRound },
   { to: '/livestream', label: 'Livestream', icon: Radio },
   { to: '/drive', label: 'Google Drive', icon: Cloud },
-  { to: '/tts-config', label: 'Cấu hình TTS', icon: AudioLines },
-  { to: '/dashboard-fleet', label: 'Dashboard Fleet', icon: LayoutDashboard },
+  { to: '/settings', label: 'Cài đặt', icon: Settings },
 ]
 
 function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
@@ -47,7 +45,7 @@ function SidebarContent({ onNavigate }: { onNavigate?: () => void }) {
         </div>
         <div>
           <div className="text-sm font-semibold leading-tight">Byscom Render</div>
-          <div className="text-xs text-slate-500">Lip-sync pipeline · 24/7</div>
+          <div className="text-xs text-slate-500">Lip-sync pipeline · v{__APP_VERSION__}</div>
         </div>
       </div>
       <nav className="flex-1 space-y-0.5 px-2 py-2">

@@ -14,9 +14,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+import dashboard_reporter
 import database as db
 
-from . import avatars, dashboard, drive, excel, jobs, livestream, tts_config_api, videos, workers, ws
+from . import akali, avatars, dashboard, drive, excel, jobs, livestream, tts_config_api, videos, workers, ws
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rendervideo")
@@ -43,7 +44,36 @@ app.include_router(livestream.router)
 app.include_router(tts_config_api.router)
 app.include_router(drive.router)
 app.include_router(dashboard.router)
+app.include_router(akali.router)
 app.include_router(ws.router)
+
+
+# Máy chưa có INGEST_TOKEN = chưa đăng ký với dashboard fleet -> khoá toàn bộ API.
+# Chặn ở đây chứ không chỉ ẩn nút trên giao diện: giao diện chỉ là một client,
+# ẩn nút không ngăn được ai gọi thẳng API.
+#
+# Chừa đúng 3 đường để bản thân màn hình kích hoạt còn chạy được: đọc trạng thái,
+# lưu token, và health check. Không chặn đường ngoài /api (trang tĩnh, /ws) —
+# chặn trang tĩnh thì không load nổi chính cái màn hình nhập token.
+_NODE_KEY_OPEN_PATHS = frozenset({
+    "/api/health",
+    "/api/dashboard/status",
+    "/api/dashboard/config",
+})
+
+
+@app.middleware("http")
+async def require_node_key(request: Request, call_next):
+    path = request.url.path
+    if (path.startswith("/api/")
+            and path not in _NODE_KEY_OPEN_PATHS
+            and not dashboard_reporter.dashboard_enabled()):
+        logger.warning("403 %s %s: máy chưa nhập Ingest Token", request.method, path)
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Máy chưa kích hoạt — nhập Ingest Token (Node key) để dùng."},
+        )
+    return await call_next(request)
 
 
 # Every response an endpoint sends back today already goes through one of

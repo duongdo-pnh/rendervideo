@@ -131,7 +131,9 @@ def build_pipeline(config, ckpt_path="checkpoints/latentsync_unet.pt", enable_de
     whisper_path = "checkpoints/whisper/small.pt" if config.model.cross_attention_dim == 768 else "checkpoints/whisper/tiny.pt"
     audio_encoder = Audio2Feature(model_path=whisper_path, device="cuda",
                                   num_frames=config.data.num_frames, audio_feat_length=config.data.audio_feat_length)
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
+    vae = AutoencoderKL.from_pretrained(
+        "checkpoints/sd-vae" if os.path.isfile("checkpoints/sd-vae/config.json")
+        else "stabilityai/sd-vae-ft-mse", torch_dtype=dtype)
     vae.config.scaling_factor = 0.18215
     vae.config.shift_factor = 0
     unet, _ = UNet3DConditionModel.from_pretrained(OmegaConf.to_container(config.model), ckpt_path, device="cpu")

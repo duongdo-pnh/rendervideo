@@ -45,6 +45,11 @@ export interface PriorityChoice {
   label: string
 }
 
+export interface EngineChoice {
+  label: string
+  value: string
+}
+
 export interface DeletedJobsResponse {
   deleted: number
   message: string
@@ -218,6 +223,13 @@ export interface DashboardStatus {
   ingest_token?: string | null
   node_name?: string | null
   error?: string | null
+}
+
+export interface AkaliStatus {
+  configured: boolean
+  akali_url?: string | null
+  worker_key?: string | null
+  worker_id?: string | null
 }
 
 // Pushed over /ws/jobs every 2s (or {error} on server-side failure)

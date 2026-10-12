@@ -28,7 +28,7 @@ function findVoiceKey(fields: [string, string, boolean][]): string | undefined {
   return fields.find(([key]) => key.endsWith('_DEFAULT_VOICE'))?.[0]
 }
 
-export default function TtsConfigPage() {
+export function TtsConfigTab() {
   const notify = useNotify()
   const [schema, setSchema] = useState<TtsConfigSchema | null>(null)
   const [values, setValues] = useState<Record<string, string>>({})

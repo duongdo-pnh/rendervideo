@@ -26,6 +26,7 @@ _envbin = os.path.dirname(sys.executable)
 if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
     os.environ["PATH"] = _envbin + os.pathsep + os.environ.get("PATH", "")
 
+import dashboard_reporter
 import tts_db
 import tts_errors
 import database as db
@@ -221,6 +222,9 @@ def main():
         return
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
+    # Node key = "đăng nhập" của máy. Chưa có thì không gọi TTS, không tạo render job.
+    if not dashboard_reporter.wait_until_activated(lambda: _RUNNING, _log):
+        return
     db.init_db()
     tts_db.init_db()
     xi.TTS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)

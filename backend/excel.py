@@ -16,6 +16,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 import excel_import
+import gpu_info
 import job_files
 import tts_db
 from latentsync.tts.factory import available_providers, list_voices
@@ -68,6 +69,8 @@ def submit_excel(body: ExcelSubmitRequest):
     rows = body.state.get("rows")
     if not rows:
         raise HTTPException(422, "Chưa có dòng sẵn sàng — gọi /preview trước.")
+    if body.engine == "latentsync" and gpu_info.latentsync_blocked():
+        raise HTTPException(422, "LatentSync không khả dụng trên GPU RTX 3080/3080 Ti (hay gặp lỗi) — dùng MuseTalk.")
     render_config = dict(
         model_res=body.model_res, out_res=body.out_res,
         enhance_mouth=int(body.enhance_mouth), enhance_region=body.enhance_region,

@@ -257,6 +257,39 @@ def list_files(folder_id=None, page_size=200):
     return out
 
 
+def download_folder(folder_id, dest_dir):
+    """Tải mọi FILE (không đệ quy vào thư mục con) nằm trực tiếp trong `folder_id`
+    về `dest_dir` (tự tạo nếu chưa có). Dùng cho akali_bridge.py tải folder batch
+    (đúng 1 Excel + 1 video, xem doc_api/APi_RENDER_QUEUE.md mục 4) về máy trước
+    khi render — hợp đồng đó không có thư mục lồng nên bỏ qua item is_folder.
+
+    Trả về list Path đã tải (thứ tự theo list_files: thư mục trước, tên sau —
+    ở đây luôn rỗng thư mục do bị bỏ qua). Lỗi mạng/API để nguyên cho caller
+    tự quyết retry (akali_bridge coi lỗi tải folder là retryable).
+    """
+    import io
+
+    from googleapiclient.http import MediaIoBaseDownload
+
+    dest_dir = Path(dest_dir)
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    service = get_service()
+
+    downloaded = []
+    for item in list_files(folder_id, page_size=1000):
+        if item["is_folder"]:
+            continue
+        dest_path = dest_dir / item["name"]
+        request = service.files().get_media(fileId=item["id"], supportsAllDrives=True)
+        with io.FileIO(dest_path, "wb") as fh:
+            downloader = MediaIoBaseDownload(fh, request)
+            done = False
+            while not done:
+                _status, done = downloader.next_chunk(num_retries=3)
+        downloaded.append(dest_path)
+    return downloaded
+
+
 def folder_info(folder_id=None):
     """Tên + link thư mục (dùng cho breadcrumb) — raise nếu ID không phải thư mục hợp lệ."""
     folder_id = folder_id or default_folder_id()
@@ -271,6 +304,19 @@ def folder_info(folder_id=None):
     return {"id": info["id"], "name": info["name"], "web_view_link": info.get("webViewLink")}
 
 
+def _create_file(service, path, name, parent_id):
+    from googleapiclient.http import MediaFileUpload
+
+    media = MediaFileUpload(str(path), resumable=True, chunksize=10 * 1024 * 1024)
+    body = {"name": name, "parents": [parent_id]}
+    return (
+        service.files()
+        .create(body=body, media_body=media, fields="id,name,webViewLink",
+                supportsAllDrives=True)
+        .execute(num_retries=3)     # tự retry lỗi mạng/5xx tạm thời
+    )
+
+
 def upload_file(path, folder_id=None, name=None, subfolder=None):
     """Upload 1 file vào thư mục Drive. Trả về {'id', 'name', 'webViewLink'}.
 
@@ -280,7 +326,7 @@ def upload_file(path, folder_id=None, name=None, subfolder=None):
     Raise DriveConfigError (thiếu config) hoặc lỗi API — caller tự try/except
     (queue_worker bọc sẵn, upload hỏng không được làm chết worker).
     """
-    from googleapiclient.http import MediaFileUpload
+    from googleapiclient.errors import HttpError
 
     path = Path(path)
     if not path.exists():
@@ -290,17 +336,22 @@ def upload_file(path, folder_id=None, name=None, subfolder=None):
         raise DriveConfigError("Chưa điền GOOGLE_DRIVE_FOLDER_ID trong .env")
 
     service = get_service()
-    if subfolder and str(subfolder).strip():
-        folder_id = ensure_folder(service, str(subfolder).strip(), folder_id)
-    media = MediaFileUpload(str(path), resumable=True, chunksize=10 * 1024 * 1024)
-    body = {"name": name or path.name, "parents": [folder_id]}
-    info = (
-        service.files()
-        .create(body=body, media_body=media, fields="id,name,webViewLink",
-                supportsAllDrives=True)
-        .execute(num_retries=3)     # tự retry lỗi mạng/5xx tạm thời
-    )
-    return info
+    subfolder = str(subfolder).strip() if subfolder else ""
+    target_id = ensure_folder(service, subfolder, folder_id) if subfolder else folder_id
+    try:
+        return _create_file(service, path, name or path.name, target_id)
+    except HttpError as e:
+        # ensure_folder()'s cache never expires — if someone deletes that subfolder
+        # straight from Drive after it's cached, every upload into it 404s forever
+        # until this process restarts. Evict the stale entry and retry once with a
+        # fresh find-or-create before giving up (only for a resolved SUBfolder — a
+        # 404 on the top-level configured folder_id itself needs a human to fix the
+        # Drive config, retrying won't help).
+        if subfolder and target_id != folder_id and e.status_code == 404:
+            _folder_cache.pop((folder_id, subfolder), None)
+            target_id = ensure_folder(service, subfolder, folder_id)
+            return _create_file(service, path, name or path.name, target_id)
+        raise
 
 
 # ---------------------------------------------------------------- .env helpers
@@ -367,13 +418,19 @@ def cmd_extract(json_path):
     print(f"→ Xong có thể XÓA file JSON: rm {json_path}")
 
 
-def run_oauth_flow(open_browser=True):
+def run_oauth_flow(open_browser=True, timeout_seconds=None):
     """OAuth 1 lần: mở trình duyệt -> đồng ý -> lưu refresh token vào DB (jobs.db).
 
     Blocking — chạy `flow.run_local_server()` (tự mở trình duyệt + đợi callback trên
     localhost). Raise DriveConfigError nếu Google không trả refresh token. Trả về
     refresh token mới. Tách khỏi cmd_auth() để backend/drive.py gọi được từ một
     thread nền mà không làm chết tiến trình (sys.exit) khi lỗi.
+
+    timeout_seconds: nếu đặt, bỏ chờ sau ngần ấy giây nếu không nhận được callback
+    (tab bị đóng, người dùng không đồng ý...). Mặc định None = chờ vô hạn, giữ
+    nguyên hành vi cũ cho cmd_auth() (CLI). backend/drive.py truyền một giá trị cụ
+    thể vì nó chạy trong thread nền — không có timeout thì _reauth_state kẹt ở
+    "pending" mãi mãi, chặn mọi lần thử lại cho tới khi backend restart.
     """
     from google_auth_oauthlib.flow import InstalledAppFlow
 
@@ -387,7 +444,17 @@ def run_oauth_flow(open_browser=True):
         }},
         scopes=SCOPES,
     )
-    creds = flow.run_local_server(port=0, open_browser=open_browser, access_type="offline", prompt="consent")
+    try:
+        creds = flow.run_local_server(
+            port=0, open_browser=open_browser, access_type="offline", prompt="consent",
+            timeout_seconds=timeout_seconds,
+        )
+    except AttributeError:
+        # run_local_server's own timeout path doesn't raise: handle_request() just
+        # returns with no request received, and it then blows up trying to read the
+        # (never-set) authorization response off None. Confirmed against the pinned
+        # google-auth-oauthlib==1.2.1 directly — this is the timeout, not a real bug.
+        raise DriveConfigError(f"Hết {timeout_seconds}s chờ đăng nhập trên trình duyệt — thử lại.") from None
     if not creds.refresh_token:
         raise DriveConfigError("Google không trả refresh token — thử lại (đảm bảo màn hình consent hiện ra).")
     database.set_config("google_drive_refresh_token", creds.refresh_token)

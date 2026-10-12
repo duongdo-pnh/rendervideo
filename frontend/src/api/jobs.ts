@@ -1,5 +1,5 @@
 import { api } from './client'
-import type { CancelAllResponse, CancelJobResponse, DeletedJobsResponse, JobOut, JobSubmitResponse, PriorityChoice } from '../types/api'
+import type { CancelAllResponse, CancelJobResponse, DeletedJobsResponse, EngineChoice, JobOut, JobSubmitResponse, PriorityChoice } from '../types/api'
 
 export function listJobs(): Promise<JobOut[]> {
   return api.get('/api/jobs')
@@ -7,6 +7,10 @@ export function listJobs(): Promise<JobOut[]> {
 
 export function priorityChoices(): Promise<PriorityChoice[]> {
   return api.get('/api/jobs/priority-choices')
+}
+
+export function engineChoices(): Promise<EngineChoice[]> {
+  return api.get('/api/jobs/engine-choices')
 }
 
 export function createJob(form: FormData): Promise<JobSubmitResponse> {

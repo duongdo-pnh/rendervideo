@@ -489,9 +489,13 @@ def submit_jobs(rows, shopee_item_id=None, progress=None, batch_id=None, excel_p
     TTS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     if batch_id is None:
         batch_id = uuid.uuid4().hex[:12]
-    tts_db.save_batch(batch_id, excel_path)
     rc = dict(RENDER_DEFAULTS)
     rc.update({k: v for k, v in (render_config or {}).items() if v is not None})
+    # model: the caller's EXPLICIT engine choice only — not RENDER_DEFAULTS' "musetalk"
+    # fallback (that default is for how the batch actually renders, unrelated to whether
+    # the batch has a *declared* model worth reporting; doc_api/API_INTEGRATION.md's
+    # "không gửi thì dashboard không suy đoán" means this agent shouldn't guess either).
+    tts_db.save_batch(batch_id, excel_path, model=(render_config or {}).get("engine"))
     rc_json = json.dumps(rc)
 
     enqueued, warnings, skipped = [], [], []

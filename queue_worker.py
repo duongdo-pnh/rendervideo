@@ -18,7 +18,7 @@ import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Thêm bin của python hiện hành (conda env) vào PATH -> subprocess thấy ffmpeg/ffprobe
@@ -29,6 +29,7 @@ if _envbin and _envbin not in os.environ.get("PATH", "").split(os.pathsep):
 
 import database as db
 import dashboard_reporter
+import job_files
 
 # Google Drive auto-upload là tùy chọn: thiếu thư viện google-* thì worker vẫn chạy bình thường.
 try:
@@ -48,9 +49,16 @@ POLL_SECONDS = 5            # idle poll interval when the queue is empty
 BACKUP_INTERVAL = 6 * 3600  # SQLite backup cadence
 BACKUP_KEEP = 8             # keep this many most-recent backups
 RENDER_CLEANUP_INTERVAL = 24 * 3600  # how often to sweep for stale renders
-RENDER_RETENTION_DAYS = 10           # delete 'done' output video this long after finished_at
+RENDER_RETENTION_DAYS = 3            # delete 'done' output video this long after finished_at
+UPLOAD_RETENTION_DAYS = 3            # delete a finished job's uploaded input this long after finished_at
 MUSETALK_AVATARS_VIDEO_DIR = ROOT / "engines" / "MuseTalk" / "results" / "v15" / "avatars_video"
-MUSETALK_CACHE_RETENTION_DAYS = 3    # delete a video-render avatar cache this long after last use
+MUSETALK_CACHE_RETENTION_DAYS = 2    # delete a video-render avatar cache this long after last use
+OS_DOWNLOADS_DIR = Path.home() / "Downloads"  # the OS's general Downloads folder — NOT
+OS_DOWNLOADS_RETENTION_DAYS = 5               # DOWNLOADS_DIR/Desktop-Renders above; nothing
+                                               # here is tracked by the render queue's own DB
+TRASH_DIR = Path.home() / ".local" / "share" / "Trash"  # freedesktop.org trash — where a
+TRASH_RETENTION_DAYS = 5                                # GUI file manager delete lands, not
+                                                         # a real delete; also not app-tracked
 GPU_MIN_FREE_MB = 2048      # require at least this much free VRAM before claiming a job
 GPU_WAIT_SECONDS = 30       # back-off when the GPU is unhealthy/busy
 RENDER_IDLE_TIMEOUT = 20 * 60  # no new log output this long means the renderer is genuinely stuck
@@ -324,6 +332,25 @@ def cleanup_old_renders():
         _log(f"cleanup: removed {removed} render(s) older than {RENDER_RETENTION_DAYS} days")
 
 
+def cleanup_old_uploads():
+    """Xóa file input (video/audio) đã upload của job đã kết thúc (done/failed/cancelled)
+    quá UPLOAD_RETENTION_DAYS ngày — trước giờ chỉ được dọn khi người dùng tự tay xóa job
+    (backend/jobs.py delete_job/clear_jobs), nên job nào không ai xóa thì uploads/ phình
+    vô hạn. job_files.cleanup_job_files() tự bỏ qua uploads/videos và uploads/tts (không
+    phải thư mục riêng của 1 job) và no-op nếu file đã không còn, nên gọi lại nhiều lần
+    là an toàn."""
+    stale = db.list_stale_upload_jobs(UPLOAD_RETENTION_DAYS)
+    removed = 0
+    for job in stale:
+        job_dir = Path(job.get("video_path") or "").parent
+        if not job_dir.exists():
+            continue  # already cleaned (manually, or an earlier sweep) — nothing to count
+        job_files.cleanup_job_files(job)
+        removed += 1
+    if removed:
+        _log(f"cleanup: removed {removed} job upload(s) older than {UPLOAD_RETENTION_DAYS} days")
+
+
 def cleanup_old_musetalk_avatar_cache():
     """Xóa avatar cache MuseTalk (video render, results/v15/avatars_video) không được
     dùng lại quá MUSETALK_CACHE_RETENTION_DAYS ngày.
@@ -353,6 +380,72 @@ def cleanup_old_musetalk_avatar_cache():
             _log(f"cleanup: failed to remove musetalk cache {entry.name}: {e}")
     if removed:
         _log(f"cleanup: removed {removed} musetalk avatar cache(s) older than {MUSETALK_CACHE_RETENTION_DAYS} days")
+
+
+def cleanup_old_os_downloads():
+    """Xóa mọi file/thư mục nằm trực tiếp trong ~/Downloads (thư mục Downloads chung của
+    hệ điều hành — KHÁC hẳn DOWNLOADS_DIR/~/Desktop/Renders ở trên) cũ hơn
+    OS_DOWNLOADS_RETENTION_DAYS ngày theo mtime. Dọn máy chung theo yêu cầu, không liên
+    quan gì tới job/DB của render queue — không có gì trong ~/Downloads được app này tạo
+    ra hay theo dõi, nên xóa thẳng theo tuổi, không qua DB như các cleanup khác."""
+    if not OS_DOWNLOADS_DIR.is_dir():
+        return
+    cutoff = time.time() - OS_DOWNLOADS_RETENTION_DAYS * 86400
+    removed = 0
+    for entry in OS_DOWNLOADS_DIR.iterdir():
+        try:
+            if entry.stat().st_mtime >= cutoff:
+                continue
+            if entry.is_dir() and not entry.is_symlink():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            removed += 1
+        except OSError as e:
+            _log(f"cleanup: failed to remove ~/Downloads entry {entry.name}: {e}")
+    if removed:
+        _log(f"cleanup: removed {removed} ~/Downloads entr(ies) older than {OS_DOWNLOADS_RETENTION_DAYS} days")
+
+
+def cleanup_old_trash():
+    """Xóa mục trong ~/.local/share/Trash (thùng rác chuẩn freedesktop.org — nơi file
+    manager GUI chuyển file bị xóa tới thay vì xóa thẳng) quá TRASH_RETENTION_DAYS ngày.
+
+    Đọc DeletionDate trong info/*.trashinfo thay vì mtime của chính file trong files/ —
+    file khi vào thùng rác vẫn giữ nguyên mtime GỐC (lúc tạo/sửa lần cuối, có khi từ rất
+    lâu trước), không phải lúc bị xóa, nên dùng mtime sẽ tính sai hoàn toàn thời điểm cần
+    so. Xóa cả 2 phía (files/ + info/*.trashinfo) cùng lúc để không để lại metadata mồ côi."""
+    info_dir = TRASH_DIR / "info"
+    if not info_dir.is_dir():
+        return
+    cutoff = datetime.now() - timedelta(days=TRASH_RETENTION_DAYS)
+    removed = 0
+    for info_path in info_dir.glob("*.trashinfo"):
+        try:
+            text = info_path.read_text(errors="replace")
+        except OSError:
+            continue
+        m = re.search(r"^DeletionDate=(.+)$", text, re.MULTILINE)
+        if not m:
+            continue
+        try:
+            deleted_at = datetime.strptime(m.group(1).strip(), "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        if deleted_at >= cutoff:
+            continue
+        target = TRASH_DIR / "files" / info_path.name[: -len(".trashinfo")]
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            info_path.unlink()
+            removed += 1
+        except OSError as e:
+            _log(f"cleanup: failed to remove trash entry {info_path.stem}: {e}")
+    if removed:
+        _log(f"cleanup: removed {removed} trash entr(ies) older than {TRASH_RETENTION_DAYS} days")
 
 
 # ---------------------------------------------------------------- one job
@@ -501,6 +594,11 @@ def _process_claimed_job(job):
         else:
             db.mark_failed(job_id, exc)
             _log("job #{} FAILED permanently: {}".format(job_id, exc))
+    finally:
+        # Scratch dir (trimmed/normalized video+audio, raw out.mp4) — the output is
+        # already copied out to DOWNLOADS_DIR by now, and a retry regenerates this
+        # from uploads/ from scratch, so nothing downstream ever needs it again.
+        shutil.rmtree(WORK_DIR / str(job_id), ignore_errors=True)
 
 def _collect_musetalk_pair(anchor):
     """Wait briefly for a second matching job created asynchronously by Excel/TTS."""
@@ -534,6 +632,9 @@ def main():
     _ensure_dirs()
     if not _acquire_worker_lock():
         return
+    # Node key = "đăng nhập" của máy. Chưa có thì không render gì cả.
+    if not dashboard_reporter.wait_until_activated(lambda: _RUNNING, _log):
+        return
 
     db.init_db()
     n = db.reset_stuck_jobs()
@@ -563,7 +664,10 @@ def main():
 
             if time.time() - last_cleanup >= RENDER_CLEANUP_INTERVAL:
                 cleanup_old_renders()
+                cleanup_old_uploads()
                 cleanup_old_musetalk_avatar_cache()
+                cleanup_old_os_downloads()
+                cleanup_old_trash()
                 last_cleanup = time.time()
 
             job = db.claim_next_job()

@@ -25,10 +25,15 @@ khác, và không máy nào giả mạo/ghi đè dữ liệu của máy khác đ
 **Cách 1 — qua giao diện (khuyến nghị, không cần biết dòng lệnh):**
 
 Đăng nhập dashboard → mục **Node keys** ở sidebar → **Tạo node mới** → điền
-tên gợi nhớ tuỳ chọn (vd "Render-01") → bấm Tạo. Token hiện ngay trong 1
-banner, có nút copy — đóng banner là không xem lại được nữa (backend chỉ lưu
-hash). Token bị lộ/thất lạc thì bấm **Tạo lại key** ở đúng dòng node đó —
-token cũ mất hiệu lực ngay lập tức, không cần tự xoá gì trong Mongo.
+tên gợi nhớ / cụm-nhóm / địa chỉ, đều **tuỳ chọn** (vd "Render-01" / "Rack-A"
+/ IP nội bộ) → bấm Tạo. Token hiện ngay trong 1 banner, có nút copy — đóng
+banner là không xem lại được nữa (backend chỉ lưu hash). Token bị lộ/thất lạc
+thì bấm **Tạo lại key** ở đúng dòng node đó — token cũ mất hiệu lực ngay lập
+tức, không cần tự xoá gì trong Mongo.
+
+3 trường tên/cụm/địa chỉ thuần thông tin quản lý, để bạn tự tổ chức/nhận diện
+node trên trang Node keys — **không** dùng để dashboard tự kết nối/định tuyến
+gì tới node đó, kiến trúc vẫn luôn là node tự đẩy dữ liệu lên (xem đầu file).
 
 **Cách 2 — qua dòng lệnh** (tiện cho script hoá, kết quả giống hệt cách 1):
 
@@ -36,7 +41,7 @@ token cũ mất hiệu lực ngay lập tức, không cần tự xoá gì trong 
 cd dashboard && docker compose exec -it backend python -m app.scripts.create_node
 ```
 
-Script hỏi 1 tên gợi nhớ (tuỳ chọn), rồi in ra:
+Script hỏi lần lượt tên gợi nhớ / cụm-nhóm / địa chỉ (đều tuỳ chọn), rồi in ra:
 
 ```
 INGEST_TOKEN=<chuỗi dài>
@@ -80,6 +85,8 @@ curl -X POST http://<dashboard>/api/ingest/node \
     "load_avg": [3.1, 2.8, 2.5],
     "ram_used_gb": 41.2,
     "ram_total_gb": 64,
+    "disk_used_gb": 420,
+    "disk_total_gb": 512,
     "disks": {
       "renders": {"used_gb": 320, "total_gb": 512},
       "avatar_cache": {"used_gb": 88, "total_gb": 200},
@@ -90,15 +97,27 @@ curl -X POST http://<dashboard>/api/ingest/node \
        "mem_used_mb": 21500, "mem_total_mb": 24576, "temp_c": 71}
     ],
     "current_job": "#1042 ao_thun_trang__ASK_PRICE",
-    "last_backup_at": "2026-08-21 12:00"
+    "last_backup_at": "2026-08-21 12:00",
+    "version": "1.4.2"
   }'
 ```
 
 `name` ở đây là tên **hiển thị** trên dashboard (vd "Render-01") — khác hẳn
 `node_id` nội bộ (chuỗi ngẫu nhiên gắn với token), đổi `name` thoải mái không
 ảnh hưởng gì tới token/danh tính node. `gpus` là mảng — nhiều GPU trên 1 máy
-thì liệt kê đủ từng cái, không gộp chung. `disks`/`current_job`/
-`last_backup_at` có thể `null` nếu không có.
+thì liệt kê đủ từng cái, không gộp chung. `disk_used_gb`/`disk_total_gb`/
+`disks`/`current_job`/`last_backup_at`/`version` có thể `null` nếu không có.
+`version` là chuỗi version agent tự khai (vd git tag/commit ngắn) — thuần
+hiển thị/theo dõi rollout trên dashboard, không có định dạng bắt buộc.
+
+`disk_used_gb`/`disk_total_gb` là dung lượng **CẢ ổ cứng vật lý** — agent tự
+đo bằng `psutil.disk_usage(path)`/`os.statvfs(path)` trên đường dẫn chứa dữ
+liệu render (giống cách đo `ram_used_gb`/`ram_total_gb` qua
+`psutil.virtual_memory()`), khác hẳn `disks` bên dưới (chỉ cộng riêng dung
+lượng 3 thư mục cache `renders`/`avatar_cache`/`uploads` — có thể nhỏ hơn
+dung lượng ổ thật nếu ổ còn chứa file khác ngoài 3 thư mục đó). Nếu agent
+chưa gửi 2 field này, dashboard sẽ tự ước tính "Tổng ổ cứng" bằng cách cộng
+dồn `disks` như cũ (kém chính xác hơn).
 
 ### 2. `POST /api/ingest/node/jobs` — hàng đợi render
 
@@ -185,13 +204,25 @@ batch do 1 hay nhiều node cùng xử lý.
 curl -X POST http://<dashboard>/api/ingest/node/batches \
   -H "X-Ingest-Token: <token>" -H "Content-Type: application/json" -d '{
     "batch_name": "Thang8_DotB_TuiXach.xlsx",
-    "total": 80, "done": 65, "failed": 3, "pending": 12
+    "total": 80, "done": 65, "failed": 3, "pending": 12,
+    "model": "musetalk"
   }'
 ```
 
 Batch có 200 dòng, node A (token A) xử lý 80 dòng đầu và node B (token B) xử
 lý 120 dòng còn lại → mỗi node tự gọi endpoint này (bằng token của chính nó)
 với `total` là phần CỦA RIÊNG NÓ (80 và 120), dashboard cộng lại ra đúng 200.
+
+**`model` — TUỲ CHỌN, mới thêm.** Model file Excel này dùng để render
+(`musetalk` hay `latentsync`) — khác hẳn `model` ở endpoint `node/jobs` (đó là
+model của TỪNG DÒNG/video, field này là model của CẢ FILE). Không bắt buộc —
+không gửi thì dashboard không suy đoán, chỉ đơn giản bỏ qua batch đó khi tính
+"thời gian trung bình hoàn thành 1 file Excel theo model" (`/api/job-eta`).
+
+Chỉ cần gửi field này **đúng 1 lần** — dashboard tự nhớ và giữ nguyên ở những
+lần push tiến độ tiếp theo (dù các lần sau không kèm `model` nữa cũng không
+bị mất). Nếu 1 batch do nhiều node cùng xử lý, chỉ cần 1 trong các node đó
+gửi kèm `model` là đủ.
 
 ## Node online/offline hoạt động thế nào
 

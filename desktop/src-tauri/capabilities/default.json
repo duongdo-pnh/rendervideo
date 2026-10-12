@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the main window. The page itself (served by backend/app.py at 127.0.0.1:8000) talks to the backend over plain fetch/WebSocket, not the Tauri IPC bridge, so nothing beyond the default window/core APIs is needed.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

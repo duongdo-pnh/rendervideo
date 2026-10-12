@@ -1,17 +1,20 @@
 """Auto-starts the background daemons the desktop app needs, so the packaged
-app is genuinely zero-terminal-steps: queue_worker.py (render queue) and
-tts_worker.py (TTS queue).
+app is genuinely zero-terminal-steps: queue_worker.py (render queue),
+tts_worker.py (TTS queue), and akali_bridge.py (akali queue bridge — see
+doc_api/APi_RENDER_QUEUE.md). akali_bridge.py no-ops immediately if
+AKALI_URL/AKALI_WORKER_KEY aren't set (see its bridge_enabled()), so starting
+it unconditionally is fine even before the "Kết nối akali" tab is configured.
 
 musetalk_render_server.py is deliberately NOT started here — it already
 auto-starts itself, lazily, the first time a render job actually needs it
 (see musetalk_adapter.py's _ensure_server(), which has its own cross-process
 lock). Duplicating that here would pin ~5.5GB of VRAM before it's needed.
 
-Both queue_worker.py and tts_worker.py already refuse to run a second
-instance (flock-based lock, see their own _acquire_worker_lock()) — so
-spawning them here is always safe to attempt, whether or not one is already
-running (manually, or from a previous launch of this app): the duplicate
-just detects the lock and exits within milliseconds.
+All three scripts already refuse to run a second instance (flock-based lock,
+see their own _acquire_worker_lock()) — so spawning them here is always safe
+to attempt, whether or not one is already running (manually, or from a
+previous launch of this app): the duplicate just detects the lock and exits
+within milliseconds.
 
 Each subprocess gets an EXPLICIT, minimal environment built from scratch
 rather than inheriting this process's via `{**os.environ}`. That blind-
@@ -47,7 +50,7 @@ LOGS_DIR = ROOT / "logs"
 
 _PASSTHROUGH_ENV_VARS = ("HOME", "LANG", "LC_ALL", "TZ", "USER")
 
-_WORKER_SCRIPTS = ("queue_worker.py", "tts_worker.py")
+_WORKER_SCRIPTS = ("queue_worker.py", "tts_worker.py", "akali_bridge.py")
 
 
 def _clean_env() -> dict:
@@ -101,19 +104,41 @@ def _kill_stale_worker(script: str) -> None:
             break
 
 
+def _spawn(script: str) -> None:
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = LOGS_DIR / f"{script[:-3]}.log"
+    log = open(log_path, "a", buffering=1)
+    subprocess.Popen(
+        [str(MAIN_PYTHON), "-u", script],
+        cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+        env=_clean_env(), start_new_session=True, close_fds=True,
+    )
+    print(f"[workers] spawned {script} (log: {log_path})")
+
+
 def start_all() -> None:
     if not MAIN_PYTHON.is_file():
         print(f"[workers] {MAIN_PYTHON} not found — skipping auto-start (not installed?)")
         return
 
-    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     for script in _WORKER_SCRIPTS:
         _kill_stale_worker(script)
-        log_path = LOGS_DIR / f"{script[:-3]}.log"
-        log = open(log_path, "a", buffering=1)
-        subprocess.Popen(
-            [str(MAIN_PYTHON), "-u", script],
-            cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
-            env=_clean_env(), start_new_session=True, close_fds=True,
-        )
-        print(f"[workers] spawned {script} (log: {log_path})")
+        _spawn(script)
+
+
+def spawn_akali_bridge() -> None:
+    """Gọi từ backend/akali.py ngay sau khi lưu AKALI_URL/AKALI_WORKER_KEY thành
+    công, để không bắt người dùng đóng/mở lại app mới thấy bridge chạy — trước
+    bản vá này, akali_bridge.py tự thoát ngay lúc backend khởi động nếu .env
+    lúc đó còn trống, và không có gì khởi động lại nó khi config được lưu sau
+    đó (xem doc_api/APi_RENDER_QUEUE.md mục 10).
+
+    An toàn gọi bất cứ lúc nào, kể cả khi bridge đã chạy — flock trong
+    akali_bridge._acquire_worker_lock() tự phát hiện và thoát ngay nếu trùng,
+    giống hệt logic start_all() ở trên. Không gọi _kill_stale_worker() ở đây:
+    đây không phải lúc source vừa được refresh, chỉ đơn giản là "đảm bảo nó
+    đang chạy" với đúng .env vừa lưu.
+    """
+    if not MAIN_PYTHON.is_file():
+        return
+    _spawn("akali_bridge.py")

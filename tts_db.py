@@ -74,6 +74,11 @@ def init_db():
             )
             """
         )
+        # Migrate: model (engine) áp cho CẢ file Excel — dashboard's "model" field on
+        # POST /api/ingest/node/batches (doc_api/API_INTEGRATION.md), sent once per batch.
+        batch_cols = {r["name"] for r in con.execute("PRAGMA table_info(tts_batch)")}
+        if "model" not in batch_cols:
+            con.execute("ALTER TABLE tts_batch ADD COLUMN model TEXT")
         con.execute(
             """
             CREATE TABLE IF NOT EXISTS tts_rate_limit (
@@ -89,11 +94,14 @@ def init_db():
 
 # ------------------------------------------------------------------ batch (ghi ngược Excel)
 
-def save_batch(batch_id, excel_path):
-    """Nhớ file Excel gốc của batch để sau xuất lại (điền video_done)."""
+def save_batch(batch_id, excel_path, model=None):
+    """Nhớ file Excel gốc của batch để sau xuất lại (điền video_done), và model
+    (engine) áp cho cả file — None nếu chưa biết (INSERT OR REPLACE thì sẽ ghi đè
+    về NULL, nhưng submit_jobs() luôn có render_config nên trong thực tế không
+    xảy ra; giữ tham số optional cho lời gọi cũ/test không truyền model)."""
     with _connect() as con:
-        con.execute("INSERT OR REPLACE INTO tts_batch(batch_id, excel_path) VALUES (?,?)",
-                    (batch_id, str(excel_path) if excel_path else None))
+        con.execute("INSERT OR REPLACE INTO tts_batch(batch_id, excel_path, model) VALUES (?,?,?)",
+                    (batch_id, str(excel_path) if excel_path else None, model))
 
 
 def get_batch_excel(batch_id):
@@ -280,6 +288,28 @@ def reset_stuck():
         return cur.rowcount
 
 
+def delete_unstarted_in_batch(batch_id):
+    """Xoá mọi dòng CHƯA CHẠY của một batch khỏi hàng chờ TTS. Trả số dòng đã xoá.
+
+    Dùng khi cả batch bị huỷ (akali_bridge nhận 409 reason=canceled — xem
+    doc_api/APi_RENDER_QUEUE.md mục 4.1 bước 3). Chỉ xoá 3 trạng thái còn sinh
+    việc về sau; 'done' và 'failed_*' là lịch sử, giữ nguyên để còn tra được
+    batch đã chạy tới đâu trước khi bị huỷ.
+
+    KHÔNG đủ để dừng hẳn batch: một dòng đang 'submitting' có thể đã gọi
+    db.add_job() xong mà chưa kịp mark_done() (tts_worker.py chạy add_job TRƯỚC
+    mark_done), nên render job của nó vẫn nằm trong hàng đợi GPU dù dòng tts_jobs
+    đã biến mất. Caller phải quét nốt bảng jobs theo drive_folder — xem
+    database.request_cancel_by_drive_folder().
+    """
+    with _connect() as con:
+        cur = con.execute(
+            "DELETE FROM tts_jobs WHERE batch_id=? AND status IN (?, ?, ?)",
+            (batch_id, *DEDUP_STATUSES),
+        )
+        return cur.rowcount
+
+
 # ------------------------------------------------------------------ views (UI/CLI)
 
 def status_counts(batch_id=None):
@@ -330,7 +360,10 @@ def list_batch_ids():
 def batch_progress(batch_id):
     """total/done/failed/pending cho PHẦN của batch này (không phải tổng cả file nếu
     nhiều node cùng xử lý) — dùng để push % hoàn thành lên dashboard fleet. 'done' cần
-    cả TTS lẫn render xong; 'failed' tính cả lỗi cứng TTS lẫn render fail."""
+    cả TTS lẫn render xong; 'failed' tính cả lỗi cứng TTS lẫn render fail.
+
+    'model' đi kèm là engine áp cho CẢ file (lưu 1 lần lúc submit_jobs() tạo batch,
+    xem save_batch()) — None nếu batch cũ tạo trước khi cột này tồn tại."""
     rows = results_for_batch(batch_id).values()
     total = len(rows)
     done = failed = 0
@@ -339,7 +372,28 @@ def batch_progress(batch_id):
             failed += 1
         elif r["render_status"] == "done":
             done += 1
-    return {"total": total, "done": done, "failed": failed, "pending": total - done - failed}
+    with _connect() as con:
+        row = con.execute("SELECT model FROM tts_batch WHERE batch_id=?", (batch_id,)).fetchone()
+    model = row["model"] if row else None
+    return {"total": total, "done": done, "failed": failed, "pending": total - done - failed,
+            "model": model}
+
+
+def batch_is_active(batch_id):
+    """True nếu batch này ĐANG thực sự có dòng nào node xử lý ngay lúc gọi — TTS đang
+    submit hoặc render đang chạy. Đây là tín hiệu tức thời (không lưu DB, không cache
+    như model) — dùng cho field 'active' khi push /api/ingest/node/batches, xem
+    doc_api/API_INTEGRATION.md mục 5."""
+    with _connect() as con:
+        row = con.execute(
+            """
+            SELECT 1 FROM tts_jobs t LEFT JOIN jobs j ON t.render_job_id = j.id
+             WHERE t.batch_id = ? AND (t.status = 'submitting' OR j.status = 'rendering')
+             LIMIT 1
+            """,
+            (batch_id,),
+        ).fetchone()
+        return row is not None
 
 
 def requeue_dead_letter(batch_id=None):

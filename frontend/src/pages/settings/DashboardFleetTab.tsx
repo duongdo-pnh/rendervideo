@@ -7,20 +7,19 @@ import { TextField } from '../../components/form/TextField'
 import { useNotify } from '../../components/notifications/NotificationProvider'
 import { dashboardStatus, saveDashboardConfig } from '../../api/dashboard'
 import { ApiError } from '../../api/client'
+import type { DashboardStatus } from '../../types/api'
 
-export default function DashboardFleetPage() {
+export function DashboardFleetTab() {
   const notify = useNotify()
-  const [url, setUrl] = useState('')
   const [token, setToken] = useState('')
   const [nodeName, setNodeName] = useState('')
-  const [status, setStatus] = useState<{ configured: boolean; error?: string | null } | null>(null)
+  const [status, setStatus] = useState<DashboardStatus | null>(null)
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
     dashboardStatus()
       .then((s) => {
         setStatus(s)
-        setUrl(s.dashboard_url ?? '')
         setToken(s.ingest_token ?? '')
         setNodeName(s.node_name ?? '')
       })
@@ -30,7 +29,7 @@ export default function DashboardFleetPage() {
   const save = async () => {
     setSaving(true)
     try {
-      const res = await saveDashboardConfig({ dashboard_url: url, ingest_token: token, node_name: nodeName })
+      const res = await saveDashboardConfig({ ingest_token: token, node_name: nodeName })
       setStatus(res)
       if (res.error) notify.error(res.error)
       else notify.success('Đã lưu cấu hình Dashboard Fleet.')
@@ -49,7 +48,9 @@ export default function DashboardFleetPage() {
           Máy này tự đẩy CPU/GPU/hàng đợi render/TTS lên dashboard giám sát mỗi 10s (và thống kê mỗi 60s). Token lấy
           từ dashboard, mục "Node keys" → "Tạo node mới" — mỗi máy 1 token riêng, hiện đúng 1 lần lúc tạo.
         </p>
-        <TextField label="Dashboard URL" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://..." />
+        <p className="text-xs text-slate-500">
+          Dashboard: <code>{status?.dashboard_url ?? '…'}</code> — cố định sẵn trong app, không cần nhập.
+        </p>
         <TextField label="Ingest Token" value={token} onChange={(e) => setToken(e.target.value)} />
         <TextField
           label="Tên hiển thị (tuỳ chọn)"

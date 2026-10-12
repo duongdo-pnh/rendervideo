@@ -6,6 +6,7 @@ import { RadioGroup } from '../../components/form/RadioGroup'
 import { SliderField } from '../../components/form/SliderField'
 import { TextField } from '../../components/form/TextField'
 import { Checkbox } from '../../components/form/Checkbox'
+import { useEngineChoices } from '../../hooks/useEngineChoices'
 import type { Engine, InputType, ModelRes, OutRes } from '../../types/api'
 
 const OUT_RES_CHOICES: OutRes[] = ['Gốc', '1080', '720', '480 Nhanh']
@@ -48,6 +49,7 @@ export function ExcelRenderConfigModal({
   onConfirm: (config: ExcelRenderConfig) => void
 }) {
   const [config, setConfig] = useState<ExcelRenderConfig>(DEFAULT_CONFIG)
+  const engineChoices = useEngineChoices()
   const set = <K extends keyof ExcelRenderConfig>(key: K, value: ExcelRenderConfig[K]) =>
     setConfig((prev) => ({ ...prev, [key]: value }))
 
@@ -84,10 +86,7 @@ export function ExcelRenderConfigModal({
               label="Engine"
               value={config.engine}
               onChange={(v) => set('engine', v as Engine)}
-              options={[
-                { label: 'MuseTalk 1.5', value: 'musetalk' },
-                { label: 'LatentSync', value: 'latentsync' },
-              ]}
+              options={engineChoices}
             />
             <SelectField
               label="Độ phân giải"

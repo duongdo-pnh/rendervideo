@@ -63,6 +63,11 @@ class PriorityChoice(BaseModel):
     label: str
 
 
+class EngineChoice(BaseModel):
+    label: str
+    value: str
+
+
 class ReorderRequest(BaseModel):
     job_ids: list[int]
 
@@ -281,6 +286,24 @@ class DashboardStatus(BaseModel):
 
 
 class DashboardConfigRequest(BaseModel):
-    dashboard_url: str = ""
+    # Không có dashboard_url: URL cố định trong dashboard_reporter._DEFAULT_DASHBOARD_URL.
     ingest_token: str = ""
     node_name: str = ""
+
+
+class AkaliStatus(BaseModel):
+    configured: bool
+    akali_url: Optional[str] = None
+    worker_key: Optional[str] = None
+    worker_id: Optional[str] = None
+
+
+class AkaliConfigRequest(BaseModel):
+    akali_url: str = ""
+    worker_key: str = ""
+
+
+class AkaliCancelResponse(BaseModel):
+    cancelled_batches: list[int]
+    stopped_render_jobs: list[int]
+    message: str

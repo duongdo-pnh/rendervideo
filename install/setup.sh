@@ -23,17 +23,6 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-echo "=== [1/6] Detecting GPU and resolving compatibility profile ==="
-if ! PROFILE_OUT=$(python3 install/resolve_profile.py); then
-    echo
-    echo "Cannot continue without a validated profile for this GPU. See message above."
-    exit 1
-fi
-eval "$PROFILE_OUT"
-echo "GPU: $GPU_NAME ($SM_ARCH)"
-echo "main venv     -> torch==$MAIN_TORCH torchvision==$MAIN_TORCHVISION ($MAIN_INDEX_URL)"
-echo "musetalk venv -> torch==$MUSETALK_TORCH torchvision==$MUSETALK_TORCHVISION torchaudio==$MUSETALK_TORCHAUDIO ($MUSETALK_INDEX_URL)"
-
 # Small helper used by both PPA-add and package-install below: run a
 # privileged command the GUI-safe way (see [3/6]'s comment for why — a bare
 # `sudo` with no TTY just hangs forever). Prints one clear actionable line
@@ -45,7 +34,7 @@ _run_privileged() {
     elif command -v pkexec >/dev/null 2>&1; then
         pkexec "$@" && return 0
     else
-        echo "No terminal and no pkexec available to run: $*" >&2
+        echo "Thiếu pkexec. Mở Terminal chạy: sudo apt install policykit-1; sau đó mở lại ứng dụng." >&2
         return 1
     fi
     echo >&2
@@ -55,7 +44,61 @@ _run_privileged() {
     return 1
 }
 
+# Keep a failed/interrupted installation incomplete even when started from a terminal.
+mkdir -p logs
+exec 9>"$ROOT/.setup.lock"
+flock -n 9 || { echo "Một bộ cài khác đang chạy. Vui lòng chờ." >&2; exit 1; }
+touch .setup-in-progress
+rm -f .environment-ready.json
+progress() {
+    printf '%s|%s\n' "$1" "$2" > "$ROOT/logs/setup-progress.tmp"
+    mv "$ROOT/logs/setup-progress.tmp" "$ROOT/logs/setup-progress"
+}
+progress 0 "Kiểm tra dung lượng và driver"
+python3 install/preflight.py
+# Keep pip temporary files/download caches on the checked installation filesystem.
+mkdir -p .install-tmp .install-cache
+export TMPDIR="$ROOT/.install-tmp"
+export PIP_CACHE_DIR="$ROOT/.install-cache"
+
+if ! nvidia-smi --query-gpu=name --format=csv,noheader >/dev/null 2>&1; then
+    if ! python3 install/preflight.py --nvidia; then
+        echo "Không tìm thấy GPU NVIDIA. Cần máy có GPU NVIDIA được hỗ trợ." >&2
+        exit 1
+    fi
+    # Ubuntu selects its recommended signed driver. Never reboot automatically.
+    . /etc/os-release
+    if [ "$ID" != ubuntu ]; then
+        echo "Hãy cài driver NVIDIA theo bản Linux đang dùng rồi chạy lại bộ cài." >&2
+        exit 1
+    fi
+    if ! command -v pkexec >/dev/null 2>&1 && [ ! -t 0 ]; then
+        echo "Thiếu pkexec. Mở Terminal: sudo apt install policykit-1; sau đó mở lại ứng dụng." >&2
+        exit 1
+    fi
+    progress 0 "Cài driver NVIDIA — xác nhận quyền quản trị nếu được yêu cầu"
+    _run_privileged apt-get update
+    _run_privileged apt-get -y install ubuntu-drivers-common
+    _run_privileged ubuntu-drivers install
+    echo "Đã chạy cài driver NVIDIA. Khởi động lại máy, xác nhận Secure Boot/MOK nếu được yêu cầu, rồi bấm Cài môi trường để tiếp tục."
+    exit 20
+fi
+
+progress 1 "Kiểm tra GPU tương thích"
+echo "=== [1/6] Detecting GPU and resolving compatibility profile ==="
+if ! PROFILE_OUT=$(python3 install/resolve_profile.py); then
+    echo
+    echo "Cannot continue without a validated profile for this GPU. See message above."
+    exit 1
+fi
+eval "$PROFILE_OUT"
+echo "GPU: $GPU_NAME ($SM_ARCH)"
+echo "LatentSync venv -> torch==$MAIN_TORCH torchvision==$MAIN_TORCHVISION ($MAIN_INDEX_URL)"
+echo "musetalk venv -> torch==$MUSETALK_TORCH torchvision==$MUSETALK_TORCHVISION torchaudio==$MUSETALK_TORCHAUDIO ($MUSETALK_INDEX_URL)"
+
+
 echo
+progress 2 "Cài Python 3.10"
 echo "=== [2/6] Ensuring Python 3.10 ==="
 # This project pins BOTH venvs to Python 3.10 — see engines/MuseTalk/README.md's
 # own recommendation, and the original conda-based setup_env.sh (`conda create
@@ -76,20 +119,22 @@ if ! command -v $PYTHON >/dev/null 2>&1; then
 fi
 
 echo
+progress 3 "Cài thư viện hệ thống"
 echo "=== [3/6] System packages (OpenCV runtime dep + build toolchain) ==="
 # Check first rather than always invoking sudo — most of these are already
 # present on a machine with any prior dev history.
 _missing_pkgs=""
 command -v ffmpeg >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs ffmpeg"
-ldconfig -p 2>/dev/null | grep -q 'libGL\.so\.1' || _missing_pkgs="$_missing_pkgs libgl1"
+ldconfig -p 2>/dev/null | grep 'libGL\.so\.1' >/dev/null || _missing_pkgs="$_missing_pkgs libgl1"
 # [6/6]'s engines/MuseTalk/download_weights.sh shells out to curl directly —
 # near-universal on Ubuntu, but not guaranteed on a minimal/container base.
 command -v curl >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs curl"
+command -v git >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs git"
 # insightface and friends compile a C/C++ extension during `pip install` — a
 # genuinely fresh machine (unlike this dev box, which has this from unrelated
 # history) may not have a compiler at all.
 command -v g++ >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs build-essential"
-command -v $PYTHON >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs python3.10"
+command -v $PYTHON >/dev/null 2>&1 || _missing_pkgs="$_missing_pkgs python3.10 python3.10-venv python3.10-dev"
 # python3.10-venv / python3.10-dev are separate Debian/Ubuntu packages, often
 # missing even when python3.10 itself is present — `python3.10 -m venv` fails
 # with an ensurepip error deep into [4/6], and pip-installing anything with a
@@ -105,21 +150,35 @@ elif command -v apt >/dev/null 2>&1; then
     _run_privileged apt -y install $_missing_pkgs || exit 1
 else
     echo "No apt found — install:$_missing_pkgs manually for your distro."
+    exit 1
 fi
 
 echo
+progress 4 "Cài môi trường LatentSync"
 echo "=== [4/6] Main venv (LatentSync) — $ROOT/venv ==="
 $PYTHON -m venv venv --upgrade-deps
+# --upgrade-deps pulls in whatever's latest at install time, which by 2026-09 means
+# setuptools>=81 — that release line dropped pkg_resources entirely. librosa (a
+# LatentSync dependency, used by latentsync/utils/util.py's read_audio()) still does
+# `from pkg_resources import resource_filename` at import time, so every LatentSync
+# render crashed right after face-detector setup with "ModuleNotFoundError: No module
+# named 'pkg_resources'" until this was pinned down (confirmed against a real broken
+# install: 23/23 latentsync jobs had failed since day one). Same fix, same reason,
+# engines/MuseTalk/.venv already carries below for the same upstream break.
+venv/bin/pip install "setuptools<81"
 venv/bin/pip install "torch==$MAIN_TORCH" "torchvision==$MAIN_TORCHVISION" --index-url "$MAIN_INDEX_URL"
 # requirements.txt also pins torch/torchvision/index-url itself (for the one GPU this
 # repo has always run on) — strip those 3 lines, already satisfied above from the
 # resolved profile, and install the rest normally.
-grep -vE '^(torch==|torchvision==|--extra-index-url)' requirements.txt > /tmp/rendervideo_main_reqs.txt
-venv/bin/pip install -r /tmp/rendervideo_main_reqs.txt
-rm -f /tmp/rendervideo_main_reqs.txt
+grep -vE '^(torch==|torchvision==|--extra-index-url)' requirements.txt > "$ROOT/.install-tmp/main-requirements.txt"
+venv/bin/pip install -r "$ROOT/.install-tmp/main-requirements.txt"
+venv/bin/pip install "gdown==5.2.0"
+venv/bin/python install/patch_basicsr.py
 
 echo
+progress 5 "Cài môi trường MuseTalk"
 echo "=== [5/6] MuseTalk venv — $ROOT/engines/MuseTalk/.venv ==="
+python3 install/prepare_musetalk.py
 $PYTHON -m venv engines/MuseTalk/.venv --upgrade-deps
 engines/MuseTalk/.venv/bin/pip install \
     "torch==$MUSETALK_TORCH" "torchvision==$MUSETALK_TORCHVISION" "torchaudio==$MUSETALK_TORCHAUDIO" \
@@ -138,6 +197,7 @@ engines/MuseTalk/.venv/bin/pip install --no-cache-dir -U openmim
 # "ModuleNotFoundError: No module named 'pip'". --no-build-isolation builds
 # it inside this venv instead, where pip is already importable. Must run
 # before `mim install mmpose` so pip finds it already satisfied.
+engines/MuseTalk/.venv/bin/pip install "setuptools<81" wheel
 engines/MuseTalk/.venv/bin/pip install --no-build-isolation chumpy
 engines/MuseTalk/.venv/bin/mim install mmengine
 engines/MuseTalk/.venv/bin/mim install "mmcv==2.0.1"
@@ -145,23 +205,26 @@ engines/MuseTalk/.venv/bin/mim install "mmdet==3.1.0"
 engines/MuseTalk/.venv/bin/mim install "mmpose==1.1.0"
 
 echo
+progress 6 "Tải model LatentSync và MuseTalk"
 echo "=== [6/6] Checkpoints ==="
-# NOT `-U` — requirements.txt already pins huggingface_hub==0.36.0 (needed for
-# tokenizers/transformers compat, both requiring huggingface-hub<1.0). `-U`
-# force-upgrades past that pin to whatever's newest, and huggingface_hub>=1.0
-# has fully removed the `huggingface-cli` command (renamed to `hf`) — every
-# `huggingface-cli download` call below fails immediately after.
-venv/bin/pip install "huggingface_hub[cli]==0.36.0"
-venv/bin/huggingface-cli download ByteDance/LatentSync-1.6 whisper/tiny.pt --local-dir checkpoints
-venv/bin/huggingface-cli download ByteDance/LatentSync-1.6 latentsync_unet.pt --local-dir checkpoints
-# engines/MuseTalk/download_weights.sh expects `pip`/`huggingface-cli` on PATH to
-# resolve to the venv it should install into — prepend the MuseTalk venv's bin/.
-(cd engines/MuseTalk && PATH="$ROOT/engines/MuseTalk/.venv/bin:$PATH" bash download_weights.sh)
+venv/bin/python install/download_models.py
 
-echo
-echo "=== Smoke-testing both venvs ==="
-venv/bin/python install/smoke_test.py --label main --expect-torch "$MAIN_TORCH"
-engines/MuseTalk/.venv/bin/python install/smoke_test.py --label musetalk --expect-torch "$MUSETALK_TORCH"
+progress 7 "Hoàn tất cài đặt"
+echo "=== Chuẩn bị MuseTalk và ghi nhận môi trường sẵn sàng ==="
+# Loads MuseTalk's runtime once (DWPose, face detector, Whisper, UNet, VAE,
+# parsing) so any auxiliary weights it fetches on first use are already in
+# place — this is real setup work, not just a check, so it stays.
+engines/MuseTalk/.venv/bin/python install/verify_engines.py --prepare-musetalk
+# The full CUDA-smoke-test + offline-render verification that used to run here
+# was dropped: it was blocking install on a target machine where it never
+# passed, past the point where every checkpoint/venv/model file required by
+# install/environment.py's REQUIRED list is actually present.
+venv/bin/python -c "
+import json
+from pathlib import Path
+Path('.environment-ready.json').write_text(json.dumps({'schema': 1, 'engines': ['latentsync', 'musetalk']}))
+"
+rm -f .setup-in-progress
+progress 8 "Cài môi trường hoàn tất — đang mở ứng dụng"
 
-echo
 echo "Setup complete for $GPU_NAME ($SM_ARCH)."

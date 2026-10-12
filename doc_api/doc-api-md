@@ -1,0 +1,709 @@
+# Nối máy render vào hàng chờ akali
+
+Hướng dẫn dựng `akali_bridge.py` trên **máy render** để nó tự lấy job từ hàng chờ
+của akali, chạy hết một batch Excel, rồi trả link thư mục Drive về.
+
+> **Đọc mục 1 trước khi làm bất cứ gì.** Tài liệu này viết dựa trên một bản
+> `rendervideo` cụ thể. Bản trên máy render **khác bản đó**, nên mọi thứ ở đây
+> phải được kiểm chứng lại trên máy thật trước khi tin.
+
+> **Nếu bạn đang sửa bridge để chữa lỗi huỷ job, đọc thẳng mục 4.** Đó là phần
+> đang hỏng trên hệ thống thật, và nó hỏng ở phía máy render chứ không phải
+> phía akali.
+
+---
+
+## 1. Mốc đối chiếu
+
+Tài liệu viết dựa trên:
+
+| | |
+|---|---|
+| Repo | `rendervideo` |
+| Branch | `feat/update-3080ti` |
+| Commit | `25f1daf` — *"fix: ngăn MuseTalk server rò VRAM/RAM và spawn trùng"* (05/08/2026) |
+| Máy | máy dev, **không có model weights**, **không có `akali_bridge.py`** |
+
+Vì bản trên máy render khác, tài liệu **không dùng số dòng** ở bất cứ đâu — chỉ
+dùng tên hàm và lệnh `grep`. Nếu một lệnh kiểm tra ở mục 2 không ra kết quả như
+mô tả, dừng lại và đối chiếu lại thay vì sửa bừa.
+
+Bridge **đã được viết và đang chạy** trên hai máy render (`Render L8247`,
+`Render L8383`), nhưng source của nó không có trong repo này. Mọi mô tả về hành
+vi bridge trong tài liệu là **yêu cầu**, không phải mô tả code hiện có.
+
+---
+
+## 2. Kiểm tra bản trên máy render
+
+Chạy tuần tự ở thư mục gốc `rendervideo`. Cột cuối là việc phải làm nếu lệch.
+
+### 2.1 Các hàm bridge sẽ gọi
+
+```bash
+grep -n "def process_excel\|def submit_jobs\|def export_results" excel_import.py
+grep -n "def status_counts\|def results_for_batch\|def save_batch\|def get_batch_excel" tts_db.py
+grep -n "def add_job\|def worker_busy\|^MODELS" database.py
+grep -n "def ensure_folder\|def default_folder_id\|def upload_file\|def drive_enabled" google_drive_upload.py
+```
+
+Kỳ vọng — chữ ký phải khớp, đặc biệt là tham số:
+
+| Hàm | Chữ ký kỳ vọng |
+|---|---|
+| `process_excel` | `(excel_path, default_video=None, default_provider=None, shopee_item_id=None)` |
+| `submit_jobs` | `(rows, shopee_item_id=None, progress=None, batch_id=None, excel_path=None, render_config=None, dedup=False)` |
+| `results_for_batch` | `(batch_id)` → dict `{excel_row: {tts_status, render_status, output_path, name}}` |
+| `ensure_folder` | `(service, name, parent_id)` → folder_id |
+
+**Nếu `process_excel` không có `default_video`**: bridge không truyền được video
+dùng chung cho cả batch. Phải xem bản đó nhận video theo cách nào.
+
+**Nếu `submit_jobs` không có `render_config`**: cấu hình render từ akali không áp
+được cho batch. Đây là điều kiện bắt buộc, không đi tiếp được nếu thiếu.
+
+### 2.2 Thư mục Drive của batch
+
+```bash
+grep -n "drive_folder" tts_worker.py
+```
+
+Kỳ vọng: `drive_folder` = **tên file Excel bỏ đuôi**, và được truyền vào
+`db.add_job(...)`. Đây là cơ sở để dựng link trả về akali.
+
+**Nếu bản kia đặt tên thư mục theo cách khác** (theo ngày, theo batch_id...),
+sửa lại mục 6 bước 13 cho khớp — bridge phải dựng link đúng thư mục thật.
+
+### 2.3 Engine có bị ghim không
+
+```bash
+grep -rn "INSERT INTO jobs" --include="*.py" .
+grep -n 'engine = "musetalk"' database.py
+```
+
+Trên bản đối chiếu:
+
+- `INSERT INTO jobs` xuất hiện **đúng một lần**, trong `add_job`
+- `add_job` có dòng `engine = "musetalk"` ghi đè vô điều kiện, ngay trước INSERT
+
+Nghĩa là **LatentSync không vào hàng chờ được**, dù `render_job.py` cài đặt đầy
+đủ và `queue_worker` có nhánh xử lý riêng cho nó. Xem mục 8.1.
+
+Nếu bản trên máy render **không có** dòng ghim đó → LatentSync dùng được luôn,
+bridge cứ truyền `engine` xuống.
+
+### 2.4 Model weights
+
+```bash
+ls -la checkpoints/ 2>&1
+ls -la engines/MuseTalk/models/ 2>&1
+```
+
+Cần có:
+
+| Engine | File |
+|---|---|
+| LatentSync 512 | `checkpoints/latentsync_unet.pt` |
+| LatentSync 256 | `checkpoints/v1.5/latentsync_unet.pt` |
+| MuseTalk | `engines/MuseTalk/models/musetalkV15/unet.pth`, `sd-vae/`, `whisper/`, `face-parse-bisent/` |
+
+Trên máy dev **cả hai đều thiếu** — đó là lý do phải kiểm tra lại trên máy render.
+Thiếu weight thì bridge chạy đúng nhưng render luôn hỏng.
+
+### 2.5 Tham số của render_job
+
+```bash
+python3 render_job.py --help
+```
+
+Kỳ vọng có: `--guidance --steps --seed --enhance_mouth --enhance_region
+--out_res --input_type --engine`.
+
+---
+
+## 3. Hợp đồng API của akali
+
+Bridge cần **6 endpoint** này, không phải đọc source akali.
+
+- Base URL: `https://api-chat-private.io.vn`
+- Xác thực: `Authorization: Bearer <WORKER_API_KEY>` cho **mọi** request
+
+> **Chỉ `/api/worker/*` mở ra Internet.** nginx cố tình không expose
+> `/api/jobs/*` (đường quản trị của dashboard) — gọi vào đó từ ngoài sẽ rơi vào
+> Next.js và trả 404/405 chứ không tới backend. Bridge không bao giờ cần đến
+> chúng.
+
+| Endpoint | Chiều | Dùng khi |
+|---|---|---|
+| `POST /api/worker/claim` | xin việc | máy rảnh |
+| `POST /api/worker/jobs/<id>/heartbeat` | giữ nhịp | 60s/lần khi đang chạy |
+| `POST /api/worker/jobs/<id>/complete` | báo xong | batch xong, đã có link Drive |
+| `POST /api/worker/jobs/<id>/fail` | báo hỏng | render lỗi |
+| `POST /api/worker/jobs/<id>/cancel` | **báo huỷ** | huỷ ở phía máy render |
+| `GET /api/worker/jobs?worker_id=` | **đối soát** | khởi động lại, và định kỳ |
+
+Hai endpoint in đậm là phần chữa lỗi lệch trạng thái — xem mục 4.
+
+### 3.1 Xin việc
+
+```
+POST /api/worker/claim
+{"worker_id": "render-01"}
+```
+
+`204 No Content` = chưa có việc, ngủ rồi thử lại.
+`200` = nhận job:
+
+```json
+{
+  "id": 78,
+  "drive_url": "https://drive.google.com/drive/folders/XXXX",
+  "drive_file_id": "XXXX",
+  "claim_token": "72ee72d8-144c-4eb5-800c-7ddd404be487",
+  "lease_seconds": 1800,
+  "attempts": 1,
+  "max_attempts": 3,
+  "params": {
+    "engine": "musetalk",
+    "input_type": "real",
+    "model_res": "256",
+    "out_res": "720",
+    "guidance": 1.5,
+    "steps": 24,
+    "seed": 1247,
+    "enhance_mouth": 1,
+    "enhance_region": "mouth",
+    "tts_provider": "autovoice",
+    "voice_id": "pv-f940f724-49c9-4b0c-8096-c4f10e27c5db"
+  }
+}
+```
+
+**Hành động claim chính là tín hiệu "máy đang rảnh".** akali không có endpoint
+báo rảnh riêng, và cũng không cần — chỉ claim khi thật sự sẵn sàng chạy.
+
+`worker_id` là danh tính của máy trên dashboard. Máy bị **tắt** trong tab Phân
+nhóm sẽ luôn nhận `204` dù hàng chờ có việc — không phải lỗi mạng.
+
+### 3.2 Giữ nhịp
+
+```
+POST /api/worker/jobs/<id>/heartbeat
+{"claim_token": "...", "progress": 40}
+```
+
+`409` = **job không còn là của máy này nữa**. Dừng ngay, không thử lại, không
+gọi `/complete` hay `/fail` nữa. Đây **không phải lỗi tạm thời** — heartbeat lại
+vẫn sẽ 409 mãi mãi.
+
+Body 409 kèm `reason` để bridge biết chuyện gì đã xảy ra:
+
+| `reason` | Nghĩa | Bridge phải làm |
+|---|---|---|
+| `canceled` | Người dùng bấm huỷ trên dashboard | Mục 4.1 — dừng render **và dọn hàng chờ nội bộ** |
+| `lease_lost` | Lease hết hạn, akali đã giao job cho máy khác | Dừng, bỏ kết quả (máy khác đang làm rồi) |
+| `not_found` | Job không còn tồn tại | Dừng, bỏ khỏi hàng đợi nội bộ |
+
+```json
+{"error": "job da bi huy", "reason": "canceled"}
+```
+
+Bốn endpoint `/heartbeat`, `/complete`, `/fail`, `/cancel` đều trả cùng dạng body
+này khi 409.
+
+`lease_seconds` hiện là **1800** (đã nâng từ 600). Heartbeat 60s/lần là dư biên.
+
+`progress` là **phần trăm, 0-100** — xem mục 11. Backend không kẹp giá trị,
+bridge tự kẹp.
+
+### 3.3 Báo xong
+
+```
+POST /api/worker/jobs/<id>/complete
+{"claim_token": "...", "output_url": "https://drive.google.com/drive/folders/YYYY"}
+```
+
+`output_url` là **link thư mục** chứa toàn bộ video của batch.
+
+Job đã bị huỷ thì `/complete` trả `409 reason=canceled` và **không ghi nhận kết
+quả** — akali không để một kết quả về muộn lật ngược lệnh huỷ của người dùng.
+
+### 3.4 Báo hỏng
+
+```
+POST /api/worker/jobs/<id>/fail
+{"claim_token": "...", "error": "...", "retryable": true}
+```
+
+`retryable: false` → job về `failed` ngay. `true` → về `pending` kèm backoff,
+tối đa `max_attempts` lần.
+
+### 3.5 Báo huỷ
+
+```
+POST /api/worker/jobs/<id>/cancel
+{"claim_token": "...", "reason": "người dùng dừng batch ở máy render"}
+```
+
+Gọi khi job bị **huỷ ở phía máy render**. Job về đúng `canceled`, y như bấm Huỷ
+trên dashboard. `reason` là chuỗi tự do, hiện ra ở cột lỗi của job.
+
+> **Không được dùng `/fail` thay cho việc này.** `/fail` làm job hiện ra là
+> **Lỗi** màu đỏ và **vẫn được giao lại** cho máy khác theo `max_attempts` — tức
+> lệnh huỷ của người dùng bị lật ngược, một máy khác chạy tiếp đúng cái batch
+> vừa bị dừng.
+
+Huỷ trùng lúc ở cả hai bên không phải lỗi: nếu dashboard vừa huỷ trước, endpoint
+này trả `409 reason=canceled` — hai bên cùng muốn một thứ, bridge không cần làm
+gì thêm.
+
+Cần `claim_token` hợp lệ. Không có fencing thì một máy đi lạc có thể huỷ job máy
+khác đang chạy.
+
+### 3.6 Đối soát
+
+```
+GET /api/worker/jobs?worker_id=render-01
+```
+
+```json
+{"worker_id": "render-01", "jobs": [
+  {"id": 78, "claim_token": "...", "progress": 40,
+   "lease_expires_at": "...", "attempts": 1, "max_attempts": 3}
+]}
+```
+
+Trả về **những job akali cho rằng máy này đang giữ**. Thiếu `worker_id` → `400`.
+
+Gọi lúc bridge khởi động và định kỳ (5–10 phút/lần là đủ), rồi so với hàng chờ
+của chính máy:
+
+| Tình trạng | Nghĩa | Bridge phải làm |
+|---|---|---|
+| Có ở akali, không chạy ở máy | Bridge mất dấu việc (khởi động lại, tiến trình chết) | `/fail` với `retryable: true` để akali giao lại |
+| Chạy ở máy, không có ở akali | Job đã bị huỷ hoặc sang tay máy khác | Giết tiến trình render ngay, dọn hàng chờ nội bộ |
+
+Đây là lưới an toàn cho trường hợp heartbeat không cứu được — xem mục 4.3.
+
+---
+
+## 4. Đồng bộ huỷ job
+
+Phần này mô tả lỗi **đang xảy ra trên hệ thống thật**, không phải tình huống giả
+định. Triệu chứng người dùng báo: *"bấm huỷ bên akali mà hàng chờ của server
+render không huỷ theo, và ngược lại"*.
+
+Điều cốt lõi phải hiểu trước: **akali không gọi xuống máy render được.** Máy
+render tự hỏi xin việc (pull), akali không giữ kết nối ngược nào. Nên mọi lệnh
+huỷ từ dashboard chỉ là *đánh dấu trong DB*, và máy render chỉ biết ở **lần gọi
+API kế tiếp của chính nó**.
+
+### 4.1 Chiều akali → máy render
+
+akali làm gì: xoá `claim_token`, đặt `status = canceled`. Từ lúc đó mọi lời gọi
+`/heartbeat`, `/complete`, `/fail` của máy đang giữ job đều nhận
+`409 reason=canceled`.
+
+Đo trên hệ thống thật (21/09/2026):
+
+| Job | Bấm Huỷ lúc | Máy nhận 409 lúc | Trễ |
+|---|---|---|---|
+| 483 (L8383) | 02:30:38 | 02:31:32 | 54 giây |
+| 487 (L8247) | 02:39:17 | 02:40:16 | 59 giây |
+
+**Tín hiệu tới nơi đúng một nhịp heartbeat.** Phía akali không thiếu gì.
+
+Chỗ hỏng nằm ở bridge, và log chỉ thẳng ra: lúc 02:31:32 máy `Render L8383`
+heartbeat **một lượt cho job 80, 481 và 483** — job 80 đã bị huỷ từ **17/09**,
+bốn ngày trước. Bridge giữ một danh sách job nó tưởng đang sở hữu và heartbeat
+cả danh sách, không bao giờ gạch tên job đã huỷ ra.
+
+**Việc bridge phải làm khi nhận `409 reason=canceled`:**
+
+1. Bỏ job khỏi danh sách đang theo dõi — **ngừng heartbeat nó vĩnh viễn**.
+2. Dừng tiến trình render đang chạy cho batch đó.
+3. **Xoá các dòng chưa chạy của batch khỏi hàng chờ nội bộ** (`tts_jobs`).
+4. Xoá workdir của job.
+5. Đánh dấu `akali_batches.status = 'abandoned'` (mục 7).
+6. **Không** gọi `/complete`, **không** gọi `/fail`.
+
+**Bước 3 là chỗ hay bị bỏ sót nhất, và là nguyên nhân trực tiếp của triệu chứng
+người dùng báo.** Một job akali = **cả một batch** nhiều dòng trong hàng chờ nội
+bộ của máy render. Dừng heartbeat thôi chưa đủ: `queue_worker` vẫn đọc tiếp từng
+dòng còn lại, GPU vẫn đốt, video vẫn đẩy lên Drive. Người dùng bấm Huỷ rồi mà
+máy vẫn làm tới hết batch — đúng cái "hàng chờ server render không huỷ theo".
+
+### 4.2 Chiều máy render → akali
+
+Trước 21/09/2026 akali **không có** đường nào cho chiều này, và đó là lỗi của
+akali. Bridge chỉ có `/fail` để báo bỏ job — mà `/fail` làm job hiện ra là
+**Lỗi** và **vẫn được giao lại** cho máy khác. Người dùng huỷ ở máy render, akali
+báo Lỗi rồi đưa đúng batch đó cho máy khác chạy tiếp.
+
+Đã thêm `POST /api/worker/jobs/<id>/cancel` (mục 3.5). Bridge phải gọi nó mỗi
+khi job bị dừng ở phía máy: người dùng bấm dừng trong giao diện máy render, thao
+tác vận hành xoá batch, hay bridge tự quyết định bỏ.
+
+### 4.3 Khi cả hai đều mất trí nhớ
+
+Heartbeat chỉ trả lời được câu *"job X còn của tôi không"* — muốn hỏi thì bridge
+phải **còn nhớ** `id` và `claim_token` của X. Bridge khởi động lại, ổ cứng bị
+xoá, tiến trình chết giữa chừng đều làm mất trí nhớ đó. Từ lúc ấy hai bên lệch
+nhau vĩnh viễn: akali chờ một job không ai chạy, hoặc máy render chạy một job
+akali đã giao cho máy khác.
+
+`GET /api/worker/jobs?worker_id=` (mục 3.6) là đường thoát: nó không cần bridge
+nhớ gì cả, chỉ cần biết `worker_id` của chính mình. Gọi lúc khởi động, **trước
+khi** claim job mới.
+
+### 4.4 akali hiển thị khoảng lệch này
+
+Job đã huỷ mà máy render chưa xác nhận sẽ hiện ghi chú đỏ **"chờ máy dừng"** cạnh
+trạng thái trên dashboard. Ghi chú biến mất ngay khi máy gọi API lần kế tiếp và
+nhận 409.
+
+Nếu ghi chú đó **đứng lâu**, nghĩa là máy render không gọi API nữa — máy tắt, mất
+mạng, hoặc bridge chết. Nó không tự biến mất theo thời gian, vì akali không có
+cách nào biết máy đã dừng hay chưa ngoài việc chính máy đó báo về.
+
+---
+
+## 5. Quy ước dữ liệu đầu vào
+
+Folder Drive akali gửi xuống chứa:
+
+- **đúng 1 file video** — avatar dùng chung cho cả batch
+- **đúng 1 file `.xlsx`** — danh sách dòng cần render
+
+Cột `video_path` trong Excel **để trống** (video đã truyền qua `default_video`).
+
+Cột `tts_provider` và `tts_voice` trong Excel **bị bỏ qua** — voice do akali
+quyết định, một giọng cho cả batch. Xem mục 6 bước 8.
+
+---
+
+## 6. Luồng bridge
+
+```
+ 0. đối soát         → GET /jobs?worker_id=...  (mục 3.6) — TRƯỚC khi claim
+ 1. rảnh?            → db.worker_busy() false, không có batch running
+ 2. POST /claim      → 204 thì ngủ; có job thì đi tiếp
+ 3. idempotency      → akali_job_id đã có trong akali_batches? → theo dõi tiếp, KHÔNG tạo mới
+ 4. tải folder Drive → workdir/<akali_job_id>/
+ 5. nhận diện file   → đúng 1 .xlsx + 1 video; sai → /fail retryable=false
+ 6. đổi tên Excel    → <stem>__job<id>.xlsx
+ 7. process_excel(xlsx, default_video=<video>)
+ 8. đè voice         → mọi dòng
+ 9. submit_jobs(rows, batch_id, excel_path, render_config)
+10. heartbeat 60s    → progress = dòng xong / tổng dòng
+                       409 reason=canceled → nhánh H
+11. phát hiện xong   → mọi dòng done/failed VÀ đã có drive_link/drive_error
+12. export_results   → upload Excel kết quả lên cùng thư mục
+13. POST /complete   → link thư mục Drive
+```
+
+Ba nhánh bắt buộc, thiếu là hai bên lệch nhau (mục 4):
+
+```
+ H. akali huỷ        → 6 bước ở mục 4.1: bỏ khỏi danh sách theo dõi, dừng render,
+                       XOÁ DÒNG CÒN LẠI KHỎI tts_jobs, xoá workdir,
+                       đánh dấu abandoned, không gọi /complete hay /fail
+ U. máy render huỷ   → POST /jobs/<id>/cancel (mục 3.5), KHÔNG phải /fail
+ R. khởi động lại    → bước 0, đối soát rồi mới claim
+```
+
+### Bước 6 — vì sao phải đổi tên Excel
+
+Thư mục con trên Drive đặt theo tên file Excel. Hai batch dùng file trùng tên
+(ví dụ khách nào cũng gửi `danh_sach.xlsx`) sẽ **đổ chung một thư mục**, và link
+trả về cho batch sau sẽ chứa cả video của batch trước.
+
+Chèn `akali_job_id` vào tên file là cách rẻ nhất, không phải sửa code rendervideo.
+
+### Bước 8 — đè voice
+
+```python
+for r in rows:
+    r["tts_provider"] = params["tts_provider"]
+    r["tts_voice"]    = params["voice_id"]
+```
+
+`submit_jobs` đọc hai khoá này từ dict nên **không cần sửa `excel_import.py`**.
+
+### Bước 9 — ánh xạ cấu hình
+
+| `params` từ akali | khoá `render_config` |
+|---|---|
+| `model_res` | `model_res` |
+| `out_res` | `out_res` |
+| `guidance` | `guidance` |
+| `steps` | `steps` |
+| `seed` | `seed` |
+| `enhance_mouth` | `enhance_mouth` |
+| `enhance_region` | `enhance_region` |
+| `input_type` | `input_type` |
+| `engine` | xem mục 8.1 |
+| `tts_provider`, `voice_id` | **không** qua đây — đè vào `rows` ở bước 8 |
+
+Người dùng **không còn chỉnh tay** các tham số này trên dashboard: form chỉ hỏi
+engine, kiểu đầu vào (người thật / video AI), độ phân giải model và giọng đọc;
+`guidance`, `steps`, `seed`, `enhance_mouth` được suy ra tự động. Nhưng `params`
+gửi xuống vẫn đủ 11 khoá như cũ — bridge không phải đổi gì.
+
+### Bước 11 — vì sao phải đợi `drive_link`
+
+`_start_drive_upload()` chạy ở **thread nền sau** `mark_done`. Thấy
+`render_status='done'` mà báo ngay thì video còn chưa lên Drive, link trả về sẽ
+thiếu file. Phải đợi mỗi job có `drive_link` **hoặc** `drive_error`.
+
+### Bước 13 — dựng link thư mục
+
+```python
+service = gdrive.get_service()
+fid = gdrive.ensure_folder(service, excel_stem, gdrive.default_folder_id())
+url = f"https://drive.google.com/drive/folders/{fid}"
+```
+
+`upload_file()` chỉ trả `webViewLink` của **từng file**, không trả folder id —
+nên phải gọi `ensure_folder` riêng.
+
+---
+
+## 7. Bảng trạng thái của bridge
+
+Tạo trong chính file SQLite mà `database.py` / `tts_db.py` đang dùng:
+
+```sql
+CREATE TABLE IF NOT EXISTS akali_batches (
+    akali_job_id  INTEGER PRIMARY KEY,
+    claim_token   TEXT NOT NULL,
+    batch_id      TEXT NOT NULL,
+    excel_stem    TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'running',  -- running | reported | abandoned
+    created_at    TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+```
+
+Bảng này là thứ khiến bridge **restart được mà không mất batch**. Thiếu nó, bridge
+chết giữa chừng thì reaper của akali thu hồi job và cả batch render lại từ đầu.
+
+`akali_job_id` là khoá chính → khi akali retry cùng job, bridge nhận ra và nối
+tiếp thay vì dựng batch mới.
+
+**Chỉ heartbeat những hàng `status = 'running'`.** Job bị huỷ chuyển sang
+`abandoned` và không bao giờ được heartbeat nữa — đây là chỗ chặn đúng lỗi job 80
+mô tả ở mục 4.1.
+
+---
+
+## 8. Bẫy đã biết
+
+### 8.1 LatentSync không vào được hàng chờ
+
+Trên bản đối chiếu, `add_job` ghi đè `engine = "musetalk"` vô điều kiện. Kèm
+comment *"Normal/Excel/TTS renders are MuseTalk-only... never persist another
+engine."*
+
+Lịch sử git cho thấy dòng này do commit `22375f2` (29/07/2026, *"feat: update
+render video musktalk"*) thêm vào — **trước đó hàng chờ không phân biệt engine**.
+Commit chỉ sửa 2 file, 6 dòng, không đụng `queue_worker` hay `render_job`. Tức
+đây là quyết định thu hẹp phạm vi, không phải vì LatentSync hỏng.
+
+Muốn mở:
+
+```python
+# thay:  engine = "musetalk"
+engine = engine if engine in ("musetalk", "latentsync") else "musetalk"
+```
+
+Phần còn lại đã sẵn: `queue_worker` có nhánh `else` gọi `trim_video_to_audio`,
+truyền `--engine` xuống, và `config_path`/`checkpoint_path` vốn trỏ checkpoint
+LatentSync.
+
+**Trước khi mở**: kiểm tra `checkpoints/latentsync_unet.pt` có trên máy render
+không (mục 2.4), và chạy tay một lần `render_job.py --engine latentsync` với
+video + audio thật.
+
+Chưa mở thì bridge nhận `engine=latentsync` phải `/fail` với lý do rõ ràng, đừng
+để nó âm thầm chạy MuseTalk.
+
+> Trên dashboard hai engine hiện là **LS-Pro** (`latentsync`) và **MT-Fast**
+> (`musetalk`). Giá trị trong `params` vẫn là tên kỹ thuật.
+
+### 8.2 Guidance và Steps bị pipeline ép
+
+`render_job.render()` kẹp lại giá trị trước khi chạy:
+
+| `input_type` | Guidance | Steps |
+|---|---|---|
+| `real` | ≤ 1.5 | ≥ 24 |
+| `ai` | ≤ 1.3 | ≥ 28 |
+
+Gửi `guidance=2.5` xuống thì thực tế chạy 1.5, **không báo lỗi**.
+
+### 8.3 `model_res` chỉ có nghĩa với LatentSync
+
+`MODELS` map `256`/`512` sang **checkpoint LatentSync**. `musetalk_render()`
+không nhận config/checkpoint, nên hai cột đó chạy không khi engine là MuseTalk.
+
+### 8.4 Retry hai tầng — không xung đột
+
+- rendervideo retry **từng video** (`MAX_RETRIES`, `tts_db.schedule_retry`)
+- akali retry **cả batch** (`attempts` / `max_attempts`)
+
+Khác hạt nên không đá nhau. Điều duy nhất phải lo là akali retry batch thì đừng
+render lại từ đầu — đã xử bằng khoá idempotency ở mục 7.
+
+### 8.5 Đừng claim sớm
+
+akali bấm giờ lease **ngay lúc `/claim`**. Máy render một GPU, chạy một job một
+lúc. Claim rồi xếp hàng chờ là lease cháy trong lúc chờ. Luôn kiểm tra
+`db.worker_busy()` trước.
+
+### 8.6 Job chỉ về máy cùng nhóm
+
+Người dùng thuộc nhóm nào thì job của họ **chỉ** được giao cho máy render thuộc
+nhóm đó. Chính xác hơn, máy chỉ claim được job thoả một trong hai:
+
+- job **không thuộc nhóm nào** (người tạo chưa được gán nhóm), hoặc
+- job thuộc **đúng nhóm của máy**
+
+Nên máy chưa gán nhóm chỉ nhận được job không nhóm, còn máy đã gán nhóm nhận
+được job nhóm mình **và** job không nhóm.
+
+Máy hỏi việc mãi mà luôn nhận `204` trong khi dashboard có job chờ thì kiểm tra
+hai thứ trước khi nghi ngờ mạng: máy có bị **tắt** trong tab Phân nhóm không, và
+máy có **cùng nhóm** với người tạo job không.
+
+---
+
+## 9. Cấu hình
+
+Biến môi trường cho bridge:
+
+```bash
+AKALI_URL=https://api-chat-private.io.vn
+AKALI_WORKER_KEY=<WORKER_API_KEY của akali>
+AKALI_WORKER_ID=render-01
+AKALI_POLL_SECONDS=10
+AKALI_HEARTBEAT_SECONDS=60
+AKALI_RECONCILE_SECONDS=300
+AKALI_WORKDIR=/var/tmp/akali_batches
+```
+
+`AKALI_WORKER_ID` là tên hiện trên dashboard. Đổi tên là akali coi như **một máy
+khác** — job đang chạy dở sẽ mồ côi cho tới khi lease hết hạn.
+
+Chuẩn bị kèm theo:
+
+1. **Đường mạng.** Dùng domain công khai ở trên; chỉ `/api/worker/*` mở ra ngoài.
+2. **Credential Drive.** Bridge phải **đọc** được folder akali giao. Service
+   account mà `rendervideo` đang dùng để upload chưa chắc được share folder
+   nguồn — kiểm tra riêng.
+
+---
+
+## 10. Nghiệm thu theo giai đoạn
+
+Mỗi giai đoạn chạy thật được, không phải chờ xong hết mới thử.
+
+**Giai đoạn 1 — claim và tải**
+- [ ] Nạp job trên dashboard akali, bridge nhận được trong vòng một nhịp poll
+- [ ] Folder tải về đủ file, nhận diện đúng 1 Excel + 1 video
+- [ ] Folder sai cấu trúc → job về `failed`, lý do đọc được trên dashboard
+
+**Giai đoạn 2 — dựng batch và giữ nhịp**
+- [ ] `tts_jobs` có đủ số dòng của Excel
+- [ ] Mọi dòng dùng đúng `voice_id` akali gửi, kể cả dòng Excel có ghi voice khác
+- [ ] Tiến độ trên dashboard nhích dần
+- [ ] Tắt bridge giữa chừng rồi bật lại → nối tiếp đúng batch cũ, không dựng batch mới
+
+**Giai đoạn 3 — báo xong**
+- [ ] Job về `done`, bấm link ra đúng thư mục chứa đủ video
+- [ ] Excel kết quả có cột `video_done`, nằm cùng thư mục
+- [ ] Một vài dòng lỗi → job vẫn `done`, dòng hỏng thể hiện trong Excel
+- [ ] Không dòng nào ra video → job về `failed`
+
+**Giai đoạn 4 — đồng bộ huỷ (mục 4)**
+
+Đây là phần đang hỏng, nghiệm thu kỹ.
+
+- [ ] Bấm Huỷ trên dashboard giữa lúc batch đang render → trong vòng 1 phút,
+      bridge nhận `409 reason=canceled` và **ngừng heartbeat job đó vĩnh viễn**
+- [ ] Cùng tình huống → **tiến trình render dừng thật**, kiểm bằng `nvidia-smi`
+      chứ không chỉ nhìn log
+- [ ] Cùng tình huống → **các dòng còn lại của batch biến mất khỏi `tts_jobs`**,
+      không có video mới nào được đẩy lên Drive sau thời điểm huỷ
+- [ ] Ghi chú "chờ máy dừng" trên dashboard biến mất sau khi bridge nhận 409
+- [ ] Huỷ batch ở giao diện máy render → job trên dashboard về **Đã huỷ**,
+      không phải **Lỗi**, và **không** bị máy khác nhận lại
+- [ ] Giết bridge giữa chừng, xoá state, bật lại → bước đối soát phát hiện job mồ
+      côi và xử lý đúng theo bảng ở mục 3.6
+- [ ] Huỷ một job rồi để máy render tắt vài giờ, bật lại → bridge không heartbeat
+      job đã huỷ đó nữa (đây chính là lỗi job 80)
+
+---
+
+## 11. Trạng thái (cập nhật 21/09/2026)
+
+### Phía akali — đã kiểm chứng trực tiếp trên hệ thống đang chạy
+
+- [x] 6 endpoint hoạt động, chạy thật qua `https://api-chat-private.io.vn`
+- [x] Huỷ trên dashboard → `/heartbeat` và `/complete` đều trả
+      `409 reason=canceled`; kết quả về muộn **không ghi đè** được lệnh huỷ
+- [x] `POST /jobs/<id>/cancel` → job về `canceled` kèm lý do, không giao lại máy
+      khác; cần `claim_token` hợp lệ
+- [x] `GET /jobs?worker_id=` trả đúng job của riêng máy đó, rỗng sau khi huỷ
+- [x] Dashboard hiện "chờ máy dừng" khi máy render chưa xác nhận
+- [x] `LEASE_SECONDS` = **1800**
+- [x] Dashboard nạp job kèm đủ 11 tham số trong `params`
+- [x] Bảng `voices` + `GET /api/voices`
+- [x] `WORKER_API_KEY` đã đổi khỏi giá trị mặc định
+- [x] 17/17 test backend pass (4 test riêng cho luồng huỷ)
+
+### Đơn vị `progress` — đã chốt
+
+**Phần trăm, 0–100.** Chuỗi kiểm chứng:
+
+| Mắt xích | Bằng chứng |
+|---|---|
+| Schema | `progress INT NOT NULL DEFAULT 0` |
+| `/heartbeat` | ghi thẳng giá trị vào cột, không biến đổi |
+| `/claim` | đặt `progress = 0` |
+| `/complete` | đặt `progress = 100` |
+| Dashboard | `width: ${job.progress}%` |
+
+Backend **không kẹp giá trị** — gửi 150 thì cột lưu 150. Bridge tự kẹp về 0–100.
+
+### Phía máy render — CHƯA làm, đây là việc còn lại
+
+Bridge đang chạy trên `Render L8247` và `Render L8383`, claim và render được.
+Nhưng **chưa xử lý huỷ**, bằng chứng ở mục 4.1: job 80 huỷ ngày 17/09 vẫn được
+heartbeat ngày 21/09.
+
+- [ ] Nhận `409 reason=canceled` → làm đủ 6 bước ở **mục 4.1**, đặc biệt là bước
+      3 (xoá dòng còn lại khỏi `tts_jobs`)
+- [ ] Huỷ ở máy render → gọi **`/cancel`** (mục 3.5), bỏ hẳn cách dùng `/fail`
+- [ ] Thêm bước đối soát lúc khởi động (**mục 3.6**), chạy trước khi claim
+- [ ] Chỉ heartbeat hàng `akali_batches.status = 'running'` (mục 7)
+- [ ] Nghiệm thu theo **giai đoạn 4** ở mục 10
+
+Source bridge không có trong repo này — ai sửa phải làm trên máy render.
+
+### Vận hành còn treo
+
+- [ ] **`ADMIN_API_KEY` vẫn là `change-me-admin`** — khoá web proxy dùng để gọi
+      backend, và giá trị mặc định này nằm công khai trong `.env.example` trên
+      GitHub. Dashboard đang mở ra Internet. Đổi thì phải restart cả `web`.
+- [ ] `SESSION_SECRET` vẫn là giá trị dev mặc định, `COOKIE_SECURE` vẫn `false`.
+- [ ] `Render L8383` đang bị **tắt** trong tab Phân nhóm — vẫn hỏi việc nhưng
+      không được cấp job. Kiểm tra xem có cố ý không.
+- [ ] Share folder Drive nguồn cho service account mà `google_drive_upload.py`
+      trên máy render đang dùng, quyền đọc là đủ.
+
+### Còn thiếu để bridge chạy trọn vẹn
+
+- Hàm tải folder Drive: `google_drive_upload.py` chỉ có upload. akali có sẵn
+  `worker/drive_client.py` với `download_folder()`, chép sang dùng lại.
+- Model weights trên máy render — xem mục 2.4. Thiếu thì bridge chạy đúng nhưng
+  render luôn hỏng.

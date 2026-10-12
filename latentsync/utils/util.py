@@ -28,7 +28,7 @@ from torchvision import transforms
 
 from einops import rearrange
 import cv2
-from decord import AudioReader, VideoReader
+import librosa
 import shutil
 import subprocess
 import shlex
@@ -116,6 +116,11 @@ def read_video_chunks(video_path: str, chunk_size: int = 16):
 
 
 def read_video_decord(video_path: str):
+    # Lazily imported: decord is unmaintained and fails to import outright on
+    # some platforms. Every render-path caller passes use_decord=False, so
+    # the rest of this module must stay importable without decord.
+    from decord import VideoReader
+
     vr = VideoReader(video_path)
     video_frames = vr[:].asnumpy()
     vr.seek(0)
@@ -155,13 +160,11 @@ def read_video_cv2(video_path: str):
 def read_audio(audio_path: str, audio_sample_rate: int = 16000):
     if audio_path is None:
         raise ValueError("Audio path is required.")
-    ar = AudioReader(audio_path, sample_rate=audio_sample_rate, mono=True)
-
-    # To access the audio samples
-    audio_samples = torch.from_numpy(ar[:].asnumpy())
-    audio_samples = audio_samples.squeeze(0)
-
-    return audio_samples
+    # librosa, not decord.AudioReader: decord is unmaintained and fails to even
+    # import on some platforms, which used to take the whole render pipeline
+    # down with it since this is on the hot path for every render.
+    samples, _ = librosa.load(audio_path, sr=audio_sample_rate, mono=True)
+    return torch.from_numpy(samples)
 
 
 def write_video(video_output_path: str, video_frames: np.ndarray, fps: int):

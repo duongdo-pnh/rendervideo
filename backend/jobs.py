@@ -8,15 +8,21 @@ from typing import Optional
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
 
+import akali_bridge
 import database as db
+import gpu_info
 import job_files
 import tts_db
 from job_naming import KIND_ANSWER, build_name, slug_key
 from render_job import OUT_RES
 
 from .models import (
-    CancelAllResponse, CancelJobResponse, DeletedJobsResponse, JobOut, JobSubmitResponse,
-    PriorityChoice, ReorderRequest,
+    CancelAllResponse, CancelJobResponse, DeletedJobsResponse, EngineChoice, JobOut,
+    JobSubmitResponse, PriorityChoice, ReorderRequest,
+)
+
+LATENTSYNC_BLOCKED_MESSAGE = (
+    "LatentSync không khả dụng trên GPU RTX 3080/3080 Ti (hay gặp lỗi) — dùng MuseTalk."
 )
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -45,6 +51,14 @@ def priority_choices():
     return [PriorityChoice(id=j["id"], label=f"#{j['id']} · {j['name']}") for j in jobs]
 
 
+@router.get("/engine-choices", response_model=list[EngineChoice])
+def engine_choices():
+    choices = [EngineChoice(label="MuseTalk 1.5", value="musetalk")]
+    if not gpu_info.latentsync_blocked():
+        choices.append(EngineChoice(label="LatentSync", value="latentsync"))
+    return choices
+
+
 @router.post("", response_model=JobSubmitResponse, status_code=201)
 async def submit_job(
     video: UploadFile,
@@ -67,6 +81,8 @@ async def submit_job(
         raise HTTPException(422, "Chọn ASK_OTHER thì cần điền other_key, ví dụ: khautrang.")
     if out_res not in OUT_RES:
         raise HTTPException(422, f"out_res không hợp lệ (expected one of {list(OUT_RES)})")
+    if engine == "latentsync" and gpu_info.latentsync_blocked():
+        raise HTTPException(422, LATENTSYNC_BLOCKED_MESSAGE)
 
     name = build_name(product, kind, intent, other_key)
     v_dst, a_dst = job_files.write_upload_pair(
@@ -130,8 +146,16 @@ def cancel_job(job_id: int):
 
 @router.post("/cancel-all", response_model=CancelAllResponse)
 def cancel_all_jobs():
-    """Hủy TẤT CẢ job đang chờ + đặt cờ cho job đang render (worker tự dừng)."""
+    """Hủy TẤT CẢ job đang chờ + đặt cờ cho job đang render (worker tự dừng).
+
+    Huỷ luôn cả batch akali đang chạy: "hủy hết" là ý định rõ ràng, không mơ hồ
+    như huỷ lẻ 1 video. Không làm bước này thì akali_bridge vẫn tưởng batch đang
+    chạy, vẫn heartbeat, và akali sẽ hiện batch đó là Xong/Lỗi thay vì Đã huỷ
+    (xem doc_api/APi_RENDER_QUEUE.md nhánh U). Chỉ đặt cờ — bridge mới có
+    claim_token để gọi /cancel báo akali.
+    """
     n_queued, n_rendering = db.cancel_all_active()
+    batches = akali_bridge.request_batch_cancel()
     total = n_queued + n_rendering
     if total == 0:
         message = "Không có job đang chờ/đang render để hủy."
@@ -142,6 +166,8 @@ def cancel_all_jobs():
         if n_rendering:
             parts.append(f"{n_rendering} đang render (sẽ dừng trong vài giây)")
         message = f"Đã hủy {' + '.join(parts)}."
+    if batches:
+        message += f" Đã huỷ {len(batches)} batch akali, đang báo về akali."
     return CancelAllResponse(cancelled_queued=n_queued, flagged_rendering=n_rendering, message=message)
 
 

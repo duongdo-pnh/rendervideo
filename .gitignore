@@ -119,3 +119,13 @@ venv/
 /venv.backup/
 __pycache__/
 *.pyc
+
+# Installer state, temporary downloads and external engine checkout
+/.install-tmp/
+/.install-cache/
+/.setup.lock
+/.setup-in-progress
+/.environment-ready.json
+/.environment-ready.tmp
+/engines/
+/.backend_run.pid

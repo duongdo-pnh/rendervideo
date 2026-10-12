@@ -1,0 +1,25 @@
+# Builds the .deb on Ubuntu 22.04 so its glibc requirement stays compatible
+# with 22.04 targets — a binary built on 24.04's newer glibc fails to even
+# start on 22.04 ("version `GLIBC_2.38' not found").
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl ca-certificates build-essential pkg-config file \
+    libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+    librsvg2-dev libssl-dev patchelf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Rust toolchain.
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Node.js (for the Tauri CLI).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g @tauri-apps/cli@^2
+
+WORKDIR /work

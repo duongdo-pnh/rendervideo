@@ -38,6 +38,9 @@ def main() -> int:
         return 1
 
     profile = profiles[arch]
+    if profile.get("_validated") is not True:
+        print(f"ERROR: GPU {gpu['name']} ({arch}) chưa có cấu hình đã xác thực cho cả hai engine. Dừng cài đặt.", file=sys.stderr)
+        return 1
     main_p = profile.get("main")
     musetalk_p = profile.get("musetalk")
     if not main_p:
