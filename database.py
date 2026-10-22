@@ -143,6 +143,8 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
     if engine not in ("musetalk", "latentsync"):
         raise ValueError(f"unknown engine {engine!r} (expected 'musetalk' or 'latentsync')")
     model_res = str(model_res)
+    if engine == "latentsync":
+        model_res = "512"  # LatentSync 1.6 only; the 256 / v1.5 checkpoint is no longer shipped
     if model_res not in MODELS:
         raise ValueError(f"unknown model_res {model_res!r} (expected one of {list(MODELS)})")
     config_path, checkpoint_path = MODELS[model_res]

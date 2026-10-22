@@ -116,7 +116,7 @@ def build_pipeline(config, ckpt_path="checkpoints/latentsync_unet.pt", enable_de
     from omegaconf import OmegaConf
     from diffusers import AutoencoderKL, DDIMScheduler
     from latentsync.models.unet import UNet3DConditionModel
-    from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+    from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline, apply_low_vram_mode
     from latentsync.whisper.audio2feature import Audio2Feature
 
     is_fp16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
@@ -139,11 +139,13 @@ def build_pipeline(config, ckpt_path="checkpoints/latentsync_unet.pt", enable_de
     unet, _ = UNet3DConditionModel.from_pretrained(OmegaConf.to_container(config.model), ckpt_path, device="cpu")
     unet = unet.to(dtype=dtype)
     pipeline = LipsyncPipeline(vae=vae, audio_encoder=audio_encoder, unet=unet, scheduler=scheduler).to("cuda")
+    apply_low_vram_mode(pipeline)  # 12 GB cards only; 24 GB cards run unchanged
     if enable_deepcache:
         from DeepCache import DeepCacheSDHelper
         helper = DeepCacheSDHelper(pipe=pipeline)
         helper.set_params(cache_interval=3, cache_branch_id=0)
         helper.enable()
+        pipeline.deepcache_helper = helper  # so the OOM fallback can turn it off
     return pipeline, dtype
 
 

@@ -1,4 +1,5 @@
 """Adapter between the render queue and persistent MuseTalk 1.5 server."""
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -18,6 +19,13 @@ MODEL_ROOT = MUSETALK_ROOT / "models"
 SOCKET_PATH = ROOT / ".musetalk.sock"
 SERVER_START_LOCK = ROOT / ".musetalk_start.lock"
 SERVER_LOG = ROOT / "logs" / "musetalk_server.log"
+# MuseTalk renders hold ACTIVE_LOCK shared; a LatentSync render on a low-VRAM card holds it
+# exclusive so it can stop the server and get its VRAM back. GATE_LOCK gives the pauser
+# priority: while it's held exclusive, new MuseTalk renders queue up instead of streaming in
+# behind each other and starving the LatentSync render forever.
+ACTIVE_LOCK = ROOT / ".musetalk_active.lock"
+GATE_LOCK = ROOT / ".musetalk_gate.lock"
+LOCK_HEARTBEAT_SECONDS = 30
 REQUIRED_FILES = (
     SERVER_SCRIPT,
     MODEL_ROOT / "musetalkV15" / "musetalk.json",
@@ -97,7 +105,7 @@ def _ensure_server():
         raise RuntimeError(f"MuseTalk server did not start; see {SERVER_LOG}")
 
 
-def _kill_server(timeout=5):
+def _kill_server(timeout=5, reason="wedged"):
     """Kill any running persistent server so the next render spawns a fresh one.
 
     A CUDA error response means the server's CUDA context is wedged — it still
@@ -122,7 +130,7 @@ def _kill_server(timeout=5):
     for pid in pids:
         try:
             os.kill(pid, signal.SIGTERM)
-            print(f"[musetalk] killed wedged server pid={pid}", flush=True)
+            print(f"[musetalk] killed {reason} server pid={pid}", flush=True)
         except OSError:
             pass
     deadline = time.monotonic() + timeout
@@ -169,7 +177,66 @@ def _wait_for_response(client, heartbeat_seconds=HEARTBEAT_SECONDS,
             return bytes(payload).split(b"\n", 1)[0].decode("utf-8")
 
 
+def _flock_with_heartbeat(handle, mode, waiting_msg):
+    """flock that prints a line every LOCK_HEARTBEAT_SECONDS while blocked, so the queue
+    worker's no-log-output stall check doesn't kill a render that is only waiting its turn."""
+    try:
+        fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+        return
+    except BlockingIOError:
+        pass
+    print(waiting_msg, flush=True)
+    waited = 0.0
+    while True:
+        try:
+            fcntl.flock(handle.fileno(), mode | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            time.sleep(1)
+            waited += 1
+            if waited % LOCK_HEARTBEAT_SECONDS == 0:
+                print(f"{waiting_msg} ({int(waited)}s)", flush=True)
+
+
+@contextlib.contextmanager
+def _render_slot():
+    """Shared hold for one MuseTalk render; waits while a LatentSync render has paused MuseTalk."""
+    with open(GATE_LOCK, "a+") as gate, open(ACTIVE_LOCK, "a+") as active:
+        _flock_with_heartbeat(gate, fcntl.LOCK_SH,
+                              "[musetalk] paused for a LatentSync render on this GPU — waiting...")
+        _flock_with_heartbeat(active, fcntl.LOCK_SH, "[musetalk] waiting for render slot...")
+        fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+        yield
+
+
+@contextlib.contextmanager
+def paused():
+    """Stop the MuseTalk server for the duration of the block, freeing its VRAM.
+
+    Blocks new MuseTalk renders, waits for in-flight ones to finish, then kills the server.
+    The next MuseTalk render restarts it via _ensure_server(). Meant for LatentSync on
+    low-VRAM cards, where both models don't fit at once.
+    """
+    with open(GATE_LOCK, "a+") as gate, open(ACTIVE_LOCK, "a+") as active:
+        _flock_with_heartbeat(gate, fcntl.LOCK_EX, "[musetalk] waiting to pause MuseTalk...")
+        _flock_with_heartbeat(active, fcntl.LOCK_EX,
+                              "[musetalk] waiting for running MuseTalk renders to finish...")
+        try:
+            _kill_server(reason="idle")
+            print("[musetalk] server stopped to free VRAM; restarts on the next MuseTalk job",
+                  flush=True)
+            yield
+        finally:
+            fcntl.flock(active.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(gate.fileno(), fcntl.LOCK_UN)
+
+
 def render(video_path, audio_path, output_path, work_dir, batch_size=20):
+    with _render_slot():
+        _render(video_path, audio_path, output_path, work_dir, batch_size)
+
+
+def _render(video_path, audio_path, output_path, work_dir, batch_size=20):
     _validate_install()
     video_path = Path(video_path).resolve()
     avatar_id = f"{_video_cache_key(video_path)}_b0"

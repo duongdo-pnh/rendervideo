@@ -231,8 +231,15 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     temp_dir = str(work_dir / f"temp_{Path(output_path).stem}")
     args = _build_args(video_path, audio_path, raw_out, checkpoint, steps, guidance, seed, temp_dir)
 
-    # Serialize the GPU-heavy section across processes (diffusion + GFPGAN).
-    with gpu_lock():
+    # Serialize the GPU-heavy section across processes (diffusion + GFPGAN). On low-VRAM cards
+    # (RTX 3080 Ti) LatentSync and the resident MuseTalk server don't fit together, so stop
+    # MuseTalk for the duration; its next job restarts it.
+    import gpu_info
+    pause_musetalk = contextlib.nullcontext()
+    if gpu_info.is_low_vram_gpu():
+        from musetalk_adapter import paused as pause_musetalk_server
+        pause_musetalk = pause_musetalk_server()
+    with gpu_lock(), pause_musetalk:
         inference_main(config=config, args=args)
         print("[render_job] diffusion done", flush=True)
 

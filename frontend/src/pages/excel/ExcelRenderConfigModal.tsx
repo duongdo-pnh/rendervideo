@@ -105,18 +105,6 @@ export function ExcelRenderConfigModal({
             />
           </div>
 
-          {config.engine === 'latentsync' && (
-            <RadioGroup
-              label="LatentSync checkpoint"
-              value={config.model_res}
-              onChange={(v) => set('model_res', v as ModelRes)}
-              options={[
-                { label: '256 (nhanh ~2×)', value: '256' },
-                { label: '512 (nét/tự nhiên, chậm)', value: '512' },
-              ]}
-            />
-          )}
-
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <SliderField
               label="Guidance Scale"

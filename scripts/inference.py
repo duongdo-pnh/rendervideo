@@ -20,7 +20,7 @@ import torch
 torch.backends.cudnn.benchmark = True
 from diffusers import AutoencoderKL, DDIMScheduler
 from latentsync.models.unet import UNet3DConditionModel
-from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline, apply_low_vram_mode
 from accelerate.utils import set_seed
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
@@ -82,11 +82,14 @@ def main(config, args):
         scheduler=scheduler,
     ).to("cuda")
 
+    apply_low_vram_mode(pipeline)  # 12 GB cards only; 24 GB cards run unchanged
+
     # use DeepCache
     if args.enable_deepcache:
         helper = DeepCacheSDHelper(pipe=pipeline)
         helper.set_params(cache_interval=3, cache_branch_id=0)
         helper.enable()
+        pipeline.deepcache_helper = helper  # so the OOM fallback can turn it off
 
     if args.seed != -1:
         set_seed(args.seed)

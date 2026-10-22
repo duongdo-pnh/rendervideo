@@ -47,6 +47,30 @@ from ..whisper.audio2feature import Audio2Feature
 import tqdm
 import soundfile as sf
 
+from gpu_info import LOW_VRAM_THRESHOLD_GIB
+
+
+def apply_low_vram_mode(pipeline) -> bool:
+    """Enable VRAM savings on cards under LOW_VRAM_THRESHOLD_GIB; no-op on bigger cards.
+    Call after the pipeline is on CUDA. Returns True when the low-VRAM path was applied."""
+    if not torch.cuda.is_available():
+        return False
+    total_gib = torch.cuda.get_device_properties(0).total_memory / 2**30
+    if total_gib >= LOW_VRAM_THRESHOLD_GIB:
+        print(f"VRAM {total_gib:.1f} GiB: full-speed mode (batched VAE, no cap)")
+        return False
+    # Encode/decode the 16-frame chunk one frame at a time: batched VAE decode at 512px
+    # needs ~2 GiB on top of the UNet.
+    pipeline.enable_vae_slicing()
+    # Hard cap on this process's PyTorch VRAM (fraction of total). Hitting it raises a normal
+    # OOM, which the split-CFG fallback in _unet_forward absorbs, instead of overflowing the card.
+    vram_fraction = float(os.environ.get("LATENTSYNC_VRAM_FRACTION", "0.85"))
+    if 0 < vram_fraction < 1:
+        torch.cuda.set_per_process_memory_fraction(vram_fraction)
+    print(f"VRAM {total_gib:.1f} GiB: low-VRAM mode (VAE slicing, cap "
+          f"{vram_fraction:.2f} = {vram_fraction * total_gib:.1f} GiB)")
+    return True
+
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 
@@ -146,6 +170,31 @@ class LipsyncPipeline(DiffusionPipeline):
             ):
                 return torch.device(module._hf_hook.execution_device)
         return self.device
+
+    def _unet_forward(self, unet_input, t, audio_embeds, do_classifier_free_guidance):
+        # Batched CFG (uncond+cond in one pass) is fastest but peaks near the 12 GB limit at 512px.
+        # On OOM fall back to one CFG half per pass, and stay there for the rest of the render.
+        if do_classifier_free_guidance and not getattr(self, "_split_cfg", False):
+            try:
+                return self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+            except torch.cuda.OutOfMemoryError:
+                torch.cuda.empty_cache()
+                self._split_cfg = True
+                # DeepCache keeps one cached feature per block, so split passes would feed the
+                # cond half's features to the uncond half on skip steps. Turn it off.
+                helper = getattr(self, "deepcache_helper", None)
+                if helper is not None:
+                    helper.disable()
+                    self.deepcache_helper = None
+                print("[lipsync] CUDA OOM in batched CFG -> split CFG passes, DeepCache off", flush=True)
+        if not do_classifier_free_guidance:
+            return self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+        embeds = audio_embeds.chunk(2) if audio_embeds is not None else (None, None)
+        halves = [
+            self.unet(x, t, encoder_hidden_states=e).sample
+            for x, e in zip(unet_input.chunk(2), embeds)
+        ]
+        return torch.cat(halves)
 
     def decode_latents(self, latents):
         latents = latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
@@ -529,7 +578,7 @@ class LipsyncPipeline(DiffusionPipeline):
                     unet_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
                     unet_input = self.scheduler.scale_model_input(unet_input, t)
                     unet_input = torch.cat([unet_input, mask_latents, masked_image_latents, ref_latents], dim=1)
-                    noise_pred = self.unet(unet_input, t, encoder_hidden_states=audio_embeds).sample
+                    noise_pred = self._unet_forward(unet_input, t, audio_embeds, do_classifier_free_guidance)
                     if do_classifier_free_guidance:
                         noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2)
                         noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)

@@ -14,7 +14,7 @@ import { createJob } from '../../api/jobs'
 import { ApiError } from '../../api/client'
 import { useEngineChoices } from '../../hooks/useEngineChoices'
 import { buildName, INTENT_CHOICES, KIND_ANSWER, KIND_INTRO, slugKey } from '../../utils/jobNaming'
-import type { Engine, InputType, ModelRes, OutRes } from '../../types/api'
+import type { Engine, InputType, OutRes } from '../../types/api'
 
 const OUT_RES_CHOICES: OutRes[] = ['Gốc', '1080', '720', '480 Nhanh']
 
@@ -30,7 +30,6 @@ export function CreateJobTab() {
   const [otherKey, setOtherKey] = useState('')
   const [inputType, setInputType] = useState<InputType>('real')
   const [engine, setEngine] = useState<Engine>('musetalk')
-  const [modelRes, setModelRes] = useState<ModelRes>('512')
   const [outRes, setOutRes] = useState<OutRes>('720')
   const [guidance, setGuidance] = useState(1.5)
   const [steps, setSteps] = useState(24)
@@ -74,7 +73,7 @@ export function CreateJobTab() {
       form.append('kind', kind)
       if (showIntent && intent) form.append('intent', intent)
       if (showOtherKey) form.append('other_key', otherKey)
-      form.append('model_res', modelRes)
+      form.append('model_res', '512')
       form.append('guidance', String(guidance))
       form.append('steps', String(steps))
       form.append('seed', String(seed))
@@ -177,18 +176,6 @@ export function CreateJobTab() {
             ]}
           />
         </div>
-
-        {engine === 'latentsync' && (
-          <RadioGroup
-            label="LatentSync checkpoint"
-            value={modelRes}
-            onChange={(v) => setModelRes(v as ModelRes)}
-            options={[
-              { label: '256 (nhanh ~2×)', value: '256' },
-              { label: '512 (nét/tự nhiên, chậm)', value: '512' },
-            ]}
-          />
-        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <SliderField label="Guidance Scale" value={guidance} min={1} max={3} step={0.1} onChange={setGuidance} />
