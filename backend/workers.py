@@ -46,6 +46,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 MAIN_PYTHON = ROOT / "venv" / "bin" / "python"
+MUSETALK_PYTHON = ROOT / "engines" / "MuseTalk" / ".venv" / "bin" / "python"
 LOGS_DIR = ROOT / "logs"
 
 _PASSTHROUGH_ENV_VARS = ("HOME", "LANG", "LC_ALL", "TZ", "USER")
@@ -116,10 +117,48 @@ def _spawn(script: str) -> None:
     print(f"[workers] spawned {script} (log: {log_path})")
 
 
+def _ensure_pkg_resources(python: Path) -> None:
+    """Pin setuptools<81 in `python`'s venv if pkg_resources is missing.
+
+    install/setup.sh pins this at install time (setuptools>=81 dropped pkg_resources,
+    which librosa imports, so every LatentSync render dies with "No module named
+    'pkg_resources'"), but that pin only landed on 2026-10-12. Venvs created before
+    then still carry setuptools>=81, and a .deb upgrade only refreshes the source —
+    it never re-runs setup.sh — so those installs stay broken. Repair them here, once:
+    after the pin, the import check passes and this is a ~1s no-op on every start.
+    """
+    if not python.is_file():
+        return
+    try:
+        check = subprocess.run([str(python), "-c", "import pkg_resources"],
+                               capture_output=True, env=_clean_env(), timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[workers] pkg_resources check failed for {python}: {e}")
+        return
+    if check.returncode == 0:
+        return
+    print(f"[workers] pkg_resources missing in {python} — installing setuptools<81")
+    try:
+        fix = subprocess.run([str(python), "-m", "pip", "install", "setuptools<81"],
+                             capture_output=True, text=True, env=_clean_env(), timeout=300)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"[workers] setuptools<81 install failed for {python}: {e}")
+        return
+    if fix.returncode == 0:
+        print(f"[workers] setuptools<81 installed in {python}")
+    else:
+        print(f"[workers] setuptools<81 install failed for {python} "
+              f"(exit {fix.returncode}): {fix.stderr.strip()[-500:]}")
+
+
 def start_all() -> None:
     if not MAIN_PYTHON.is_file():
         print(f"[workers] {MAIN_PYTHON} not found — skipping auto-start (not installed?)")
         return
+
+    # Before any worker can start a render on a venv that can't import librosa.
+    for python in (MAIN_PYTHON, MUSETALK_PYTHON):
+        _ensure_pkg_resources(python)
 
     for script in _WORKER_SCRIPTS:
         _kill_stale_worker(script)
