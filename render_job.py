@@ -95,6 +95,37 @@ def _maybe_downscale(video_path, target_short, work_dir):
     return out
 
 
+# LatentSync diffuses at up to this shorter side even when a smaller output is chosen, then
+# downscales at the end (_finalize_downscale). Downscaling first loses detail through the
+# fast NVENC pass and the later re-encodes; the 512px face crop makes 1080 cost ~the same.
+LATENTSYNC_WORK_SHORT = 1080
+# Mild unsharp after the lanczos downscale: 720 output measured ~1.1-1.2x the face sharpness
+# of the source downscaled to 720 (vs ~0.65x before), without visible halos at this amount.
+FINAL_UNSHARP = "unsharp=5:5:0.45:5:5:0"
+
+
+def _finalize_downscale(path, target_short):
+    """Lanczos-downscale the finished render to target shorter side + mild sharpen, in place."""
+    cap = cv2.VideoCapture(path)
+    w, h = int(cap.get(3)), int(cap.get(4))
+    cap.release()
+    if min(w, h) <= target_short:
+        return
+    tmp = path + ".final.mp4"
+    vf = (f"scale='if(gt(iw,ih),-2,{target_short})':'if(gt(iw,ih),{target_short},-2)'"
+          f":flags=lanczos,{FINAL_UNSHARP}")
+    # Same targeted bitrate as the pipeline encode (see lipsync_pipeline.py).
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-nostdin", "-i", path, "-vf", vf,
+         "-c:v", "libx264", "-preset", "medium", "-b:v", "2900k", "-maxrate", "3200k",
+         "-bufsize", "3200k", "-pix_fmt", "yuv420p", "-c:a", "copy", tmp],
+        check=True,
+    )
+    os.replace(tmp, path)
+    print(f"[render_job] final downscale {w}x{h} -> shorter side {target_short} (lanczos + sharpen)",
+          flush=True)
+
+
 def _probe_duration(path):
     """Media duration in seconds via ffprobe, or 0.0 if unknown."""
     try:
@@ -181,7 +212,12 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         video_path = _trim_to_audio(video_path, audio_path, str(work_dir))
 
     # Output resolution: downscale input to chosen shorter side (output res = input res).
-    video_path = _maybe_downscale(video_path, OUT_RES.get(out_res), str(work_dir))
+    # LatentSync below 1080 diffuses at 1080 and downscales the result at the end instead.
+    target_short = OUT_RES.get(out_res)
+    final_short = None
+    if engine == "latentsync" and target_short and target_short < LATENTSYNC_WORK_SHORT:
+        final_short, target_short = target_short, LATENTSYNC_WORK_SHORT
+    video_path = _maybe_downscale(video_path, target_short, str(work_dir))
 
     if engine == "musetalk":
         from musetalk_adapter import render as musetalk_render
@@ -266,6 +302,9 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         else:
             # Fast mode: raw diffusion output, no GFPGAN.
             os.replace(raw_out, output_path)
+
+    if final_short and os.path.exists(output_path):
+        _finalize_downscale(output_path, final_short)
 
     if not os.path.exists(output_path):
         raise RuntimeError(f"render finished but output missing: {output_path}")
