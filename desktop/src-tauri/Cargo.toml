@@ -1,6 +1,6 @@
 [package]
 name = "byscom-render-desktop"
-version = "1.3.4"
+version = "1.3.5"
 description = "Byscom Render desktop shell — launches the FastAPI backend and shows it in a native window"
 edition = "2021"
 
