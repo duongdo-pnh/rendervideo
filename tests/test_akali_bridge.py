@@ -179,6 +179,76 @@ class BatchCancelFlagTests(unittest.TestCase):
         self.assertFalse(ab._batch_cancel_requested(80))
         ab.request_batch_cancel(80)
         self.assertTrue(ab._batch_cancel_requested(80))
+        ab._set_batch_output_url(80, "https://d/folders/F")
+        self.assertEqual(ab._batch_output_url(80), "https://d/folders/F")
+
+
+class HeartbeatPayloadTests(unittest.TestCase):
+    def test_output_url_only_sent_when_present(self):
+        with patch.object(ab, "_post") as post:
+            ab.heartbeat(80, "tok", 40)
+            ab.heartbeat(80, "tok", 40, "")
+            ab.heartbeat(80, "tok", 140, "https://drive.google.com/drive/folders/F")
+        payloads = [c.args[1] for c in post.call_args_list]
+        self.assertNotIn("output_url", payloads[0])
+        self.assertNotIn("output_url", payloads[1])
+        self.assertEqual(payloads[2], {"claim_token": "tok", "progress": 100,
+                                       "output_url": "https://drive.google.com/drive/folders/F"})
+
+
+class EarlyOutputUrlTests(unittest.TestCase):
+    """Link thư mục Drive gửi sớm qua heartbeat (docs/early-output-url.md)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(db, "DB_PATH", Path(self._tmp.name) / "jobs.db")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        db.init_db()
+        ab._init_batches_table()
+        ab._save_batch(80, "tok", "batch-80", "FAQ__job80")
+
+    def test_nothing_uploaded_yet_sends_no_link_and_skips_drive(self):
+        with patch.object(ab, "_batch_folder_url") as build:
+            self.assertIsNone(ab._early_output_url(80, "FAQ__job80", uploaded=0))
+        build.assert_not_called()
+
+    def test_first_upload_builds_link_once_then_reuses_stored_one(self):
+        with patch.object(ab, "_batch_folder_url", return_value="https://d/folders/F") as build:
+            self.assertEqual(ab._early_output_url(80, "FAQ__job80", uploaded=1), "https://d/folders/F")
+            self.assertEqual(ab._early_output_url(80, "FAQ__job80", uploaded=2), "https://d/folders/F")
+        build.assert_called_once_with("FAQ__job80")
+        self.assertEqual(ab._get_batch(80)["output_url"], "https://d/folders/F")
+
+    def test_drive_error_does_not_raise_and_retries_next_tick(self):
+        with patch.object(ab, "_batch_folder_url", side_effect=RuntimeError("drive down")):
+            self.assertIsNone(ab._early_output_url(80, "FAQ__job80", uploaded=1))
+        with patch.object(ab, "_batch_folder_url", return_value="https://d/folders/F"):
+            self.assertEqual(ab._early_output_url(80, "FAQ__job80", uploaded=1), "https://d/folders/F")
+
+    def test_requeued_job_starts_without_a_link(self):
+        ab._set_batch_output_url(80, "https://d/folders/F")
+        ab._mark_batch(80, "abandoned")
+        ab._save_batch(80, "tok-moi", "batch-moi", "FAQ__job80")
+        self.assertIsNone(ab._batch_output_url(80))
+
+    def test_wait_for_batch_sends_link_once_a_row_is_on_drive(self):
+        snapshots = iter([(3, 0, 0, 0, 0), (3, 1, 1, 0, 1), (3, 3, 3, 0, 3)])
+        sent = []
+
+        def fake_heartbeat(job_id, token, progress, output_url=None):
+            sent.append(output_url)
+
+        with patch.object(ab, "_batch_snapshot", side_effect=lambda _b: next(snapshots)), \
+                patch.object(ab, "heartbeat", side_effect=fake_heartbeat), \
+                patch.object(ab, "_heartbeat_seconds", return_value=0), \
+                patch.object(ab, "_batch_folder_url", return_value="https://d/folders/F"), \
+                patch.object(ab.time, "sleep"):
+            outcome, succeeded, _ = ab._wait_for_batch(80, "tok", "batch-80", "FAQ__job80")
+
+        self.assertEqual((outcome, succeeded), ("done", 3))
+        self.assertEqual(sent, [None, "https://d/folders/F", "https://d/folders/F"])
 
 
 class IdentifyFilesTests(unittest.TestCase):

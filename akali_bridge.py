@@ -212,15 +212,20 @@ def _conflict_reason(e):
         return "unknown"
 
 
-def heartbeat(job_id, claim_token, progress):
+def heartbeat(job_id, claim_token, progress, output_url=None):
     """None nếu còn giữ lease. Khác None = 409, trả luôn `reason` để caller xử đúng
     nhánh: 'canceled' phải dọn hàng chờ nội bộ (mục 4.1), 'lease_lost'/'not_found'
-    thì chỉ cần buông. 409 KHÔNG phải lỗi tạm thời — heartbeat lại vẫn 409 mãi."""
+    thì chỉ cần buông. 409 KHÔNG phải lỗi tạm thời — heartbeat lại vẫn 409 mãi.
+
+    output_url (tuỳ chọn): link thư mục Drive của batch, gửi sớm để dashboard hiện
+    nút "Mở" khi job còn đang chạy (docs/early-output-url.md). Không đổi status."""
+    # Backend không kẹp giá trị (mục 11) — kẹp ở đây để dashboard không vẽ
+    # thanh tiến độ quá 100%.
+    payload = {"claim_token": claim_token, "progress": max(0, min(100, int(progress)))}
+    if output_url:
+        payload["output_url"] = output_url
     try:
-        # Backend không kẹp giá trị (mục 11) — kẹp ở đây để dashboard không vẽ
-        # thanh tiến độ quá 100%.
-        _post(f"/api/worker/jobs/{job_id}/heartbeat",
-              {"claim_token": claim_token, "progress": max(0, min(100, int(progress)))})
+        _post(f"/api/worker/jobs/{job_id}/heartbeat", payload)
         return None
     except requests.HTTPError as e:
         reason = _conflict_reason(e)
@@ -288,6 +293,10 @@ def _init_batches_table():
         if "cancel_requested" not in existing:
             con.execute("ALTER TABLE akali_batches ADD COLUMN "
                         "cancel_requested INTEGER NOT NULL DEFAULT 0")
+        # Link thư mục Drive đã gửi sớm qua heartbeat — lưu bền để bridge khởi động
+        # lại giữa chừng không phải gọi Drive API dựng lại link.
+        if "output_url" not in existing:
+            con.execute("ALTER TABLE akali_batches ADD COLUMN output_url TEXT")
 
 
 def request_batch_cancel(akali_job_id=None):
@@ -344,7 +353,8 @@ def _save_batch(akali_job_id, claim_token, batch_id, excel_stem):
             "excel_stem = excluded.excel_stem, status = 'running', "
             # Phải xoá cờ huỷ của LƯỢT TRƯỚC: không xoá thì lượt chạy mới
             # (akali giao lại cùng job id) bị huỷ oan ngay ở vòng lặp đầu tiên.
-            "cancel_requested = 0",
+            # Link sớm cũng xoá: lượt mới chỉ gửi link khi chính nó đã có video lên Drive.
+            "cancel_requested = 0, output_url = NULL",
             (akali_job_id, claim_token, batch_id, excel_stem),
         )
 
@@ -353,6 +363,22 @@ def _mark_batch(akali_job_id, status):
     with _connect() as con:
         con.execute(
             "UPDATE akali_batches SET status = ? WHERE akali_job_id = ?", (status, akali_job_id)
+        )
+
+
+def _batch_output_url(akali_job_id):
+    with _connect() as con:
+        row = con.execute(
+            "SELECT output_url FROM akali_batches WHERE akali_job_id = ?", (akali_job_id,)
+        ).fetchone()
+        return row["output_url"] if row else None
+
+
+def _set_batch_output_url(akali_job_id, output_url):
+    with _connect() as con:
+        con.execute(
+            "UPDATE akali_batches SET output_url = ? WHERE akali_job_id = ?",
+            (output_url, akali_job_id),
         )
 
 
@@ -504,22 +530,53 @@ def _row_finished(tts_status, render_status, job_row):
 
 
 def _batch_snapshot(batch_id):
-    """(total, finished, succeeded, cancelled) — cancelled tách riêng để phân biệt
-    'batch hỏng' với 'batch bị người dùng dừng ở máy render' (nhánh U, mục 6)."""
+    """(total, finished, succeeded, cancelled, uploaded) — cancelled tách riêng để phân
+    biệt 'batch hỏng' với 'batch bị người dùng dừng ở máy render' (nhánh U, mục 6).
+    uploaded = số dòng đã THẬT SỰ lên Drive (có drive_link), không phải chỉ render
+    xong: upload chạy ở thread nền sau mark_done."""
     results = tts_db.results_for_batch(batch_id)
-    finished = succeeded = cancelled = 0
+    finished = succeeded = cancelled = uploaded = 0
     for r in results.values():
         job_row = db.get_job(r["render_job_id"]) if r.get("render_job_id") else None
+        if job_row and job_row.get("drive_link"):
+            uploaded += 1
         if _row_finished(r["tts_status"], r["render_status"], job_row):
             finished += 1
             if r["render_status"] == "done":
                 succeeded += 1
             elif r["render_status"] == "cancelled":
                 cancelled += 1
-    return len(results), finished, succeeded, cancelled
+    return len(results), finished, succeeded, cancelled, uploaded
 
 
-def _wait_for_batch(akali_job_id, claim_token, batch_id):
+def _batch_folder_url(excel_stem):
+    """Link thư mục batch, dựng ĐÚNG như bước 13 (_export_and_upload): cùng excel_stem
+    + cùng thư mục gốc -> ensure_folder() trả cùng folder_id với chỗ queue_worker
+    đang upload video vào."""
+    service = gdrive.get_service()
+    folder_id = gdrive.ensure_folder(service, excel_stem, gdrive.default_folder_id())
+    return f"https://drive.google.com/drive/folders/{folder_id}"
+
+
+def _early_output_url(akali_job_id, excel_stem, uploaded):
+    """Link thư mục để gửi kèm heartbeat, hoặc None nếu chưa có video nào lên Drive.
+
+    Lỗi Drive API KHÔNG được làm hỏng heartbeat: heartbeat trễ có thể làm hết lease
+    và job bị giao cho máy khác. Lỗi thì trả None, nhịp sau thử lại."""
+    url = _batch_output_url(akali_job_id)
+    if url or not uploaded:
+        return url
+    try:
+        url = _batch_folder_url(excel_stem)
+    except Exception as e:
+        _log(f"job #{akali_job_id}: chưa dựng được link thư mục Drive, thử lại nhịp sau — {e}")
+        return None
+    _set_batch_output_url(akali_job_id, url)
+    _log(f"job #{akali_job_id}: đã có video trên Drive — gửi link thư mục sớm {url}")
+    return url
+
+
+def _wait_for_batch(akali_job_id, claim_token, batch_id, excel_stem):
     """Trả (outcome, succeeded, cancelled) — outcome: 'done' | 'stopped' | reason
     của 409 ('canceled' | 'lease_lost' | 'not_found' | 'unknown').
 
@@ -528,14 +585,15 @@ def _wait_for_batch(akali_job_id, claim_token, batch_id):
     """
     next_heartbeat = 0.0
     while _RUNNING:
-        total, finished, succeeded, cancelled = _batch_snapshot(batch_id)
+        total, finished, succeeded, cancelled, uploaded = _batch_snapshot(batch_id)
         # Nhánh U (mục 4.2) — có người bấm huỷ ở phía máy render. Kiểm cờ TRƯỚC
         # heartbeat để không báo tiến độ cho một batch vừa bị huỷ.
         if _batch_cancel_requested(akali_job_id):
             return "cancel_requested", succeeded, cancelled
         if time.monotonic() >= next_heartbeat:
             progress = int(finished * 100 / total) if total else 0
-            reason = heartbeat(akali_job_id, claim_token, progress)
+            output_url = _early_output_url(akali_job_id, excel_stem, uploaded)
+            reason = heartbeat(akali_job_id, claim_token, progress, output_url)
             if reason:
                 return reason, succeeded, cancelled
             next_heartbeat = time.monotonic() + _heartbeat_seconds()
@@ -552,10 +610,9 @@ def _export_and_upload(batch_id, excel_stem):
     (excel_stem — mục 2.2), trả link thư mục (mục 5 bước 13: upload_file() không
     trả folder id nên phải ensure_folder() riêng)."""
     out_path, _filled, _total = xi.export_results(batch_id)
-    service = gdrive.get_service()
-    folder_id = gdrive.ensure_folder(service, excel_stem, gdrive.default_folder_id())
+    output_url = _batch_folder_url(excel_stem)
     gdrive.upload_file(out_path, folder_id=gdrive.default_folder_id(), subfolder=excel_stem)
-    return f"https://drive.google.com/drive/folders/{folder_id}"
+    return output_url
 
 
 # ---------------------------------------------------------------- xử lý 1 job akali (mục 5, toàn bộ)
@@ -563,7 +620,7 @@ def _export_and_upload(batch_id, excel_stem):
 def _finish_batch(akali_job_id, claim_token, batch_id, excel_stem):
     """Theo dõi tới khi xong (bước 10-11) rồi báo kết quả (bước 12-13) — dùng
     chung cho batch mới nộp lẫn batch cũ nối lại lúc khởi động (_resume_pending_batches)."""
-    outcome, succeeded, cancelled = _wait_for_batch(akali_job_id, claim_token, batch_id)
+    outcome, succeeded, cancelled = _wait_for_batch(akali_job_id, claim_token, batch_id, excel_stem)
 
     if outcome == "canceled":
         # Nhánh H (mục 4.1) — người dùng bấm Huỷ trên dashboard.
