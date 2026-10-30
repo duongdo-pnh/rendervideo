@@ -164,6 +164,11 @@ def start_all() -> None:
         _kill_stale_worker(script)
         _spawn(script)
 
+    # An update ships fun5b/ but not its venvs/models: install them in the background when
+    # this machine can run Fun-5B (no-op once installed, or on GPUs under ~20 GB).
+    import fun5b_setup
+    fun5b_setup.auto_start()
+
 
 def spawn_akali_bridge() -> None:
     """Gọi từ backend/akali.py ngay sau khi lưu AKALI_URL/AKALI_WORKER_KEY thành

@@ -1,5 +1,8 @@
 # Nối máy render vào hàng chờ akali
 
+> **Job Fun-5B (ảnh nhân vật + video mẫu, `params.engine = "fun5b"`)** đi nhánh riêng, không Excel/TTS:
+> xem [AKALI_FUN5B.md](AKALI_FUN5B.md). Từ 31/10/2026 `/claim` gửi kèm `engines` (§4 của file đó).
+
 Hướng dẫn dựng `akali_bridge.py` trên **máy render** để nó tự lấy job từ hàng chờ
 của akali, chạy hết một batch Excel, rồi trả link thư mục Drive về.
 

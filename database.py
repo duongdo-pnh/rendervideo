@@ -61,7 +61,23 @@ _CONFIG_COLUMNS = {
     # không thể kill trực tiếp subprocess render_job.py của worker. Đặt cờ này, worker tự
     # kiểm tra ở mỗi vòng poll (_run_render) rồi tự dừng subprocess của chính nó.
     "cancel_requested": "INTEGER NOT NULL DEFAULT 0",
+    # 0..1 while rendering (written by fun5b_adapter; other engines leave it NULL).
+    "progress":         "REAL",
+    # engine == 'fun5b' (character animation: ref image + driving video, no audio). See
+    # docs/FUN5B_INTEGRATION_PLAN.md. video_path is the driving video, audio_path is ''.
+    "ref_image_path":   "TEXT",
+    "background_path":  "TEXT",   # optional clean plate uploaded by the user (skips FireRed)
+    "fun5b_preset":     "TEXT",   # fast | balanced | natural | natural_light
+    "keep_background":  "INTEGER NOT NULL DEFAULT 1",
+    "auto_background":  "INTEGER NOT NULL DEFAULT 1",
+    "table_line":       "REAL",   # 0..1 of the height; NULL = automatic
+    "sharp_hands":      "INTEGER NOT NULL DEFAULT 0",
 }
+
+ENGINES = ("musetalk", "latentsync", "fun5b")
+FUN5B_PRESETS = ("fast", "balanced", "natural", "natural_light")
+FUN5B_DEFAULT_PRESET = "natural"
+FUN5B_DEFAULT_SEED = 42
 
 
 def _ensure_app_config_table(con):
@@ -140,7 +156,9 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
             drive_folder=None, engine="musetalk"):
     """Insert a new render job with its full render config."""
     engine = str(engine)
-    if engine not in ("musetalk", "latentsync"):
+    if engine == "fun5b":
+        raise ValueError("engine 'fun5b' jobs are created with add_fun5b_job()")
+    if engine not in ENGINES:
         raise ValueError(f"unknown engine {engine!r} (expected 'musetalk' or 'latentsync')")
     model_res = str(model_res)
     if engine == "latentsync":
@@ -164,6 +182,42 @@ def add_job(name, video_path, audio_path, model_res, guidance=1.5, steps=24, see
         return cur.lastrowid
 
 
+def add_fun5b_job(name, ref_image_path, video_path, preset=FUN5B_DEFAULT_PRESET, seed=FUN5B_DEFAULT_SEED,
+                  keep_background=True, auto_background=True, table_line=None, sharp_hands=False,
+                  background_path=None, drive_folder=None):
+    """Insert a Fun-5B character-animation job: `ref_image_path` performs the motion of `video_path`.
+
+    The lip-sync columns (audio_path, model_res, config/checkpoint) are NOT NULL in the original
+    schema, so they get neutral values; queue_worker never reads them for this engine."""
+    preset = str(preset)
+    if preset not in FUN5B_PRESETS:
+        raise ValueError(f"unknown preset {preset!r} (expected one of {list(FUN5B_PRESETS)})")
+    if table_line is not None:
+        table_line = float(table_line)
+        if not 0 < table_line < 1:
+            raise ValueError("table_line must be between 0 and 1 (exclusive), or None for automatic")
+    with _connect() as con:
+        cur = con.execute(
+            """
+            INSERT INTO jobs (name, video_path, audio_path, model_res, config_path, checkpoint_path, engine,
+                              seed, enhance_mouth, out_res, drive_folder, ref_image_path, background_path,
+                              fun5b_preset, keep_background, auto_background, table_line, sharp_hands)
+            VALUES (?, ?, '', '', '', '', 'fun5b', ?, 0, '720', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, str(video_path), int(seed), str(drive_folder) if drive_folder else None,
+             str(ref_image_path), str(background_path) if background_path else None, preset,
+             int(bool(keep_background)), int(bool(auto_background)), table_line, int(bool(sharp_hands))),
+        )
+        return cur.lastrowid
+
+
+def set_progress(job_id, progress):
+    """Render progress 0..1 of a rendering job (None clears it)."""
+    value = None if progress is None else min(max(float(progress), 0.0), 1.0)
+    with _connect() as con:
+        con.execute("UPDATE jobs SET progress = ? WHERE id = ?", (value, job_id))
+
+
 def claim_next_job():
     """Atomically grab the oldest queued job and flip it to 'rendering'. Returns a dict or None.
 
@@ -179,6 +233,7 @@ def claim_next_job():
             UPDATE jobs
                SET status = 'rendering',
                    started_at = datetime('now','localtime'),
+                   progress = NULL,
                    finished_at = NULL,
                    error = NULL
              WHERE id = (
@@ -226,7 +281,7 @@ def claim_matching_jobs(anchor, limit=2):
         claimed = []
         for row in rows:
             item = con.execute(
-                "UPDATE jobs SET status=\x27rendering\x27, started_at=datetime(\x27now\x27,\x27localtime\x27), "
+                "UPDATE jobs SET status=\x27rendering\x27, progress=NULL, started_at=datetime(\x27now\x27,\x27localtime\x27), "
                 "finished_at=NULL,error=NULL WHERE id=? AND status=\x27queued\x27 RETURNING *",
                 (row["id"],),
             ).fetchone()
@@ -244,7 +299,7 @@ def claim_matching_jobs(anchor, limit=2):
 def mark_done(job_id, output_path):
     with _connect() as con:
         con.execute(
-            "UPDATE jobs SET status='done', output_path=?, error=NULL, "
+            "UPDATE jobs SET status='done', output_path=?, error=NULL, progress=1, "
             "finished_at=datetime('now','localtime') WHERE id=?",
             (str(output_path), job_id),
         )
@@ -367,7 +422,7 @@ def requeue_for_retry(job_id, error):
     """Bump retry count and put the job back to 'queued' so the worker picks it up again."""
     with _connect() as con:
         con.execute(
-            "UPDATE jobs SET status='queued', retries=retries+1, error=?, "
+            "UPDATE jobs SET status='queued', retries=retries+1, error=?, progress=NULL, "
             "started_at=NULL WHERE id=?",
             (str(error)[:2000], job_id),
         )
@@ -435,7 +490,7 @@ def retry_job(job_id):
         if row["status"] != STATUS_FAILED:
             raise ValueError(f"Job #{job_id} không ở trạng thái lỗi (hiện tại: {row['status']}).")
         updated = con.execute(
-            "UPDATE jobs SET status='queued', retries=0, error=NULL, "
+            "UPDATE jobs SET status='queued', retries=0, error=NULL, progress=NULL, "
             "started_at=NULL, finished_at=NULL WHERE id=? RETURNING *",
             (job_id,),
         ).fetchone()
@@ -563,7 +618,7 @@ def reset_stuck_jobs():
     """On worker startup, requeue jobs left in 'rendering' by a previous crash/restart."""
     with _connect() as con:
         cur = con.execute(
-            "UPDATE jobs SET status='queued', started_at=NULL WHERE status='rendering'"
+            "UPDATE jobs SET status='queued', started_at=NULL, progress=NULL WHERE status='rendering'"
         )
         return cur.rowcount
 

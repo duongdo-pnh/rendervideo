@@ -44,3 +44,12 @@ export function deleteJob(jobId: number): Promise<DeletedJobsResponse> {
 export function clearJobsByStatus(status: string): Promise<DeletedJobsResponse> {
   return api.post(`/api/jobs/clear/${status}`)
 }
+
+/** Fun-5B character animation job (backend/jobs.py submit_animate_job). */
+export function createAnimateJob(form: FormData): Promise<JobSubmitResponse> {
+  return api.postForm('/api/jobs/animate', form)
+}
+
+export function jobRefImageUrl(jobId: number): string {
+  return `/api/jobs/${jobId}/ref-image`
+}

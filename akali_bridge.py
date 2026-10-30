@@ -30,6 +30,7 @@ import dashboard_reporter
 import database as db
 import excel_import as xi
 import google_drive_upload as gdrive
+import gpu_info
 import tts_db
 from env_path import resolve_env_path
 
@@ -47,6 +48,13 @@ _PLACEHOLDER_PROVIDER = "autovoice"
 _PLACEHOLDER_VOICE = "__akali_placeholder__"
 
 _VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".webm", ".avi")
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+# Fun-5B (ảnh nhân vật + video mẫu, không Excel/TTS) — doc_api/AKALI_FUN5B.md.
+FUN5B_ENGINE = "fun5b"
+_FUN5B_BATCH_PREFIX = "fun5b:"  # akali_batches.batch_id = "fun5b:<render job id>"
+_FUN5B_UPLOAD_RETRY_DELAYS = (60, 180, 600)  # giây chờ trước mỗi lần thử upload lại (§5.4)
+_FUN5B_UPLOADING_PROGRESS = 97  # render xong, đang đẩy lên Drive
 
 _RUNNING = True
 _LOCK_FILE = None
@@ -188,10 +196,34 @@ def _post(path, payload, timeout=15):
     return r
 
 
+def _claim_engines():
+    """Engine máy này chạy được NGAY LÚC NÀY, gửi kèm mỗi lần claim (doc_api/AKALI_FUN5B.md §4).
+
+    musetalk luôn có; latentsync theo đúng điều kiện của UI chọn engine (gpu_info); fun5b chỉ khi
+    đã tự cài xong (và không đang cài dở) và GPU đủ VRAM. Tính lại mỗi lần vì máy có thể vừa tự
+    cài xong Fun-5B giữa chừng. Kiểm tra lỗi thì bỏ engine đó đi, không bao giờ làm hỏng claim."""
+    engines = ["musetalk"]
+    try:
+        if not gpu_info.latentsync_blocked():
+            engines.append("latentsync")
+    except Exception as e:
+        _log(f"không kiểm tra được latentsync, bỏ khỏi engines: {e}")
+    try:
+        import fun5b_adapter
+        import fun5b_setup
+
+        if fun5b_adapter.unavailable_reason()[0] is None and not fun5b_setup.running():
+            engines.append(FUN5B_ENGINE)
+    except Exception as e:
+        _log(f"không kiểm tra được fun5b, bỏ khỏi engines: {e}")
+    return engines
+
+
 def claim():
-    """None nếu chưa có việc (204). Raise nếu akali lỗi thật (4xx/5xx khác 204)."""
+    """None nếu chưa có việc (204). Raise nếu akali lỗi thật (4xx/5xx khác 204).
+    akali bản cũ bỏ qua `engines` (chỉ đọc worker_id) nên gửi kèm luôn là an toàn."""
     r = requests.post(_base_url() + "/api/worker/claim", headers=_headers(),
-                       json={"worker_id": _worker_id()}, timeout=15)
+                       json={"worker_id": _worker_id(), "engines": _claim_engines()}, timeout=15)
     if r.status_code == 204:
         return None
     r.raise_for_status()
@@ -476,6 +508,249 @@ def _prepare_and_submit(akali_job_id, folder, params):
     return batch_id, excel_stem
 
 
+# ---------------------------------------------------------------- Fun-5B (doc_api/AKALI_FUN5B.md)
+#
+# Một job akali = 1 ảnh nhân vật + 1 video mẫu = 1 render job (engine fun5b), không Excel/TTS.
+# Kết quả đẩy vào folder Drive riêng "fun5b__job<id>" chỉ chứa đúng video thành phẩm: akali trừ
+# point theo tổng độ dài video trong folder output_url (§3.3).
+
+def _fun5b_folder_name(akali_job_id):
+    return f"fun5b__job{akali_job_id}"
+
+
+def _identify_fun5b_files(folder):
+    """(ảnh nhân vật, video mẫu, ảnh nền | None), nhận diện theo đuôi file (§2): akali đặt tên
+    nhan_vat.* / video_mau.* / background.*, nhưng folder người dùng tự dựng cũng phải chạy được.
+    File khác (vd .xlsx) bị bỏ qua. Raise BridgeFailure(retryable=False) nếu sai số lượng."""
+    files = sorted(p for p in folder.iterdir() if p.is_file())
+    images = [p for p in files if p.suffix.lower() in _IMAGE_EXTS]
+    backgrounds = [p for p in images if p.stem.lower() == "background"]
+    refs = [p for p in images if p not in backgrounds]
+    videos = [p for p in files if p.suffix.lower() in _VIDEO_EXTS]
+    if len(refs) != 1:
+        raise BridgeFailure(f"cần đúng 1 ảnh nhân vật (.png/.jpg/.webp, không tính background.*), thấy {len(refs)}",
+                            retryable=False)
+    if len(videos) != 1:
+        raise BridgeFailure(f"cần đúng 1 video mẫu trong folder, thấy {len(videos)}", retryable=False)
+    if len(backgrounds) > 1:
+        raise BridgeFailure(f"chỉ được 1 ảnh background.*, thấy {len(backgrounds)}", retryable=False)
+    return refs[0], videos[0], (backgrounds[0] if backgrounds else None)
+
+
+def _flag(params, key, default):
+    value = params.get(key)
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def _fun5b_options(params):
+    """params akali -> kwargs của db.add_fun5b_job (§3.1). Thiếu khoá thì dùng mặc định; giá trị
+    sai thì BridgeFailure(retryable=False) — job khác máy cũng sai y hệt."""
+    preset = params.get("preset") or db.FUN5B_DEFAULT_PRESET
+    if preset not in db.FUN5B_PRESETS:
+        raise BridgeFailure(f"preset không hợp lệ: {preset!r} (dùng {', '.join(db.FUN5B_PRESETS)})", retryable=False)
+    seed = params.get("seed")
+    try:
+        seed = db.FUN5B_DEFAULT_SEED if seed in (None, "") else int(seed)
+    except (TypeError, ValueError):
+        raise BridgeFailure(f"seed không hợp lệ: {seed!r}", retryable=False) from None
+    table = params.get("table_line")
+    try:
+        table = None if table in (None, "") or float(table) == 0 else float(table)
+    except (TypeError, ValueError):
+        raise BridgeFailure(f"table_line không hợp lệ: {table!r}", retryable=False) from None
+    if table is not None and not 1 <= table <= 99:
+        raise BridgeFailure(f"table_line phải trong 1–99 (% chiều cao) hoặc null, nhận {table!r}", retryable=False)
+    return {
+        "preset": preset, "seed": seed,
+        "keep_background": _flag(params, "keep_background", True),
+        "auto_background": _flag(params, "auto_background", True),
+        "table_line": None if table is None else table / 100,
+        "sharp_hands": _flag(params, "sharp_hands", False),
+    }
+
+
+def _result_folder_id(folder_name):
+    return gdrive.ensure_folder(gdrive.get_service(), folder_name, gdrive.default_folder_id())
+
+
+def _prepare_and_submit_fun5b(akali_job_id, folder, params):
+    """F1–F5: nhận diện file, kiểm params, dọn folder kết quả, đưa 1 render job vào hàng đợi.
+    Trả (batch_id, tên folder kết quả) để lưu vào akali_batches như batch Excel."""
+    image, video, background = _identify_fun5b_files(folder)
+    options = _fun5b_options(params)
+    if not gdrive.drive_enabled():
+        # Không có Drive thì không có output_url -> không bao giờ /complete được. Để máy khác làm.
+        raise BridgeFailure("máy render chưa bật upload Google Drive", retryable=True)
+
+    folder_name = _fun5b_folder_name(akali_job_id)
+    # F3 — "Chạy lại" trên akali giữ nguyên akali_job_id, nên folder có thể còn video của lần
+    # trước (máy này hoặc máy khác cùng tài khoản Drive). Để lại thì akali tính point 2 lần.
+    try:
+        trashed = gdrive.trash_folder_contents(_result_folder_id(folder_name))
+    except Exception as e:
+        raise BridgeFailure(f"không dọn được folder kết quả {folder_name} trên Drive: {e}", retryable=True) from e
+    if trashed:
+        _log(f"job #{akali_job_id}: folder {folder_name} còn {len(trashed)} file cũ — đã chuyển vào thùng rác")
+
+    try:
+        render_job_id = db.add_fun5b_job(f"fun5b_job{akali_job_id}", image, video, background_path=background,
+                                         drive_folder=folder_name, **options)
+    except ValueError as e:
+        raise BridgeFailure(f"tham số Fun-5B không hợp lệ: {e}", retryable=False) from e
+    _log(f"job #{akali_job_id}: Fun-5B render job #{render_job_id} ({image.name} + {video.name}, "
+         f"preset={options['preset']}) -> Drive/{folder_name}")
+    return f"{_FUN5B_BATCH_PREFIX}{render_job_id}", folder_name
+
+
+def _fun5b_progress(row):
+    """progress 0-100 cho heartbeat. jobs.progress của Fun-5B đã gồm cả giai đoạn nạp model / vẽ
+    nền / tách pose (render_job.FUN5B_STAGE_PROGRESS), không đứng yên ở 0 suốt ~10 phút đầu."""
+    if row["status"] == db.STATUS_DONE:
+        return _FUN5B_UPLOADING_PROGRESS
+    if row["status"] == db.STATUS_RENDERING:
+        return int((row.get("progress") or 0) * 100)
+    return 0
+
+
+def _is_drive_quota_error(error):
+    text = str(error or "").lower()
+    return "storagequotaexceeded" in text or "storage quota has been exceeded" in text
+
+
+def _retry_fun5b_upload(row):
+    """Upload lại video đã render (queue_worker chỉ thử 1 lần), cùng tên file và folder."""
+    from queue_worker import _drive_safe_name
+
+    path = row.get("output_path")
+    if not path or not Path(path).is_file():
+        raise RuntimeError(f"không còn file video để upload lại: {path}")
+    info = gdrive.upload_file(path, name=_drive_safe_name(path), subfolder=row.get("drive_folder"))
+    db.set_drive_result(row["id"], link=info.get("webViewLink"))
+
+
+_FUN5B_UPLOAD_STUCK_SECONDS = 15 * 60  # done mà chưa có drive_link/drive_error: thread upload đã chết
+
+
+def _wait_for_fun5b(akali_job_id, claim_token, render_job_id):
+    """Heartbeat tới khi render job có kết quả cuối. Trả (outcome, row):
+    done | failed | cancelled | cancel_requested | drive_quota | drive_failed | missing | stopped,
+    hoặc reason của 409 ('canceled' | 'lease_lost' | 'not_found' | 'unknown')."""
+    next_heartbeat = 0.0
+    attempts, retry_at, done_since = 0, None, None
+    while _RUNNING:
+        row = db.get_job(render_job_id)
+        if _batch_cancel_requested(akali_job_id):
+            return "cancel_requested", row
+        if row is None:
+            return "missing", None
+        now = time.monotonic()
+        if now >= next_heartbeat:
+            reason = heartbeat(akali_job_id, claim_token, _fun5b_progress(row))
+            if reason:
+                return reason, row
+            next_heartbeat = now + _heartbeat_seconds()
+
+        status = row["status"]
+        if status in (db.STATUS_FAILED, db.STATUS_CANCELLED):
+            return status, row
+        if status == db.STATUS_DONE:
+            if row.get("drive_link"):
+                return "done", row
+            error = row.get("drive_error")
+            done_since = done_since or now
+            if not error and now - done_since > _FUN5B_UPLOAD_STUCK_SECONDS:
+                error = "upload Drive không kết thúc sau 15 phút"
+                db.set_drive_result(render_job_id, error=error)
+            if error:
+                if _is_drive_quota_error(error):
+                    return "drive_quota", row
+                if attempts >= len(_FUN5B_UPLOAD_RETRY_DELAYS):
+                    return "drive_failed", row
+                if retry_at is None:
+                    retry_at = now + _FUN5B_UPLOAD_RETRY_DELAYS[attempts]
+                    _log(f"job #{akali_job_id}: upload Drive lỗi ({error}) — thử lại sau "
+                         f"{_FUN5B_UPLOAD_RETRY_DELAYS[attempts]}s ({attempts + 1}/{len(_FUN5B_UPLOAD_RETRY_DELAYS)})")
+                elif now >= retry_at:
+                    attempts, retry_at = attempts + 1, None
+                    try:
+                        _retry_fun5b_upload(row)
+                        _log(f"job #{akali_job_id}: upload lại lên Drive OK")
+                    except Exception as e:
+                        db.set_drive_result(render_job_id, error=e)
+                        _log(f"job #{akali_job_id}: upload lại lỗi — {e}")
+        time.sleep(min(5.0, _heartbeat_seconds()))
+    return "stopped", None
+
+
+def _finish_fun5b(akali_job_id, claim_token, batch_id, folder_name):
+    """Bước 6–9 của nhánh F (§5.1) — dùng chung cho job mới và job nối lại lúc khởi động."""
+    render_job_id = int(batch_id[len(_FUN5B_BATCH_PREFIX):])
+    outcome, row = _wait_for_fun5b(akali_job_id, claim_token, render_job_id)
+
+    if outcome == "canceled":  # huỷ trên dashboard akali (nhánh H)
+        _abandon_batch(akali_job_id, batch_id, folder_name, "akali báo canceled")
+        return
+    if outcome in ("lease_lost", "not_found", "unknown"):
+        _mark_batch(akali_job_id, "abandoned")
+        _log(f"job #{akali_job_id}: 409 reason={outcome} — ngừng theo dõi, KHÔNG gọi /complete hay /fail")
+        return
+    if outcome == "stopped":
+        _log(f"job #{akali_job_id}: bridge đang tắt — lần chạy sau nối tiếp qua akali_batches")
+        return
+    if outcome in ("cancel_requested", db.STATUS_CANCELLED):  # huỷ ở máy render (nhánh U)
+        try:
+            cancel(akali_job_id, claim_token, "người dùng dừng job ở máy render")
+        except requests.HTTPError as e:
+            _log(f"job #{akali_job_id}: /cancel lỗi — {e}")
+        _abandon_batch(akali_job_id, batch_id, folder_name, "huỷ ở máy render")
+        return
+
+    failure = None
+    if outcome == "missing":
+        failure = (f"render job #{render_job_id} không còn trên máy render", True)
+    elif outcome == db.STATUS_FAILED:
+        error = row.get("error") or "render lỗi"
+        # render_job.py in "[render_job] REJECTED: ..." khi đầu vào hỏng (không thấy người, file
+        # hỏng): máy khác cũng hỏng y hệt. Lỗi khác (GPU, server chết) thì để máy khác thử.
+        failure = (error, "REJECTED:" not in error)
+    elif outcome == "drive_quota":
+        failure = (f"Drive máy render hết dung lượng — dọn Drive rồi bấm Chạy lại ({row.get('drive_error')})", False)
+    elif outcome == "drive_failed":
+        failure = (f"upload Drive lỗi sau {len(_FUN5B_UPLOAD_RETRY_DELAYS)} lần thử lại: {row.get('drive_error')}. "
+                   f"Video vẫn ở máy render: {row.get('output_path')}", True)
+    if failure:
+        _log(f"job #{akali_job_id}: /fail retryable={failure[1]} — {failure[0]}")
+        fail(akali_job_id, claim_token, failure[0], retryable=failure[1])
+        _mark_batch(akali_job_id, "abandoned")
+        return
+
+    # F6 — ngay trước /complete: folder chỉ được còn đúng video của render job này (một upload
+    # dở của máy khác vừa mất lease có thể lên sau F3 — akali sẽ trừ point gấp đôi).
+    try:
+        keep = gdrive.file_id_from_link(row["drive_link"])
+        if not keep:
+            raise RuntimeError(f"không đọc được file id từ {row['drive_link']}")
+        folder_id = _result_folder_id(folder_name)
+        trashed = gdrive.trash_folder_contents(folder_id, keep_file_id=keep)
+        if trashed:
+            _log(f"job #{akali_job_id}: folder kết quả có thêm {len(trashed)} file lạ — đã chuyển vào thùng rác: {trashed}")
+        output_url = f"https://drive.google.com/drive/folders/{folder_id}"
+    except Exception as e:
+        _log(f"job #{akali_job_id}: chưa dọn được folder kết quả (còn giữ lease, thử lại vòng sau) — {e}")
+        return
+    try:
+        complete(akali_job_id, claim_token, output_url)
+    except requests.HTTPError as e:
+        _log(f"job #{akali_job_id}: /complete lỗi — {e} (job vẫn 'running', thử lại vòng sau)")
+        return
+    _mark_batch(akali_job_id, "reported")
+    _log(f"job #{akali_job_id}: DONE -> {output_url}")
+
+
 # ---------------------------------------------------------------- dọn batch bị huỷ (mục 4.1)
 
 _ABANDON_RESWEEP_SECONDS = 15   # > thời gian tts_worker kẹt giữa add_job() và mark_done()
@@ -620,6 +895,9 @@ def _export_and_upload(batch_id, excel_stem):
 def _finish_batch(akali_job_id, claim_token, batch_id, excel_stem):
     """Theo dõi tới khi xong (bước 10-11) rồi báo kết quả (bước 12-13) — dùng
     chung cho batch mới nộp lẫn batch cũ nối lại lúc khởi động (_resume_pending_batches)."""
+    if batch_id.startswith(_FUN5B_BATCH_PREFIX):
+        _finish_fun5b(akali_job_id, claim_token, batch_id, excel_stem)
+        return
     outcome, succeeded, cancelled = _wait_for_batch(akali_job_id, claim_token, batch_id, excel_stem)
 
     if outcome == "canceled":
@@ -690,7 +968,10 @@ def _handle_job(job):
     else:
         try:
             folder = _download_batch_folder(akali_job_id, job.get("drive_file_id"))
-            batch_id, excel_stem = _prepare_and_submit(akali_job_id, folder, params)
+            if params.get("engine") == FUN5B_ENGINE:
+                batch_id, excel_stem = _prepare_and_submit_fun5b(akali_job_id, folder, params)
+            else:
+                batch_id, excel_stem = _prepare_and_submit(akali_job_id, folder, params)
         except BridgeFailure as e:
             _log(f"job #{akali_job_id}: {e} (retryable={e.retryable})")
             fail(akali_job_id, claim_token, str(e), retryable=e.retryable)

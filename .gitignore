@@ -60,6 +60,13 @@ wandb/
 
 # --- runtime artifacts / caches ---
 /avatar_cache/
+/fun5b_cache
+.fun5b.sock
+.fun5b_start.lock
+.fun5b_active.lock
+.fun5b-setup.lock
+.musetalk_active.lock
+.musetalk_gate.lock
 /output/
 /downloads/
 /uploads/

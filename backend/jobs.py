@@ -4,9 +4,11 @@ Wraps database.py directly (no Gradio dependency) — mirrors the behavior of
 web_ui.py's add_to_queue / refresh_status / do_prioritize_job / do_delete_job /
 do_clear, just returning JSON instead of gr.update() tuples.
 """
+from pathlib import Path
 from typing import Optional
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 import akali_bridge
 import database as db
@@ -16,6 +18,7 @@ import tts_db
 from job_naming import KIND_ANSWER, build_name, slug_key
 from render_job import OUT_RES
 
+from .engines import unavailable_reason
 from .models import (
     CancelAllResponse, CancelJobResponse, DeletedJobsResponse, EngineChoice, JobOut,
     JobSubmitResponse, PriorityChoice, ReorderRequest,
@@ -101,6 +104,81 @@ async def submit_job(
         job_id=job_id, name=name, engine=engine,
         message=f"Đã thêm job #{job_id} ('{name}') vào hàng đợi.",
     )
+
+
+def fun5b_job_name(image_name, video_name):
+    """Default Fun-5B job name: '<image stem>_<video stem>' (queue_worker adds _<id> on a clash)."""
+    return f"{Path(image_name or 'anh').stem}_{Path(video_name or 'video').stem}"[:120]
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".m4v", ".avi"}
+
+
+@router.post("/animate", response_model=JobSubmitResponse, status_code=201)
+async def submit_animate_job(
+    image: UploadFile,
+    video: UploadFile,
+    background: Optional[UploadFile] = None,
+    product: str = Form(""),
+    kind: Optional[str] = Form(None),  # naming fields are optional: without them the name is <image>_<video>
+    intent: Optional[str] = Form(None),
+    other_key: Optional[str] = Form(None),
+    preset: str = Form(db.FUN5B_DEFAULT_PRESET),
+    seed: int = Form(db.FUN5B_DEFAULT_SEED),
+    keep_background: bool = Form(True),
+    auto_background: bool = Form(True),
+    table_line: Optional[float] = Form(None),  # % of the height, 0/empty = automatic
+    sharp_hands: bool = Form(False),
+):
+    """Fun-5B job (character image performs the driving video's motion; silent 720×1280 output)."""
+    reason, _ = unavailable_reason()
+    if reason:
+        raise HTTPException(422, reason)
+    if kind == KIND_ANSWER and intent == "ASK_OTHER" and not slug_key(other_key):
+        raise HTTPException(422, "Chọn ASK_OTHER thì cần điền other_key, ví dụ: khautrang.")
+    for upload, exts, label in ((image, _IMAGE_EXTS, "Ảnh nhân vật"), (video, _VIDEO_EXTS, "Video mẫu")):
+        if Path(upload.filename or "").suffix.lower() not in exts:
+            raise HTTPException(422, f"{label}: định dạng không hỗ trợ ({', '.join(sorted(exts))}).")
+    if background is not None and background.filename and \
+            Path(background.filename).suffix.lower() not in _IMAGE_EXTS:
+        raise HTTPException(422, "Ảnh nền sạch: định dạng không hỗ trợ.")
+    if preset not in db.FUN5B_PRESETS:
+        raise HTTPException(422, f"preset không hợp lệ (expected one of {list(db.FUN5B_PRESETS)})")
+    if table_line is not None and not 0 <= table_line < 100:
+        raise HTTPException(422, "Mép bàn phải trong khoảng 0–99 (% chiều cao).")
+
+    name = (build_name(product, kind, intent, other_key) if kind
+            else fun5b_job_name(image.filename, video.filename))
+    bg_bytes = await background.read() if background is not None and background.filename else None
+    img_dst, vid_dst, bg_dst = job_files.write_fun5b_upload(
+        image.filename, await image.read(), video.filename, await video.read(),
+        background.filename if bg_bytes else None, bg_bytes,
+    )
+    try:
+        job_id = db.add_fun5b_job(
+            name, img_dst, vid_dst, preset=preset, seed=seed, keep_background=keep_background,
+            auto_background=auto_background, table_line=(table_line / 100) if table_line else None,
+            sharp_hands=sharp_hands, background_path=bg_dst,
+        )
+    except ValueError as e:
+        job_files.cleanup_job_files({"video_path": str(vid_dst)})
+        raise HTTPException(422, str(e)) from None
+
+    return JobSubmitResponse(
+        job_id=job_id, name=name, engine="fun5b",
+        message=f"Đã thêm job Fun-5B #{job_id} ('{name}') vào hàng đợi.",
+    )
+
+
+@router.get("/{job_id}/ref-image")
+def job_ref_image(job_id: int):
+    """The character image of a Fun-5B job (queue thumbnail)."""
+    row = db.get_job(job_id)
+    path = Path((row or {}).get("ref_image_path") or "")
+    if not row or row.get("engine") != "fun5b" or not path.is_file():
+        raise HTTPException(404, "Không có ảnh nhân vật cho job này.")
+    return FileResponse(path)
 
 
 @router.post("/{job_id}/priority", response_model=JobOut)

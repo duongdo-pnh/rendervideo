@@ -34,10 +34,28 @@ class JobOut(BaseModel):
     drive_folder: Optional[str] = None
     batch_id: Optional[str] = None
     excel_file: Optional[str] = None
+    progress: Optional[float] = None
+    # engine == "fun5b" only
+    ref_image_path: Optional[str] = None
+    fun5b_preset: Optional[str] = None
+    keep_background: Optional[bool] = None
+    auto_background: Optional[bool] = None
+    table_line: Optional[float] = None
+    sharp_hands: Optional[bool] = None
+    has_background: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: dict, batch: Optional[dict] = None) -> "JobOut":
+        fun5b = row["engine"] == "fun5b"
         return cls(
+            progress=row.get("progress"),
+            ref_image_path=row.get("ref_image_path") if fun5b else None,
+            fun5b_preset=row.get("fun5b_preset") if fun5b else None,
+            keep_background=bool(row.get("keep_background")) if fun5b else None,
+            auto_background=bool(row.get("auto_background")) if fun5b else None,
+            table_line=row.get("table_line") if fun5b else None,
+            sharp_hands=bool(row.get("sharp_hands")) if fun5b else None,
+            has_background=bool(row.get("background_path")) if fun5b else None,
             id=row["id"], name=row["name"], status=row["status"], engine=row["engine"],
             model_res=row["model_res"], out_res=row["out_res"], input_type=row["input_type"],
             guidance=row["guidance"], steps=row["steps"], seed=row["seed"],
@@ -56,6 +74,71 @@ class JobSubmitResponse(BaseModel):
     name: str
     engine: str
     message: str
+
+
+class Fun5bPreset(BaseModel):
+    key: str
+    label: str
+    steps: int
+    note: str
+    seconds_per_10s: int  # measured render time of 10s of driving video on an RTX 3090
+
+
+class Fun5bDefaults(BaseModel):
+    preset: str
+    seed: int
+    keep_background: bool
+    auto_background: bool
+    sharp_hands: bool
+
+
+class Fun5bInstallStatus(BaseModel):
+    state: str  # installed | running | failed | skipped | not_installed  (fun5b_setup.status())
+    step: int
+    total: int
+    label: str
+    message: Optional[str] = None
+    downloaded_gb: Optional[float] = None
+    models_gb: float
+
+
+class Fun5bInfo(BaseModel):
+    available: bool
+    reason: Optional[str] = None
+    missing: list[str] = []
+    plate_available: bool
+    presets: list[Fun5bPreset]
+    defaults: Fun5bDefaults
+    install: Fun5bInstallStatus
+
+
+class Fun5bServerStatus(BaseModel):
+    running: bool
+    loaded: bool = False
+    busy: bool = False
+    job_id: Optional[int] = None
+    vram_mb: Optional[int] = None
+    gpu_free_mb: Optional[int] = None
+    gpu_total_mb: Optional[int] = None
+
+
+class Fun5bStopResponse(BaseModel):
+    stopped: bool
+    message: str
+
+
+class Fun5bPlate(BaseModel):
+    id: str
+    source_name: Optional[str] = None
+    created_at: Optional[str] = None
+    last_used: Optional[str] = None
+    size_kb: int
+    has_source: bool
+
+
+class Fun5bPlateLookup(BaseModel):
+    id: str
+    cached: bool
 
 
 class PriorityChoice(BaseModel):

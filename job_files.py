@@ -40,6 +40,24 @@ def write_upload_pair(video_name, video_bytes, audio_name, audio_bytes):
     return video_dst, audio_dst
 
 
+def write_fun5b_upload(image_name, image_bytes, video_name, video_bytes, background_name=None,
+                       background_bytes=None):
+    """A Fun-5B job's uploads (character image, driving video, optional clean plate) in one
+    uploads/<hex>/ dir, so cleanup_job_files() (keyed on video_path) removes all of them.
+    Returns (image_dst, video_dst, background_dst or None)."""
+    job_dir = UPLOADS_DIR / uuid.uuid4().hex[:12]
+    job_dir.mkdir(parents=True, exist_ok=True)
+    image_dst = job_dir / ("image" + (Path(image_name).suffix or ".png"))
+    video_dst = job_dir / ("video" + (Path(video_name).suffix or ".mp4"))
+    image_dst.write_bytes(image_bytes)
+    video_dst.write_bytes(video_bytes)
+    background_dst = None
+    if background_bytes:
+        background_dst = job_dir / ("background" + (Path(background_name or "").suffix or ".png"))
+        background_dst.write_bytes(background_bytes)
+    return image_dst, video_dst, background_dst
+
+
 def stabilize_video(path):
     """Move a default/template video for an Excel batch into a durable location
     (uploads/videos/) so it survives the request that uploaded it."""

@@ -5,6 +5,7 @@ import { NodeKeyGate } from './layout/NodeKeyGate'
 import { Spinner } from './components/Spinner'
 
 const JobsPage = lazy(() => import('./pages/jobs/JobsPage'))
+const AnimatePage = lazy(() => import('./pages/animate/AnimatePage'))
 const VideosPage = lazy(() => import('./pages/videos/VideosPage'))
 const ExcelPage = lazy(() => import('./pages/excel/ExcelPage'))
 const AvatarCachePage = lazy(() => import('./pages/avatar-cache/AvatarCachePage'))
@@ -27,6 +28,7 @@ export function App() {
         <Routes>
           <Route element={<AppLayout />}>
             <Route index element={<JobsPage />} />
+            <Route path="animate" element={<AnimatePage />} />
             <Route path="videos" element={<VideosPage />} />
             <Route path="excel" element={<ExcelPage />} />
             <Route path="avatar-cache" element={<AvatarCachePage />} />

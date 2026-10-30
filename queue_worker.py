@@ -67,6 +67,13 @@ MUSETALK_BATCH_COLLECT_SECONDS = 10
 MUSETALK_BATCH_POLL_SECONDS = 0.5
 
 
+RENDER_EXIT_REJECTED = 3  # render_job.EXIT_REJECTED: the job's input is bad, do not retry
+
+
+class JobRejected(Exception):
+    """render_job.py exited RENDER_EXIT_REJECTED (Fun-5B found no person, unreadable file, ...)."""
+
+
 class JobCancelled(Exception):
     """Raised out of _run_render() when the DB's cancel_requested flag is seen mid-render —
     caught separately from a real render failure so the job lands as 'cancelled', not
@@ -480,12 +487,41 @@ def _drive_safe_name(path):
     return f"{stem[:140]}.{suffix}" if suffix else stem[:140]
 
 
+def _fun5b_command(job, out_path):
+    """render_job.py args of a Fun-5B job. Its inputs go in as uploaded: fun5b resamples the driving
+    video to 30fps and crops it itself, and there is no audio to normalize."""
+    cmd = [
+        sys.executable, str(ROOT / "render_job.py"), "--engine", "fun5b",
+        "--job-id", str(job["id"]), "--ref-image", job["ref_image_path"], "--video", job["video_path"],
+        "--output", str(out_path), "--preset", job.get("fun5b_preset") or db.FUN5B_DEFAULT_PRESET,
+        "--seed", str(job["seed"]), "--keep-background", str(int(job.get("keep_background", 1))),
+        "--auto-background", str(int(job.get("auto_background", 1))),
+        "--sharp-hands", str(int(job.get("sharp_hands", 0))),
+    ]
+    if job.get("table_line") is not None:
+        cmd += ["--table-line", str(job["table_line"])]
+    if job.get("background_path"):
+        cmd += ["--background", job["background_path"]]
+    return cmd
+
+
 def process_job(job):
     job_id = job["id"]
-    _log(f"claim job #{job_id} '{job['name']}' model={job['model_res']}")
+    _log(f"claim job #{job_id} '{job['name']}' engine={job.get('engine')} model={job['model_res']}")
     work = WORK_DIR / str(job_id)
     work.mkdir(parents=True, exist_ok=True)
     log_path = LOGS_DIR / f"job_{job_id}.log"
+
+    if job.get("engine") == "fun5b":
+        out_path = work / "out.mp4"
+        _log(f"job #{job_id} Fun-5B rendering (stall {RENDER_IDLE_TIMEOUT//60}min) -> {log_path.name}")
+        returncode = _run_render(_fun5b_command(job, out_path), log_path, job_id=job_id)
+        if returncode == RENDER_EXIT_REJECTED:
+            raise JobRejected(_tail(log_path, 4))
+        if returncode != 0 or not out_path.exists():
+            raise RuntimeError(f"render rc={returncode}; log tail:\n{_tail(log_path)}")
+        _finish_job(job, out_path)
+        return
 
     # Keep MuseTalk video stable across different audio lengths so its avatar cache is reusable.
     if job.get("engine", "musetalk") == "musetalk":
@@ -518,7 +554,11 @@ def process_job(job):
     if returncode != 0 or not out_path.exists():
         tail = _tail(log_path)
         raise RuntimeError(f"render rc={returncode}; log tail:\n{tail}")
+    _finish_job(job, out_path)
 
+
+def _finish_job(job, out_path):
+    job_id = job["id"]
     # Point 4: download ra ĐÚNG TÊN nhập (tên này = khóa match khi import sang hệ live).
     dst = DOWNLOADS_DIR / f"{_safe_name(job['name'])}.mp4"
     if dst.exists():
@@ -585,6 +625,9 @@ def _process_claimed_job(job):
     except JobCancelled:
         db.mark_cancelled(job_id)
         _log(f"job #{job_id} cancelled by user")
+    except JobRejected as exc:  # bad input (e.g. no person in the image): a retry would fail the same way
+        db.mark_failed(job_id, exc)
+        _log(f"job #{job_id} FAILED (not retried): {exc}")
     except Exception as exc:
         retries = job["retries"]
         if retries < db.MAX_RETRIES:

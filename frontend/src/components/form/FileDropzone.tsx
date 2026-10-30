@@ -1,18 +1,23 @@
-import { useCallback, useRef, useState, type DragEvent } from 'react'
-import { UploadCloud, X } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
+import { FileCheck, UploadCloud, X } from 'lucide-react'
 
 interface Props {
   label: string
   accept: string
-  kind: 'video' | 'audio'
+  kind: 'video' | 'audio' | 'image'
   file: File | null
   onChange: (file: File | null) => void
+  /** false: show only the chosen file's name (no player / image) */
+  preview?: boolean
 }
 
-export function FileDropzone({ label, accept, kind, file, onChange }: Props) {
+export function FileDropzone({ label, accept, kind, file, onChange, preview = true }: Props) {
   const [dragOver, setDragOver] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
-  const url = file ? URL.createObjectURL(file) : null
+  const url = useMemo(() => (file && preview ? URL.createObjectURL(file) : null), [file, preview])
+  useEffect(() => () => {
+    if (url) URL.revokeObjectURL(url)
+  }, [url])
 
   const handleDrop = useCallback(
     (e: DragEvent<HTMLDivElement>) => {
@@ -54,10 +59,29 @@ export function FileDropzone({ label, accept, kind, file, onChange }: Props) {
             <span className="text-xs">Kéo thả hoặc bấm để chọn file</span>
           </div>
         )}
+        {file && !preview && (
+          <div onClick={(e) => e.stopPropagation()} className="flex items-center justify-between gap-2 py-3">
+            <span className="flex min-w-0 items-center gap-2 text-sm">
+              <FileCheck className="h-4 w-4 shrink-0 text-emerald-500" />
+              <span className="truncate font-medium text-slate-700 dark:text-slate-200">{file.name}</span>
+              <span className="shrink-0 text-xs text-slate-400">{(file.size / 1024 / 1024).toFixed(1)} MB</span>
+            </span>
+            <button
+              type="button"
+              onClick={() => onChange(null)}
+              className="shrink-0 rounded-full p-1 text-slate-400 hover:bg-slate-100 dark:hover:bg-slate-800 hover:text-rose-600"
+              aria-label="Xóa file"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
         {file && url && (
           <div onClick={(e) => e.stopPropagation()}>
             {kind === 'video' ? (
               <video src={url} controls className="max-h-56 w-full rounded-lg bg-black" />
+            ) : kind === 'image' ? (
+              <img src={url} alt={file.name} className="mx-auto max-h-56 rounded-lg object-contain" />
             ) : (
               <audio src={url} controls className="w-full" />
             )}

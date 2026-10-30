@@ -1,0 +1,5 @@
+{
+  "repo": "https://github.com/aigc-apps/VideoX-Fun.git",
+  "commit": "4b7b6402a1e0f0406bd6801fb66c0a00bd922621",
+  "note": "Fun-5B runs VideoX-Fun from this checkout (engines/VideoX-Fun), unpatched on disk: fun5b/run.py patches it at runtime. Validated on RTX 3090, 2026-10-30."
+}

@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 import dashboard_reporter
 import database as db
 
-from . import akali, avatars, dashboard, drive, excel, jobs, livestream, tts_config_api, videos, workers, ws
+from . import akali, avatars, dashboard, drive, engines, excel, jobs, livestream, tts_config_api, videos, workers, ws
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("rendervideo")
@@ -40,6 +40,7 @@ app.include_router(videos.router)
 app.include_router(excel.router)
 app.include_router(excel.tts_router)
 app.include_router(avatars.router)
+app.include_router(engines.router)
 app.include_router(livestream.router)
 app.include_router(tts_config_api.router)
 app.include_router(drive.router)

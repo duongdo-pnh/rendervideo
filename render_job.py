@@ -33,6 +33,7 @@ import argparse
 import contextlib
 import fcntl
 import subprocess
+import time
 from pathlib import Path
 
 import cv2
@@ -219,6 +220,10 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
         final_short, target_short = target_short, LATENTSYNC_WORK_SHORT
     video_path = _maybe_downscale(video_path, target_short, str(work_dir))
 
+    # The resident Fun-5B server (~12GB VRAM, ~14GB RAM) and this engine do not fit together.
+    import fun5b_adapter
+    fun5b_adapter.ensure_stopped()
+
     if engine == "musetalk":
         from musetalk_adapter import render as musetalk_render
         print("[render_job] engine=MuseTalk 1.5 (fp16)", flush=True)
@@ -311,7 +316,91 @@ def render(video_path, audio_path, output_path, config_path, checkpoint,
     print(f"[render_job] OK -> {output_path}", flush=True)
 
 
+EXIT_REJECTED = 3  # the job's input is bad (no person found, ...): queue_worker fails it without retrying
+
+
+# One progress scale for a whole Fun-5B job (jobs.progress, 0..1), so the queue UI and akali's
+# heartbeat move during the minutes of model load / FireRed before the first denoising step too.
+# 0.97 = rendered, uploading to Drive (akali_bridge); 1 = done.
+FUN5B_STAGE_PROGRESS = {"load": 0.01, "plate": 0.03, "pose": 0.05}
+FUN5B_RENDER_START, FUN5B_RENDER_SPAN = 0.05, 0.90
+
+
+def render_fun5b(job_id, image, video, output_path, preset, seed, keep_background, auto_background,
+                 table_line, sharp_hands, background):
+    """Fun-5B character animation (ref image + driving video, no audio) via fun5b_adapter's
+    persistent server, with the MuseTalk server stopped for the duration and the GPU lock held."""
+    import database as db
+    import fun5b_adapter
+    from musetalk_adapter import paused as pause_musetalk_server
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    last, best = [0.0], [0.0]
+
+    def on_progress(event):
+        stage = event.get("stage")
+        if stage == "render":
+            value = FUN5B_RENDER_START + FUN5B_RENDER_SPAN * float(event.get("progress", 0))
+        elif stage in FUN5B_STAGE_PROGRESS:
+            value = FUN5B_STAGE_PROGRESS[stage]
+        else:
+            return
+        if value <= best[0]:  # never backwards (the model reloads after FireRed: "load" again)
+            return
+        best[0] = value
+        now = time.monotonic()
+        if stage != "render" or now - last[0] >= 5:  # the queue UI polls every 2s; no need to write every step
+            last[0] = now
+            try:
+                db.set_progress(job_id, value)
+            except Exception as e:  # a locked/missing DB must never fail a 30-minute render
+                print(f"[render_job] progress not saved: {e}", flush=True)
+
+    print(f"[render_job] engine=Fun-5B preset={preset} seed={seed} keep_background={keep_background} "
+          f"auto_background={auto_background} table_line={table_line} sharp_hands={sharp_hands}", flush=True)
+    with gpu_lock(), pause_musetalk_server():
+        fun5b_adapter.render(job_id, image, video, output_path, preset=preset, seed=seed,
+                             keep_background=keep_background, auto_background=auto_background,
+                             table_line=table_line, sharp_hands=sharp_hands, background_path=background,
+                             on_progress=on_progress)
+    if not os.path.exists(output_path):
+        raise RuntimeError(f"render finished but output missing: {output_path}")
+    print(f"[render_job] OK -> {output_path}", flush=True)
+
+
+def main_fun5b(argv):
+    import fun5b_adapter
+
+    ap = argparse.ArgumentParser(description="Single-job Fun-5B render runner")
+    ap.add_argument("--engine", choices=["fun5b"], required=True)
+    ap.add_argument("--job-id", type=int, required=True)
+    ap.add_argument("--ref-image", required=True)
+    ap.add_argument("--video", required=True)
+    ap.add_argument("--output", required=True)
+    ap.add_argument("--preset", default="natural")
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--keep-background", type=int, default=1)
+    ap.add_argument("--auto-background", type=int, default=1)
+    ap.add_argument("--table-line", type=float, default=None)
+    ap.add_argument("--sharp-hands", type=int, default=0)
+    ap.add_argument("--background", default=None)
+    a = ap.parse_args(argv)
+    try:
+        render_fun5b(a.job_id, a.ref_image, a.video, a.output, a.preset, a.seed, bool(a.keep_background),
+                     bool(a.auto_background), a.table_line, bool(a.sharp_hands), a.background)
+    except fun5b_adapter.RenderRejected as e:
+        print(f"[render_job] REJECTED: {e}", file=sys.stderr, flush=True)
+        sys.exit(EXIT_REJECTED)
+    except Exception as e:
+        print(f"[render_job] ERROR: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
+
 def main():
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--engine")
+    if pre.parse_known_args()[0].engine == "fun5b":  # different inputs (image, no audio): own CLI
+        return main_fun5b(sys.argv[1:])
     ap = argparse.ArgumentParser(description="Single-job lip-sync render runner")
     ap.add_argument("--video", required=True)
     ap.add_argument("--audio", required=True)

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import {
   Clapperboard,
+  PersonStanding,
   Video,
   FileSpreadsheet,
   UserRound,
@@ -25,6 +26,7 @@ interface NavItem {
 
 export const NAV: NavItem[] = [
   { to: '/', label: 'Render / Jobs', icon: Clapperboard, end: true },
+  { to: '/animate', label: 'Chuyển động nhân vật', icon: PersonStanding },
   { to: '/videos', label: 'Video đã render', icon: Video },
   { to: '/excel', label: 'Import Excel', icon: FileSpreadsheet },
   { to: '/avatar-cache', label: 'Avatar Cache', icon: UserRound },

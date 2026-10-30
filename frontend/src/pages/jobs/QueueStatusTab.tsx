@@ -14,6 +14,7 @@ import {
   deleteJob,
   listJobs,
   priorityChoices as fetchPriorityChoices,
+  jobRefImageUrl,
   reorderPriority,
   retryJob,
 } from '../../api/jobs'
@@ -25,6 +26,8 @@ import { PriorityModal } from './PriorityModal'
 import { Badge } from '../../components/Badge'
 import { groupByExcelFile, type ExcelFileGroup } from '../../utils/groupByExcelFile'
 import type { JobOut } from '../../types/api'
+
+const ENGINE_LABEL: Record<string, string> = { musetalk: 'MuseTalk', latentsync: 'LatentSync', fun5b: 'Fun-5B' }
 
 function renderSeconds(job: JobOut): number | null {
   if (!job.started_at) return null
@@ -301,21 +304,38 @@ export function QueueStatusTab() {
                     <tr key={job.id} className="hover:bg-slate-50 dark:hover:bg-slate-900/60">
                       <td className="px-2 py-2 font-mono text-xs text-slate-500 sm:px-4">#{job.id}</td>
                       <td className="max-w-[56px] truncate px-2 py-2 font-medium sm:max-w-[220px] sm:px-4">
-                        {job.status === 'done' ? (
-                          <button className="text-brand-600 hover:underline dark:text-brand-400" onClick={() => setPreviewJob(job)}>
-                            {job.name}
-                          </button>
-                        ) : (
-                          job.name
-                        )}
+                        <span className="flex items-center gap-2">
+                          {job.engine === 'fun5b' && (
+                            <img src={jobRefImageUrl(job.id)} alt="" title="Fun-5B · ảnh nhân vật" loading="lazy"
+                              className="hidden h-8 w-[18px] shrink-0 rounded object-cover sm:block"
+                              onError={(e) => (e.currentTarget.style.display = 'none')} />
+                          )}
+                          <span className="truncate">
+                            {job.status === 'done' ? (
+                              <button className="text-brand-600 hover:underline dark:text-brand-400" onClick={() => setPreviewJob(job)}>
+                                {job.name}
+                              </button>
+                            ) : (
+                              job.name
+                            )}
+                          </span>
+                        </span>
                       </td>
                       <td className="px-2 py-2 sm:px-4">
                         <Badge tone={STATUS_TONE[job.status]} icon={STATUS_ICON[job.status]} spin={STATUS_SPIN[job.status]}>
                           {STATUS_LABEL[job.status]}
+                          {job.status === 'rendering' && job.progress != null && ` ${Math.round(job.progress * 100)}%`}
                         </Badge>
+                        {job.status === 'rendering' && job.progress != null && (
+                          <div className="mt-1 h-1 w-full min-w-[60px] overflow-hidden rounded-full bg-slate-100 dark:bg-slate-800">
+                            <div className="h-full rounded-full bg-brand-500 transition-[width] duration-700" style={{ width: `${job.progress * 100}%` }} />
+                          </div>
+                        )}
                       </td>
-                      <td className="hidden px-4 py-2 text-xs text-slate-500 min-[1900px]:table-cell">{job.engine}</td>
-                      <td className="hidden px-4 py-2 text-xs text-slate-500 min-[1900px]:table-cell">{job.model_res}</td>
+                      <td className="hidden px-4 py-2 text-xs text-slate-500 min-[1900px]:table-cell">{ENGINE_LABEL[job.engine] ?? job.engine}</td>
+                      <td className="hidden px-4 py-2 text-xs text-slate-500 min-[1900px]:table-cell">
+                        {job.engine === 'fun5b' ? job.fun5b_preset : job.model_res}
+                      </td>
                       <td className="hidden px-4 py-2 text-xs min-[1900px]:table-cell">{job.priority}</td>
                       <td className="hidden whitespace-nowrap px-4 py-2 text-xs xl:table-cell">
                         {formatDuration(renderSeconds(job), { inProgress: job.status === 'rendering' })}

@@ -1,7 +1,8 @@
 // Hand-transcribed from backend/models.py — keep in sync with that file.
 
 export type JobStatus = 'queued' | 'rendering' | 'done' | 'failed' | 'cancelled'
-export type Engine = 'musetalk' | 'latentsync'
+export type Engine = 'musetalk' | 'latentsync' | 'fun5b'
+export type Fun5bPresetKey = 'fast' | 'balanced' | 'natural' | 'natural_light'
 export type ModelRes = '512' | '256'
 export type OutRes = 'Gốc' | '1080' | '720' | '480 Nhanh'
 export type InputType = 'real' | 'ai'
@@ -31,6 +32,16 @@ export interface JobOut {
   excel_file?: string | null
   drive_error?: string | null
   drive_folder?: string | null
+  /** 0..1 while rendering (Fun-5B only for now) */
+  progress?: number | null
+  // engine === 'fun5b' only
+  ref_image_path?: string | null
+  fun5b_preset?: Fun5bPresetKey | null
+  keep_background?: boolean | null
+  auto_background?: boolean | null
+  table_line?: number | null
+  sharp_hands?: boolean | null
+  has_background?: boolean | null
 }
 
 export interface JobSubmitResponse {
@@ -236,4 +247,71 @@ export interface AkaliStatus {
 export interface JobsSnapshot {
   jobs: JobOut[]
   priority_choices: PriorityChoice[]
+}
+
+// --- Fun-5B (backend/engines.py) ---
+
+export interface Fun5bPreset {
+  key: Fun5bPresetKey
+  label: string
+  steps: number
+  note: string
+  /** measured render time of 10s of driving video on an RTX 3090 */
+  seconds_per_10s: number
+}
+
+export interface Fun5bInstallStatus {
+  state: 'installed' | 'running' | 'failed' | 'skipped' | 'not_installed'
+  step: number
+  total: number
+  label: string
+  message?: string | null
+  /** while the models download (step 6) */
+  downloaded_gb?: number | null
+  models_gb: number
+}
+
+export interface Fun5bInfo {
+  available: boolean
+  reason?: string | null
+  missing: string[]
+  plate_available: boolean
+  presets: Fun5bPreset[]
+  defaults: {
+    preset: Fun5bPresetKey
+    seed: number
+    keep_background: boolean
+    auto_background: boolean
+    sharp_hands: boolean
+  }
+  install: Fun5bInstallStatus
+}
+
+export interface Fun5bServerStatus {
+  running: boolean
+  loaded: boolean
+  busy: boolean
+  job_id?: number | null
+  vram_mb?: number | null
+  gpu_free_mb?: number | null
+  gpu_total_mb?: number | null
+}
+
+export interface Fun5bStopResponse {
+  stopped: boolean
+  message: string
+}
+
+export interface Fun5bPlate {
+  id: string
+  source_name?: string | null
+  created_at?: string | null
+  last_used?: string | null
+  size_kb: number
+  has_source: boolean
+}
+
+export interface Fun5bPlateLookup {
+  id: string
+  cached: boolean
 }

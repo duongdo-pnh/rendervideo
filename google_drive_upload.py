@@ -257,6 +257,29 @@ def list_files(folder_id=None, page_size=200):
     return out
 
 
+def file_id_from_link(link):
+    """Drive file id of a webViewLink (https://drive.google.com/file/d/<id>/view...), or None."""
+    m = re.search(r"/d/([A-Za-z0-9_-]+)", link or "") or re.search(r"[?&]id=([A-Za-z0-9_-]+)", link or "")
+    return m.group(1) if m else None
+
+
+def trash_folder_contents(folder_id, keep_file_id=None):
+    """Move everything directly inside `folder_id` to the Drive trash, except `keep_file_id`.
+
+    Used by akali_bridge for a Fun-5B job's result folder, which must hold exactly the one
+    finished video (akali charges points by the total video duration in that folder). Trash, not
+    delete: a mistake stays recoverable for 30 days. Returns the trashed file names."""
+    service = get_service()
+    trashed = []
+    for item in list_files(folder_id, page_size=1000):
+        if item["id"] == keep_file_id:
+            continue
+        service.files().update(fileId=item["id"], body={"trashed": True},
+                               supportsAllDrives=True).execute(num_retries=3)
+        trashed.append(item["name"])
+    return trashed
+
+
 def download_folder(folder_id, dest_dir):
     """Tải mọi FILE (không đệ quy vào thư mục con) nằm trực tiếp trong `folder_id`
     về `dest_dir` (tự tạo nếu chưa có). Dùng cho akali_bridge.py tải folder batch
