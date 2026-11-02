@@ -23,6 +23,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+# MuseTalk checkpoints are official trusted model files and predate PyTorch
+# 2.6's weights_only=True default. MMEngine does not pass this flag itself.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 # Conservative defaults keep the web UI and encoder responsive while MuseTalk runs.
 os.environ.setdefault("OMP_NUM_THREADS", "2")
 os.environ.setdefault("MKL_NUM_THREADS", "2")

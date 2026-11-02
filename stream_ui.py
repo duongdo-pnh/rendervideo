@@ -29,7 +29,7 @@ BACKEND_LOG = ROOT / "logs" / "musetalk_stream_api.log"
 FACEBOOK_AVATAR_720 = Path(
     os.environ.get(
         "FACEBOOK_LIVE_AVATAR_PATH",
-        str(ROOT / "avatar_cache" / "facebook_live_selected_720x1280.mp4"),
+        str(ROOT / "avatar_cache" / "facebook_live_selected_720p.mp4"),
     )
 )
 SAMPLE_AUDIO_DIR = ROOT / "engines" / "MuseTalk" / "data" / "audio"
@@ -127,7 +127,7 @@ def _compose_push_url(server_url: str, stream_key: str) -> str:
 
 
 def _normalize_facebook_avatar(avatar_video: str) -> str:
-    """Convert the complete uploaded avatar to a stable portrait 720p/30fps file."""
+    """Normalize to 30fps within a 720p landscape/portrait box, preserving aspect."""
     if not avatar_video:
         raise gr.Error("Cần tải lên avatar video hợp lệ.")
     source = Path(avatar_video).resolve()
@@ -141,8 +141,8 @@ def _normalize_facebook_avatar(avatar_video: str) -> str:
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-i", str(source),
         "-vf",
-        "scale=720:1280:force_original_aspect_ratio=decrease,"
-        "pad=720:1280:(ow-iw)/2:(oh-ih)/2:color=black,fps=30",
+        "scale=w='if(gte(iw,ih),1280,720)':h='if(gte(iw,ih),720,1280)':"
+        "force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2,fps=30",
         "-an",
     ]
     nvenc_command = command_prefix + [
@@ -161,7 +161,7 @@ def _normalize_facebook_avatar(avatar_video: str) -> str:
         os.replace(temporary, FACEBOOK_AVATAR_720)
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
         temporary.unlink(missing_ok=True)
-        raise gr.Error(f"Không thể resize avatar về 720×1280: {type(exc).__name__}") from None
+        raise gr.Error(f"Không thể resize avatar về 720p: {type(exc).__name__}") from None
     return str(FACEBOOK_AVATAR_720.resolve())
 
 
@@ -228,14 +228,14 @@ def start_stream(
         _cache_progress_text(2, "Đang kiểm tra video mẫu..."),
     )
     if session_id == "facebook-live":
-        progress(0.08, desc="Resize mẫu về 720×1280, 30 FPS...")
+        progress(0.08, desc="Resize mẫu về 720p, giữ tỷ lệ ngang/dọc, 30 FPS...")
         avatar_video = _normalize_facebook_avatar(avatar_video)
         progress(0.35, desc="Resize hoàn tất")
         yield (
             "### Đã resize mẫu, chuẩn bị tạo cache...",
             {"cache_progress_percent": 35, "cache_stage": "resized"},
             gr.update(),
-            _cache_progress_text(35, "Resize 720×1280, 30 FPS đã hoàn tất."),
+            _cache_progress_text(35, "Resize 720p, giữ tỷ lệ ngang/dọc, 30 FPS đã hoàn tất."),
         )
     _CURRENT_PREVIEW_SESSION = session_id
     _CURRENT_AVATAR_VIDEO = str(Path(avatar_video).resolve()) if avatar_video else None

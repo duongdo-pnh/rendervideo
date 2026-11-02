@@ -1,0 +1,670 @@
+"""HTTP API for one persistent MuseTalk realtime stream.
+
+Run with the MuseTalk virtualenv:
+    engines/MuseTalk/.venv/bin/python musetalk_stream_api.py --port 8091
+"""
+from __future__ import annotations
+
+import argparse
+import cgi
+import hashlib
+import json
+import os
+import shutil
+import sys
+import threading
+import time
+import traceback
+import uuid
+import wave
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import urlparse
+
+# MuseTalk checkpoints are official trusted model files and predate PyTorch
+# 2.6's weights_only=True default. MMEngine does not pass this flag itself.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
+# Conservative defaults keep the web UI and encoder responsive while MuseTalk runs.
+os.environ.setdefault("OMP_NUM_THREADS", "2")
+os.environ.setdefault("MKL_NUM_THREADS", "2")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "2")
+
+APP_ROOT = Path(__file__).resolve().parent
+MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
+sys.path.insert(0, str(APP_ROOT))
+sys.path.insert(0, str(MUSETALK_ROOT))
+os.chdir(MUSETALK_ROOT)
+
+import cv2
+import librosa
+import numpy as np
+import torch
+from transformers import WhisperModel
+
+import scripts.realtime_inference as rt
+from musetalk.utils.audio_processor import AudioProcessor
+from musetalk.utils.face_parsing import FaceParsing
+from musetalk.utils.utils import datagen, load_all_model
+from musetalk_streaming.manager import StreamManager
+from musetalk_streaming.models import StreamConfig
+from musetalk_streaming.output import RTMPOutput, ReLiveClipOutput
+from musetalk_streaming.session import StreamSession
+
+MANAGER = StreamManager()
+GPU_LOCK = threading.Lock()
+AVATAR_LOCK = threading.Lock()
+AVATARS = {}
+# session_id -> avatar_id đang chuẩn bị (chưa xong nên chưa có session để hỏi status bình
+# thường). UI đọc tiến độ qua đây khi GET /api/streams/<session_id> còn 404 -> tải lại trang
+# không mất tiến độ, vì tiến độ nằm ở SERVER (file JSON cạnh cache), không phải phiên trình duyệt.
+CURRENT_PREP = {}
+# TRẦN batch, không phải mục tiêu. Batch to = kernel CUDA chạy dài = OBS phải xếp
+# hàng sau nó để composite -> rớt frame ĐÚNG LÚC avatar đang nói. Đo trên 5090
+# (2026-08-04, avatar đọc + đang encode, 60s mỗi mức):
+#   batch 20 -> OBS 27,1 fps, skip 11,3%     batch 8 -> 30,0 fps, skip 0,19%
+#   batch  6 -> OBS 30,0 fps, skip 0,00%     batch 2 -> MuseTalk đói buffer
+# Giữ trần thấp để dù caller cũ truyền 20 vẫn không phá được độ mượt.
+MAX_GPU_BATCH = max(1, int(os.getenv("MUSETALK_MAX_GPU_BATCH", "8")))
+BLEND_WORKERS = max(1, int(os.getenv("MUSETALK_BLEND_WORKERS", "16")))
+AUDIO_UPLOAD_DIR = APP_ROOT / "uploads" / "stream_audio"
+MAX_AUDIO_UPLOAD_BYTES = int(os.getenv("MUSETALK_MAX_AUDIO_UPLOAD_MB", "100")) * 1024 * 1024
+ALLOWED_AUDIO_SUFFIXES = {".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus"}
+MAX_AUDIO_CHUNK_SECONDS = max(
+    5.0, float(os.getenv("MUSETALK_MAX_AUDIO_CHUNK_SECONDS", "5"))
+)
+AUDIO_CHUNK_DIR = APP_ROOT / "uploads" / "stream_audio_chunks"
+
+
+def load_runtime() -> None:
+    cv2.setNumThreads(max(1, int(os.getenv("MUSETALK_OPENCV_THREADS", "2"))))
+    torch.set_num_threads(max(1, int(os.getenv("MUSETALK_TORCH_THREADS", "2"))))
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    rt.args = SimpleNamespace(
+        version="v15", extra_margin=10, parsing_mode="jaw",
+        left_cheek_width=90, right_cheek_width=90,
+        audio_padding_length_left=2, audio_padding_length_right=2,
+        skip_save_images=False,
+    )
+    rt.device = torch.device("cuda:0")
+    rt.vae, rt.unet, rt.pe = load_all_model(
+        unet_model_path="models/musetalkV15/unet.pth",
+        vae_type="sd-vae", unet_config="models/musetalkV15/musetalk.json",
+        device=rt.device,
+    )
+    rt.timesteps = torch.tensor([0], device=rt.device)
+    rt.pe = rt.pe.half().to(rt.device)
+    rt.vae.vae = rt.vae.vae.half().to(rt.device)
+    rt.unet.model = rt.unet.model.half().to(rt.device)
+    rt.audio_processor = AudioProcessor(feature_extractor_path="models/whisper")
+    rt.weight_dtype = rt.unet.model.dtype
+    rt.whisper = WhisperModel.from_pretrained("models/whisper")
+    rt.whisper = rt.whisper.to(device=rt.device, dtype=rt.weight_dtype).eval()
+    rt.whisper.requires_grad_(False)
+    rt.fp = FaceParsing(left_cheek_width=90, right_cheek_width=90)
+
+
+def avatar_cache_complete(avatar_id: str) -> bool:
+    base = MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id
+    required = ("avator_info.json", "coords.pkl", "latents.pt", "mask_coords.pkl")
+    return (
+        all((base / name).is_file() for name in required)
+        and (base / "full_imgs").is_dir() and (base / "mask").is_dir()
+    )
+
+
+def read_prep_progress(session_id: str):
+    """Đọc tiến độ chuẩn bị avatar (nhận diện mặt/mask) đang chạy cho session này, nếu có.
+    None khi không có phiên nào đang chuẩn bị (đã xong hoặc chưa từng bắt đầu)."""
+    avatar_id = CURRENT_PREP.get(session_id)
+    if not avatar_id:
+        return None
+    path = MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id / "prep_progress.json"
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    # File tiến độ nằm lại trên đĩa VĨNH VIỄN sau khi dựng xong. Nếu vẫn báo "đang
+    # chuẩn bị" cho một phiên KHÔNG còn tồn tại, endpoint trả 200 -> phía Mac tưởng
+    # phiên còn sống (nó chỉ kiểm tra mã 200) nên KHÔNG BAO GIỜ dựng lại phiên:
+    # luồng tắt vĩnh viễn thay vì tự hồi. Chỉ nhận là "đang chuẩn bị" khi thật sự
+    # còn dở; xong rồi mà không có phiên thì phải trả 404 để bên kia dựng lại.
+    if data.get("stage") == "done":
+        return None
+    data["avatar_id"] = avatar_id
+    return data
+
+
+def get_avatar(avatar_id: str, video_path: str, batch_size: int):
+    with AVATAR_LOCK:
+        avatar = AVATARS.get(avatar_id)
+        if avatar is None:
+            cache_dir = MUSETALK_ROOT / "results" / "v15" / "avatars" / avatar_id
+            cache_ready = avatar_cache_complete(avatar_id)
+            # MuseTalk upstream prompts on stdin when an incomplete cache exists.
+            # This API is non-interactive, so discard only that generated partial cache.
+            if cache_dir.exists() and not cache_ready:
+                shutil.rmtree(cache_dir)
+            avatar = rt.Avatar(
+                avatar_id=avatar_id, video_path=video_path, bbox_shift=0,
+                batch_size=min(MAX_GPU_BATCH, batch_size), preparation=not cache_ready,
+            )
+            # Miệng lấy theo input_latent_list_cycle[i], chỗ dán lấy theo coord_list_cycle[i]:
+            # hai danh sách LỆCH NHAU là miệng của khung này bị ép vào ô toạ độ của khung khác
+            # (méo xệch, không bám mặt) mà không có lỗi nào được báo. Chặn ở đây để cache hỏng
+            # bị từ chối thẳng thay vì phát hình sai âm thầm.
+            n_lat = len(avatar.input_latent_list_cycle)
+            n_frame = len(avatar.frame_list_cycle)
+            if n_lat != n_frame:
+                raise RuntimeError(
+                    f"cache hỏng: {n_lat} latent nhưng {n_frame} khung hình "
+                    f"(lệch {n_frame - n_lat}) -- phải dựng lại cache avatar '{avatar_id}'"
+                )
+            AVATARS[avatar_id] = avatar
+        else:
+            avatar.batch_size = min(MAX_GPU_BATCH, batch_size)
+        return avatar
+
+
+def read_idle_frames(video_path: str, limit: int = 250) -> list[np.ndarray]:
+    """Mẫu khung RẢI ĐỀU khắp cả video, không chỉ đọc `limit` khung đầu tiên.
+
+    Khung idle chỉ dùng khi hàng đợi trống giữa 2 câu voice (không nhép miệng).
+    Giọng nền hay bị cắt thành từng đoạn ngắn cách nhau vài giây -> hàng đợi
+    trống rất thường xuyên -> nếu idle chỉ lấy ~10s đầu video, avatar trông như
+    "chiếu đi chiếu lại đúng 1 đoạn đầu" suốt buổi live dù nguồn dài 12 phút.
+    """
+    capture = cv2.VideoCapture(video_path)
+    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    frames = []
+    try:
+        if total > limit:
+            step = total / limit
+            for i in range(limit):
+                capture.set(cv2.CAP_PROP_POS_FRAMES, int(i * step))
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+        else:
+            while len(frames) < limit:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                frames.append(frame)
+    finally:
+        capture.release()
+    if not frames:
+        raise ValueError("avatar_video has no readable frames")
+    return frames
+
+
+def audio_chunks(audio_path: str, fps: float):
+    features, length = rt.audio_processor.get_audio_feature(
+        audio_path, weight_dtype=rt.weight_dtype
+    )
+    return rt.audio_processor.get_whisper_chunk(
+        features, rt.device, rt.weight_dtype, rt.whisper, length, fps=fps,
+        audio_padding_length_left=rt.args.audio_padding_length_left,
+        audio_padding_length_right=rt.args.audio_padding_length_right,
+    )
+
+
+def split_audio_for_stream(audio_path: str, request_id: str, delete_source: bool = False):
+    """Keep one logical voice timeline; inference already streams it in GPU batches."""
+    path = Path(audio_path)
+    return [(request_id, str(path), delete_source)]
+
+
+def blend_cached_frame(
+    image: np.ndarray, face: np.ndarray, face_box, mask_array: np.ndarray, crop_box
+) -> np.ndarray:
+    """Pixel-identical cached-mask blend without PIL full-frame conversions.
+
+    crop_box có thể âm/vượt biên khung hình khi mặt sát mép (build-time dùng PIL
+    .crop() tự đệm đen ngoài biên; mask_array vẫn giữ ĐÚNG kích thước crop_box gốc).
+    Cắt numpy thô KHÔNG tự đệm -- số âm bị hiểu là đếm từ cuối mảng nên ra lát RỖNG,
+    làm mọi khung ở mép hình vỡ pipeline (ValueError broadcast shape). Phải kẹp
+    crop_box về biên khung thật rồi dịch cả vùng dán mặt lẫn mask theo đúng phần bị kẹp.
+    """
+    x, y, x1, y1 = face_box
+    x_s, y_s, x_e, y_e = crop_box
+    h, w = image.shape[:2]
+    cx_s, cy_s = max(0, x_s), max(0, y_s)
+    cx_e, cy_e = min(w, x_e), min(h, y_e)
+    if cx_e <= cx_s or cy_e <= cy_s:
+        return image  # crop_box nằm hoàn toàn ngoài khung -- không có gì để ghép
+
+    output = image.copy()
+    background = output[cy_s:cy_e, cx_s:cx_e]
+    foreground = background.copy()
+
+    if mask_array.ndim == 3:
+        mask_array = mask_array[..., 0]
+    # mask_array có kích thước theo crop_box GỐC (chưa kẹp) -- cắt đúng phần tương
+    # ứng với vùng đã kẹp bằng cùng độ dịch (cy_s - y_s, cx_s - x_s).
+    my0, mx0 = cy_s - y_s, cx_s - x_s
+    mask_crop = mask_array[my0:my0 + (cy_e - cy_s), mx0:mx0 + (cx_e - cx_s)]
+
+    # vùng dán mặt tính theo crop_box gốc, dịch về theo phần bị kẹp rồi kẹp tiếp
+    # trong biên của foreground (mặt cũng có thể bị cắt bớt nếu nằm sát mép).
+    fh, fw = foreground.shape[:2]
+    fy0, fy1 = y - cy_s, y1 - cy_s
+    fx0, fx1 = x - cx_s, x1 - cx_s
+    sy0, sy1 = max(0, fy0), min(fh, fy1)
+    sx0, sx1 = max(0, fx0), min(fw, fx1)
+    if sy1 > sy0 and sx1 > sx0:
+        face_y0, face_y1 = sy0 - fy0, face.shape[0] - (fy1 - sy1)
+        face_x0, face_x1 = sx0 - fx0, face.shape[1] - (fx1 - sx1)
+        foreground[sy0:sy1, sx0:sx1] = face[face_y0:face_y1, face_x0:face_x1]
+
+    alpha = mask_crop.astype(np.uint16, copy=False)[..., None]
+    background[:] = (
+        foreground.astype(np.uint16) * alpha
+        + background.astype(np.uint16) * (255 - alpha)
+        + 127
+    ) // 255
+    return output
+
+
+@torch.inference_mode()
+def produce_sentence(
+    avatar, request, emit, cancel, fps: int, frame_repeat: int = 1,
+    frame_cursor: list[int] | None = None,
+) -> None:
+    frame_repeat = max(1, int(frame_repeat))
+    inference_fps = fps / frame_repeat
+    all_chunks = audio_chunks(request.audio_path, inference_fps)
+    full_total_frames = len(all_chunks) * frame_repeat
+    start_frame = min(max(0, int(request.start_frame)), full_total_frames)
+    start_chunk = min(len(all_chunks), start_frame // frame_repeat)
+    chunks = all_chunks[start_chunk:]
+    request.total_frames = max(0, full_total_frames - start_frame)
+    waveform, _ = librosa.load(request.audio_path, sr=16_000, mono=True)
+    pcm_start = round(start_frame * 16_000 / fps)
+    waveform = waveform[pcm_start:]
+    pcm = np.clip(waveform * 32767, -32768, 32767).astype(np.int16)
+    latents = avatar.input_latent_list_cycle
+    freeze_frame_index = request.freeze_frame_index
+    base_frame_index = (
+        freeze_frame_index
+        if freeze_frame_index is not None
+        else (
+            request.start_driver_frame_index
+            if request.start_driver_frame_index is not None
+            else (frame_cursor[0] if frame_cursor is not None else 0)
+        )
+    )
+    batches = datagen(
+        chunks,
+        [
+            latents[
+                (
+                    base_frame_index
+                    if freeze_frame_index is not None
+                    else base_frame_index + i
+                ) % len(latents)
+            ]
+            for i in range(len(chunks))
+        ],
+        min(MAX_GPU_BATCH, int(avatar.batch_size)),
+    )
+    frame_index = 0
+    total_batch_seconds = 0.0
+    total_blend_seconds = 0.0
+
+    noface_cycle = getattr(avatar, "noface_idx_cycle", None) or frozenset()
+
+    def blend_frame(item):
+        result, index = item
+        cycle = (
+            base_frame_index
+            if freeze_frame_index is not None
+            else base_frame_index + index
+        ) % len(avatar.frame_list_cycle)
+        # frame_list_cycle/mask_list_cycle giữ bytes ảnh NÉN trong RAM (không phải mảng thô)
+        # để tránh OOM trên avatar dài -- xem read_img_bytes() trong realtime_inference.py.
+        frame = cv2.imdecode(avatar.frame_list_cycle[cycle], cv2.IMREAD_COLOR)
+        if cycle in noface_cycle:
+            # Khung này lúc dựng cache KHÔNG nhận được khuôn mặt (người ra khỏi khung/quay đi).
+            # Toạ độ của nó là toạ độ MƯỢN từ khung khác, dán miệng vào là lệch hẳn khỏi mặt.
+            # Giữ nguyên khung gốc (không nhép); tiếng vẫn phát bình thường.
+            return frame
+        bbox = avatar.coord_list_cycle[cycle]
+        x1, y1, x2, y2 = bbox
+        mouth = cv2.resize(result.astype("uint8"), (x2 - x1, y2 - y1))
+        mask_array = cv2.imdecode(avatar.mask_list_cycle[cycle], cv2.IMREAD_UNCHANGED)
+        return blend_cached_frame(
+            frame, mouth, bbox,
+            mask_array, avatar.mask_coords_list_cycle[cycle],
+        )
+
+    with ThreadPoolExecutor(max_workers=BLEND_WORKERS) as blend_pool:
+        for whisper_batch, latent_batch in batches:
+            if cancel.is_set():
+                break
+            batch_started = time.monotonic()
+            with GPU_LOCK:
+                audio_features = rt.pe(whisper_batch.to(rt.device, non_blocking=True))
+                latent_batch = latent_batch.to(
+                    device=rt.device, dtype=rt.unet.model.dtype, non_blocking=True
+                )
+                predicted = rt.unet.model(
+                    latent_batch, rt.timesteps, encoder_hidden_states=audio_features
+                ).sample.to(device=rt.device, dtype=rt.vae.vae.dtype)
+                decoded = rt.vae.decode_latents(predicted)
+            total_batch_seconds += time.monotonic() - batch_started
+
+            usable = min(len(decoded), len(chunks) - frame_index)
+            blend_started = time.monotonic()
+            work = [(decoded[offset], frame_index + offset) for offset in range(usable)]
+            frames = blend_pool.map(blend_frame, work)
+            for frame in frames:
+                if cancel.is_set():
+                    break
+                # At 720p the 3090 sustains about 12.5 generated mouth frames
+                # per second. Duplicate each generated frame into the output
+                # FPS clock when a lower render FPS is used.
+                # output clock while advancing audio on every output frame.
+                for repeat_index in range(frame_repeat):
+                    output_index = frame_index * frame_repeat + repeat_index
+                    start = round(output_index * 16_000 / fps)
+                    end = round((output_index + 1) * 16_000 / fps)
+                    driver_index = (
+                        base_frame_index
+                        if freeze_frame_index is not None
+                        else base_frame_index + frame_index
+                    )
+                    emit(frame, pcm[start:end], driver_index)
+                frame_index += 1
+            total_blend_seconds += time.monotonic() - blend_started
+            del audio_features, latent_batch, predicted, decoded
+    if frame_cursor is not None and freeze_frame_index is None:
+        # Preserve the driver-video phase across all five-second voice chunks.
+        # Only the mouth changes; the body/background never jump back to frame 0.
+        frame_cursor[0] = base_frame_index + frame_index
+    return {
+        "frames": frame_index,
+        "gpu_batch_ms": total_batch_seconds * 1000,
+        "blend_ms": total_blend_seconds * 1000,
+        "gpu_memory_bytes": torch.cuda.memory_allocated() if torch.cuda.is_available() else 0,
+    }
+
+
+def start_session(body: dict) -> dict:
+    video_path = str(Path(body["avatar_video"]).resolve())
+    if not Path(video_path).is_file():
+        raise ValueError("avatar_video does not exist")
+    session_id = str(body["session_id"])
+    video_stat = Path(video_path).stat()
+    fingerprint = hashlib.sha256(
+        f"{video_path}:{video_stat.st_size}:{video_stat.st_mtime_ns}".encode("utf-8")
+    ).hexdigest()[:12]
+    avatar_id = f"{str(body.get('avatar_id', session_id))}-{fingerprint}"
+    CURRENT_PREP[session_id] = avatar_id
+    # Same rule as the normal MuseTalk renderer: output keeps the driver's
+    # native frame size/aspect ratio.  Realtime used to default to 1280x720,
+    # which stretched portrait and square avatars.
+    idle_frames = read_idle_frames(video_path)
+    source_height, source_width = idle_frames[0].shape[:2]
+    width = max(2, source_width // 2 * 2)
+    height = max(2, source_height // 2 * 2)
+    output_mode = str(body.get("output_mode", "rtmp")).lower()
+    push_url = str(body.get("push_url", ""))
+    # The desktop Facebook session is a persistent realtime feed consumed by
+    # OBS. Do not let an empty UI request replace it with legacy MP4 output.
+    if session_id == "facebook-live" and output_mode == "relive":
+        output_mode = "udp"
+        push_url = "udp://127.0.0.1:5000?pkt_size=1316"
+    config = StreamConfig(
+        session_id=session_id, avatar_id=avatar_id, avatar_video=video_path,
+        push_url=push_url, fps=int(body.get("fps", 25)),
+        output_fps=int(body["output_fps"]) if body.get("output_fps") else None,
+        width=width, height=height,
+        warmup_frames=int(body.get("warmup_frames", 30)),
+        video_queue_frames=int(body.get("video_queue_frames", 150)),
+        interrupt_cover_frames=int(body.get("interrupt_cover_frames", 20)),
+        video_bitrate=str(body.get("video_bitrate", "3500k")),
+        audio_bitrate=str(body.get("audio_bitrate", "128k")),
+        audio_delay_ms=int(body.get("audio_delay_ms", 300)),
+    )
+    avatar = get_avatar(avatar_id, video_path, int(body.get("batch_size", 6)))
+    if output_mode == "relive":
+        output = ReLiveClipOutput(
+            APP_ROOT / "outputs" / "relive_clips",
+            str(body.get("relive_callback_url", "http://127.0.0.1:7864/api/musetalk/clip")),
+        )
+    elif output_mode in {"rtmp", "udp"}:
+        output = RTMPOutput(config.push_url, config.video_bitrate, config.audio_bitrate,
+                            config.output_sample_rate, config.audio_delay_ms,
+                            output_fps=config.output_fps)
+    else:
+        raise ValueError("output_mode must be rtmp, udp or relive")
+    frame_cursor = [0]
+    session = StreamSession(
+        config, output, idle_frames,
+        lambda request, emit, cancel: produce_sentence(
+            avatar, request, emit, cancel, config.fps,
+            frame_repeat=2 if session_id == "facebook-live" and config.fps == 25 else 1,
+            frame_cursor=frame_cursor,
+        ),
+        lambda request_id, event, details: print(
+            f"[stream] session={session_id} request={request_id} event={event} details={details}",
+            flush=True,
+        ),
+    )
+    MANAGER.replace(session)
+    session.start()
+    return session.get_status()
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "MuseTalkStream/1.0"
+
+    def _json(self, status: int, payload: dict) -> None:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def _jpeg(self, frame: np.ndarray) -> None:
+        ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if not ok:
+            raise RuntimeError("cannot encode preview frame")
+        payload = encoded.tobytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        return json.loads(self.rfile.read(length) or b"{}")
+
+    def _multipart_audio(self) -> dict:
+        content_type = self.headers.get("Content-Type", "")
+        if not content_type.lower().startswith("multipart/form-data"):
+            raise ValueError("Content-Type must be multipart/form-data")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0:
+            raise ValueError("empty multipart request")
+        if length > MAX_AUDIO_UPLOAD_BYTES:
+            raise ValueError(
+                f"audio upload exceeds {MAX_AUDIO_UPLOAD_BYTES // (1024 * 1024)} MB"
+            )
+        form = cgi.FieldStorage(
+            fp=self.rfile,
+            headers=self.headers,
+            environ={
+                "REQUEST_METHOD": "POST",
+                "CONTENT_TYPE": content_type,
+                "CONTENT_LENGTH": str(length),
+            },
+            keep_blank_values=True,
+        )
+        if "audio" not in form:
+            raise ValueError("multipart field audio is required")
+        item = form["audio"]
+        if isinstance(item, list):
+            item = item[0]
+        if not getattr(item, "filename", None) or item.file is None:
+            raise ValueError("audio must be a file")
+        suffix = Path(item.filename).suffix.lower()
+        if suffix not in ALLOWED_AUDIO_SUFFIXES:
+            raise ValueError(
+                "unsupported audio format; use wav, mp3, m4a, aac, flac, ogg or opus"
+            )
+        AUDIO_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        destination = AUDIO_UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+        try:
+            with open(destination, "wb") as output:
+                shutil.copyfileobj(item.file, output, length=1024 * 1024)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            raise
+        return {
+            "audio_path": str(destination),
+            "request_id": form.getfirst("request_id") or f"postman-{int(time.time())}",
+            "priority": int(form.getfirst("priority") or 0),
+            "interrupt": str(form.getfirst("interrupt") or "false").lower()
+            in {"1", "true", "yes", "on"},
+        }
+
+    def _route(self) -> tuple[str | None, str | None]:
+        parts = [p for p in urlparse(self.path).path.split("/") if p]
+        if parts[:2] != ["api", "streams"]:
+            return None, None
+        return (parts[2] if len(parts) > 2 else None,
+                parts[3] if len(parts) > 3 else None)
+
+    def do_POST(self) -> None:
+        session_id, action = self._route()
+        uploaded_path = None
+        enqueued_chunks = 0
+        try:
+            if session_id is None:
+                result = start_session(self._body())
+                self._json(201, result)
+                return
+            session = MANAGER.get(session_id)
+            if action == "enqueue-file":
+                body = self._multipart_audio()
+                uploaded_path = body["audio_path"]
+                chunks = split_audio_for_stream(
+                    uploaded_path, str(body["request_id"]), delete_source=True
+                )
+                session.enqueue_batch(
+                    [(chunk_id, chunk_path, int(body.get("priority", 0)), delete_after_use)
+                     for chunk_id, chunk_path, delete_after_use in chunks],
+                    interrupt=bool(body.get("interrupt", False)),
+                )
+                enqueued_chunks = len(chunks)
+                uploaded_path = None  # split helper/session owns the upload now
+            elif action == "enqueue":
+                body = self._body()
+                audio_path = str(Path(body["audio_path"]).resolve())
+                if not Path(audio_path).is_file():
+                    raise ValueError("audio_path does not exist")
+                chunks = split_audio_for_stream(audio_path, str(body["request_id"]))
+                session.enqueue_batch(
+                    [(chunk_id, chunk_path, int(body.get("priority", 0)), delete_after_use)
+                     for chunk_id, chunk_path, delete_after_use in chunks],
+                    interrupt=bool(body.get("interrupt", False)),
+                )
+                enqueued_chunks = len(chunks)
+            elif action == "interrupt":
+                self._body()
+                session.interrupt()
+            else:
+                self._json(404, {"error": "not found"})
+                return
+            status = session.get_status()
+            if enqueued_chunks:
+                status["audio_chunks_enqueued"] = enqueued_chunks
+            self._json(202, status)
+        except (KeyError, ValueError) as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
+            self._json(400, {"error": str(exc)})
+        except RuntimeError as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
+            self._json(409, {"error": str(exc)})
+        except Exception as exc:
+            if uploaded_path:
+                Path(uploaded_path).unlink(missing_ok=True)
+            traceback.print_exc()
+            self._json(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+    def do_GET(self) -> None:
+        session_id, action = self._route()
+        if session_id is None:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            session = MANAGER.get(session_id)
+            if action == "preview.jpg":
+                self._jpeg(session.get_preview_frame())
+            elif action is None:
+                self._json(200, session.get_status())
+            else:
+                self._json(404, {"error": "not found"})
+        except KeyError as exc:
+            if action == "preview.jpg":
+                placeholder = np.zeros((720, 1280, 3), dtype=np.uint8)
+                cv2.putText(
+                    placeholder, "Chua Start stream", (390, 350),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.5, (255, 255, 255), 3, cv2.LINE_AA,
+                )
+                self._jpeg(placeholder)
+            elif action is None:
+                progress = read_prep_progress(session_id)
+                if progress is not None:
+                    self._json(200, {"status": "preparing", **progress})
+                else:
+                    self._json(404, {"error": str(exc)})
+            else:
+                self._json(404, {"error": str(exc)})
+
+    def do_DELETE(self) -> None:
+        session_id, action = self._route()
+        if session_id is None or action is not None:
+            self._json(404, {"error": "not found"})
+            return
+        try:
+            MANAGER.stop(session_id)
+            self._json(200, MANAGER.get(session_id).get_status())
+        except KeyError as exc:
+            self._json(404, {"error": str(exc)})
+
+    def log_message(self, fmt: str, *args) -> None:
+        print(f"[stream-api] {self.address_string()} {fmt % args}", flush=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8091)
+    args = parser.parse_args()
+    load_runtime()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"[stream-api] listening http://{args.host}:{args.port}", flush=True)
+    try:
+        server.serve_forever()
+    finally:
+        for status in MANAGER.statuses():
+            MANAGER.stop(status["session_id"])
+        server.server_close()
+
+
+if __name__ == "__main__":
+    main()

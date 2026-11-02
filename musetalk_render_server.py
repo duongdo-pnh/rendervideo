@@ -13,11 +13,16 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+# MuseTalk checkpoints are official trusted model files and predate PyTorch
+# 2.6's weights_only=True default. MMEngine does not pass this flag itself.
+os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+
 APP_ROOT = Path(__file__).resolve().parent
 MUSETALK_ROOT = APP_ROOT / "engines" / "MuseTalk"
 sys.path.insert(0, str(MUSETALK_ROOT))
 
 import cv2
+import numpy as np
 import torch
 from transformers import WhisperModel
 
@@ -181,7 +186,9 @@ def _encode_job(avatar, req, frames, run_dir):
     try:
         with ThreadPoolExecutor(max_workers=blend_workers) as pool:
             for blended in pool.map(blend_one, enumerate(frames)):
-                process.stdin.write(memoryview(blended).cast("B"))
+                # Blending may return a strided NumPy view. A raw-video pipe
+                # needs tightly packed BGR bytes, especially with NumPy 2.
+                process.stdin.write(np.ascontiguousarray(blended, dtype=np.uint8).tobytes())
         process.stdin.close()
         returncode = process.wait()
     except Exception:

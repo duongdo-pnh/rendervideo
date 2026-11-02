@@ -22,6 +22,8 @@ wandb/
 /test
 /models/
 /venv/
+/.runtime
+/.tools/
 /detect_results/
 /temp
 
