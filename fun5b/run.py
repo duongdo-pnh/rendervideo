@@ -20,6 +20,7 @@ import threading
 import time
 
 from fun5b import config
+from fun5b.config import low_vram
 from fun5b.facelock import FaceLock, head_map
 from fun5b.pose import FUN_ROOT, DrivingPoses, PoseDetector, draw_pose_frame, pose_frames
 from fun5b.vae_decode import decode_frames, lean_vae
@@ -147,12 +148,20 @@ def load_pipeline():
                     self.decode_offload.add(frames)
                     print(f"VAE decode of {frames} latent frames out of memory with the DiT on the GPU: from now "
                           "on with the DiT in host RAM", flush=True)
-            self.transformer.to("cpu")
+            self.dit_to("cpu")
             torch.cuda.empty_cache()
             try:
                 return decode_frames(self.vae, latents, stop)
             finally:
-                self.transformer.to("cuda")
+                self.dit_to("cuda")
+
+        def dit_to(self, device):
+            """Move the DiT, or with a _BlockStreamer only its GPU-resident part (the streamed blocks stay in pinned
+            host RAM and are copied in block by block as they run)."""
+            if getattr(self, "streamer", None) is None:
+                self.transformer.to(device)
+            else:
+                self.streamer.move_resident(device)
 
     # VideoX-Fun reads the .pth checkpoints (T5 11GB, VAE 2.8GB) fully into RAM; memory-map them instead.
     torch_load = torch.load
@@ -168,6 +177,115 @@ class _NoTextEncoder(torch.nn.Module):
     """Stands in for T5 once the fixed prompt is encoded."""
 
     dtype = torch.bfloat16
+
+
+# On a low_vram() GPU (fun5b/config.py) T5 encodes on the CPU and only part of the DiT's blocks live on the GPU, the
+# rest streamed in from pinned host RAM (_BlockStreamer). Same weights and arithmetic, so the same video.
+# GPU memory kept free beside the resident blocks for a chunk's activations, the streamed block in flight and the
+# VAE. RTX 3080 Ti, 121-frame chunk: 4.5 ran out of memory in the first step's FFN, 6.5 (9/30 blocks resident) peaked
+# at 9.9GB allocated, 6.5s per step. FUN5B_RESIDENT_BLOCKS overrides the count.
+LOW_VRAM_RESERVE_GIB = float(os.environ.get("FUN5B_LOW_VRAM_RESERVE_GIB", "6.5"))
+
+
+def _to_device(value, device):
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, (list, tuple)):
+        return type(value)(_to_device(v, device) for v in value)
+    return value
+
+
+class _BlockStreamer:
+    """Keeps the first `resident` transformer blocks on the GPU and the others in pinned host RAM. A streamed block is
+    copied in on a side stream while the block before it computes, and its GPU copy is dropped as soon as it has run.
+    Its parameters' .data is the pinned host tensor whenever it is not running, so in-place weight edits (the LoRA
+    merge) land in the copy that is streamed."""
+
+    def __init__(self, transformer, resident):
+        import functools
+
+        self.transformer = transformer
+        self.blocks = list(transformer.blocks)
+        self.resident = max(0, min(resident, len(self.blocks)))
+        self.stream = torch.cuda.Stream()
+        self.host = {}  # block index -> [(parameter or buffer, pinned host tensor)]
+        self.ready = {}  # block index -> event recorded on self.stream once its copy is done
+        streamed = set()
+        for i, block in enumerate(self.blocks[self.resident:], self.resident):
+            pairs = []
+            for t in list(block.parameters()) + list(block.buffers()):
+                t.data = t.data.to("cpu").pin_memory()
+                pairs.append((t, t.data))
+                streamed.add(id(t))
+            self.host[i] = pairs
+            block.register_forward_pre_hook(functools.partial(self._before, i))
+            block.register_forward_hook(functools.partial(self._after, i))
+        self.order = sorted(self.host)
+        self.resident_tensors = [t for t in list(transformer.parameters()) + list(transformer.buffers())
+                                 if id(t) not in streamed]
+        self.resident_host = None  # pinned host buffers the resident part is parked in during VAE encode/decode
+        for t in self.resident_tensors:
+            t.data = t.data.to("cuda")
+
+    def move_resident(self, device):
+        """Park the resident part in pinned host RAM ("cpu") or bring it back ("cuda"). Copied out each time, so
+        weight edits made while it was on the GPU (the LoRA merge) are kept."""
+        if torch.device(device).type == "cpu":
+            if self.resident_host is None:
+                self.resident_host = [torch.empty_like(t.data, device="cpu").pin_memory()
+                                      for t in self.resident_tensors]
+            for t, host in zip(self.resident_tensors, self.resident_host):
+                if t.data.is_cuda:
+                    host.copy_(t.data, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            for t, host in zip(self.resident_tensors, self.resident_host):
+                t.data = host
+        else:
+            for t in self.resident_tensors:
+                if not t.data.is_cuda:
+                    t.data = t.data.to("cuda", non_blocking=True)
+
+    def _fetch(self, i):
+        with torch.cuda.stream(self.stream):
+            for t, host in self.host[i]:
+                t.data = host.to("cuda", non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(self.stream)
+        self.ready[i] = event
+
+    def _before(self, i, module, args):
+        if i not in self.ready:
+            self._fetch(i)
+        current = torch.cuda.current_stream()
+        current.wait_event(self.ready.pop(i))
+        for t, _ in self.host[i]:
+            t.data.record_stream(current)  # its memory is not reused before the compute queued on it has run
+        # Prefetch the next streamed block (after the last one: the first, for the next step).
+        nxt = self.order[(self.order.index(i) + 1) % len(self.order)]
+        if nxt != i and nxt not in self.ready:
+            self._fetch(nxt)
+
+    def _after(self, i, module, args, output):
+        for t, host in self.host[i]:
+            t.data = host
+
+
+def _stream_blocks(transformer):
+    """Put as many DiT blocks on the GPU as leave LOW_VRAM_RESERVE_GIB free, stream the rest."""
+    blocks = list(transformer.blocks)
+    block_bytes = sum(t.numel() * t.element_size() for t in blocks[0].parameters())
+    other_bytes = sum(t.numel() * t.element_size() for t in transformer.parameters()) - block_bytes * len(blocks)
+    forced = os.environ.get("FUN5B_RESIDENT_BLOCKS")
+    if forced:
+        resident = int(forced)
+    else:
+        free, _ = torch.cuda.mem_get_info()
+        budget = free - other_bytes - LOW_VRAM_RESERVE_GIB * 2**30
+        resident = max(0, int(budget // block_bytes))
+    streamer = _BlockStreamer(transformer, resident)
+    print(f"low-VRAM: {streamer.resident}/{len(blocks)} DiT blocks on the GPU ({block_bytes / 2**30:.2f}GB each), "
+          f"{len(blocks) - streamer.resident} streamed from host RAM", flush=True)
+    return streamer
 
 
 def _load_pipeline(GpuPipeline, AutoencoderKLWan3_8, AutoTokenizer, Wan2_2Transformer3DModel, WanT5EncoderModel,
@@ -191,10 +309,24 @@ def _load_pipeline(GpuPipeline, AutoencoderKLWan3_8, AutoTokenizer, Wan2_2Transf
 
         install(vae)
     gc.collect()
-    text_encoder = WanT5EncoderModel.from_pretrained(
-        os.path.join(MODEL_DIR, cfg["text_encoder_kwargs"].get("text_encoder_subpath", "text_encoder")),
-        additional_kwargs=OmegaConf.to_container(cfg["text_encoder_kwargs"]), low_cpu_mem_usage=True, torch_dtype=dtype,
-    ).eval().to("cuda")
+    small_gpu = low_vram()
+    # T5 (11GB) does not fit next to the VAE on a 12GB card: there it encodes the fixed prompt on the CPU.
+    encode_device = torch.device("cpu" if small_gpu else "cuda")
+    # The prompts are fixed, so their embeddings are cached on disk: loading T5 and encoding on the CPU took ~400s of
+    # a ~430s load (31s with the cache). Keyed by the texts, the model (real path: the app reaches it through
+    # symlinks too) and the encode device (CPU and GPU T5 differ in the last bits), so a cached file is exactly what
+    # this machine would compute.
+    key = hashlib.sha256("\0".join([PROMPT, NEGATIVE, NEGATIVE_LIGHT, os.path.realpath(MODEL_DIR),
+                                    encode_device.type]).encode())
+    embeds_path = os.path.join(config.CACHE_DIR, "prompt_embeds", f"{key.hexdigest()[:16]}.pt")
+    cached = torch.load(embeds_path, map_location="cuda") if os.path.isfile(embeds_path) else None
+    text_encoder = None
+    if cached is None:
+        text_encoder = WanT5EncoderModel.from_pretrained(
+            os.path.join(MODEL_DIR, cfg["text_encoder_kwargs"].get("text_encoder_subpath", "text_encoder")),
+            additional_kwargs=OmegaConf.to_container(cfg["text_encoder_kwargs"]), low_cpu_mem_usage=True,
+            torch_dtype=dtype,
+        ).eval().to(encode_device)
     gc.collect()
     tokenizer = AutoTokenizer.from_pretrained(
         os.path.join(MODEL_DIR, cfg["text_encoder_kwargs"].get("tokenizer_subpath", "tokenizer")))
@@ -202,13 +334,20 @@ def _load_pipeline(GpuPipeline, AutoencoderKLWan3_8, AutoTokenizer, Wan2_2Transf
         **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(cfg["scheduler_kwargs"]))
     )
     pipe = GpuPipeline(transformer=None, transformer_2=None, vae=vae, tokenizer=tokenizer,
-                       text_encoder=text_encoder, scheduler=scheduler)
-    with torch.no_grad():
-        pipe.embeds = {
-            neg_light: pipe.encode_prompt(PROMPT, (NEGATIVE_LIGHT if neg_light else "") + NEGATIVE,
-                                          do_classifier_free_guidance=True, device=torch.device("cuda"), dtype=dtype)
-            for neg_light in (False, True)
-        }
+                       text_encoder=text_encoder or _NoTextEncoder(), scheduler=scheduler)
+    if cached is not None:
+        pipe.embeds = cached
+    else:
+        with torch.no_grad():
+            pipe.embeds = {
+                neg_light: _to_device(pipe.encode_prompt(PROMPT, (NEGATIVE_LIGHT if neg_light else "") + NEGATIVE,
+                                                         do_classifier_free_guidance=True, device=encode_device,
+                                                         dtype=dtype), "cuda")
+                for neg_light in (False, True)
+            }
+        os.makedirs(os.path.dirname(embeds_path), exist_ok=True)
+        torch.save(pipe.embeds, embeds_path + ".tmp")
+        os.replace(embeds_path + ".tmp", embeds_path)
     pipe.register_modules(text_encoder=_NoTextEncoder())  # __call__ still reads text_encoder.dtype
     del text_encoder
     gc.collect()
@@ -218,9 +357,27 @@ def _load_pipeline(GpuPipeline, AutoencoderKLWan3_8, AutoTokenizer, Wan2_2Transf
                                                                        "transformer")),
         transformer_additional_kwargs=OmegaConf.to_container(cfg["transformer_additional_kwargs"]), torch_dtype=dtype,
         low_cpu_mem_usage=True,  # the default path builds the model in fp32 first: ~20GB of host RAM for 5B params
-    ).to(dtype).to("cuda")
+    ).to(dtype)
+    pipe.streamer = _stream_blocks(transformer) if small_gpu else None
+    if pipe.streamer is None:
+        transformer.to("cuda")
+    else:
+        # A chunk's VAE encodes (control video, masked start video) peak at ~3GB: with the resident blocks on the
+        # GPU they ran out of memory on a 12GB card, so the DiT waits in host RAM meanwhile (as for the decode).
+        encode = vae.encode
+
+        def encode_without_dit(*args, **kwargs):
+            pipe.dit_to("cpu")
+            torch.cuda.empty_cache()
+            try:
+                return encode(*args, **kwargs)
+            finally:
+                pipe.dit_to("cuda")
+
+        vae.encode = encode_without_dit
     gc.collect()
-    if os.environ.get("FUN5B_COMPILE", "1") != "0":
+    # Not with streamed blocks: their weights change device inside the forward, under the compiled graph.
+    if pipe.streamer is None and os.environ.get("FUN5B_COMPILE", "1") != "0":
         # torch.compile in place (module names stay, so the LoRA merge still finds them): 6.1 -> 5.3 s per step at a
         # 121-frame chunk, output within 43 dB PSNR of eager; ~30s to compile on the first step of each chunk size.
         transformer.compile(dynamic=False)

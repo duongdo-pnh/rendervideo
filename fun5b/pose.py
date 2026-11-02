@@ -39,6 +39,18 @@ class PoseDetector:
             pose=os.path.join(DWPOSE_DIR, "dw-ll_ucoco_384.onnx"), pose_input_size=(288, 384),
             to_openpose=True, backend="onnxruntime", device="cuda",
         )
+        if config.low_vram():
+            # ONNX Runtime's default CUDA arena grows by powers of two and never gives memory back, and its cuDNN
+            # convolutions take the biggest workspace: after a 15s driving video it held ~2GB, and the streamed DiT
+            # (fun5b.run) then ran out of memory in its first step on a 12GB card. Grow only by what is asked.
+            import onnxruntime as ort
+
+            cuda = ("CUDAExecutionProvider", {"device_id": 0, "arena_extend_strategy": "kSameAsRequested",
+                                              "cudnn_conv_algo_search": "HEURISTIC",
+                                              "cudnn_conv_use_max_workspace": "0"})
+            for tool, path in ((self.model.det_model, "yolox_l.onnx"), (self.model.pose_model, "dw-ll_ucoco_384.onnx")):
+                tool.session = ort.InferenceSession(os.path.join(DWPOSE_DIR, path),
+                                                    providers=[cuda, "CPUExecutionProvider"])
 
     def __call__(self, rgb):
         """(134, 3) keypoints (x, y, score in pixels, OpenPose order with neck) of the biggest person, or None.

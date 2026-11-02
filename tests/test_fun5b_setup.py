@@ -29,13 +29,20 @@ class AutoStartTests(_TempLogs):
 
     def test_small_gpu_is_skipped_and_remembered_without_downloading(self):
         with patch.object(fs, "installed", return_value=False), patch.object(fs, "start") as start, \
-                patch.object(gpu_info, "gpu_total_gib", return_value=12.0), \
-                patch.object(gpu_info, "current_gpu_name", return_value="RTX 3080 Ti"):
+                patch.object(gpu_info, "gpu_total_gib", return_value=10.0), \
+                patch.object(gpu_info, "current_gpu_name", return_value="RTX 3080"):
             fs.auto_start()
             status = fs.status()
         start.assert_not_called()
         self.assertEqual(status["state"], "skipped")
-        self.assertIn("RTX 3080 Ti", status["message"])
+        self.assertIn("RTX 3080", status["message"])
+
+    def test_12gb_gpu_installs(self):
+        # RTX 3080 Ti: the video model and FireRed run with part of their weights streamed from host RAM.
+        with patch.object(gpu_info, "gpu_total_gib", return_value=12.0), \
+                patch.object(fs, "bytes_needed", return_value=0):
+            code, _reason = fs.preflight()
+        self.assertEqual(code, 0)
 
     def test_missing_engine_on_a_big_gpu_starts_the_install(self):
         with patch.object(fs, "installed", return_value=False), patch.object(fs, "start") as start, \

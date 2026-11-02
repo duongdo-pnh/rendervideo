@@ -31,6 +31,21 @@ DEFAULT_SEED = 42
 VIDEO_COLOR_PARAMS = ["-vf", "scale=out_color_matrix=bt709:out_range=tv", "-colorspace", "bt709",
                       "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
 
+# GPUs below this (RTX 3080 Ti, 12GB) cannot hold the 10GB bf16 DiT next to a chunk's activations and the VAE:
+# fun5b.run streams part of it from host RAM and fun5b.pose caps ONNX Runtime's GPU memory. FUN5B_LOW_VRAM=0/1 forces
+# either path.
+LOW_VRAM_GIB = 20
+
+
+def low_vram():
+    forced = os.environ.get("FUN5B_LOW_VRAM")
+    if forced in ("0", "1"):
+        return forced == "1"
+    import torch
+
+    return torch.cuda.get_device_properties(0).total_memory / 2**30 < LOW_VRAM_GIB
+
+
 # Triton compiles its launchers with the system C compiler (gcc, from install/setup.sh's apt step).
 # Keep Triton/Inductor compile results across restarts (default is /tmp).
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(CACHE_DIR, "compile/inductor"))

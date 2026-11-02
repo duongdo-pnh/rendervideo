@@ -53,6 +53,9 @@ def _log(msg):
 def _release():
     gc.collect()
     torch.cuda.empty_cache()
+    # Pinned host memory (the streamed DiT blocks on a low-VRAM GPU, ~9GB) stays in PyTorch's host cache after the
+    # model is dropped: FireRed's worker, in the same memory scope, was then OOM-killed.
+    torch._C._host_emptyCache()
     _LIBC.malloc_trim(0)  # hand freed frame buffers back to the OS (RAM grew GBs per job without it)
 
 

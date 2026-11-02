@@ -9,6 +9,10 @@ usage: engines/Fun5B/.venv-edit/bin/python -I fun5b/edit_worker.py --model-dir c
 The 16GB Qwen2.5-VL text encoder is put on the GPU first to encode the prompt and the " " negative, then freed, and
 only then the GGUF transformer (Q5_K_M, 14.9GB) is loaded: both at once do not fit in 24GB. Measured on an RTX 3090:
 ~5 min of denoising at 40 steps, ~6.5 min with loading, 18.8GB peak.
+
+Below LOW_VRAM_GIB (RTX 3080 Ti, 12GB) neither fits on its own: the text encoder keeps the layers that fit
+TEXT_ENCODER_GPU_GIB on the GPU and runs the others from host RAM (accelerate), and the transformer's blocks are
+streamed in from host RAM one at a time while the previous one computes (diffusers group offloading). Same weights.
 """
 
 import argparse
@@ -18,6 +22,16 @@ import time
 
 import torch
 from PIL import Image
+
+LOW_VRAM_GIB = 20  # as fun5b/config.py (not imported: this file runs in .venv-edit, outside the repo's imports)
+TEXT_ENCODER_GPU_GIB = float(os.environ.get("FIRERED_TEXT_ENCODER_GPU_GIB", "8"))
+
+
+def low_vram():
+    forced = os.environ.get("FUN5B_LOW_VRAM")
+    if forced in ("0", "1"):
+        return forced == "1"
+    return torch.cuda.get_device_properties(0).total_memory / 2**30 < LOW_VRAM_GIB
 
 
 @torch.no_grad()
@@ -40,8 +54,11 @@ def main():
     from transformers import Qwen2_5_VLForConditionalGeneration
 
     tic = time.time()
+    small_gpu = low_vram()
+    placement = (dict(device_map="auto", max_memory={0: f"{TEXT_ENCODER_GPU_GIB}GiB", "cpu": "64GiB"})
+                 if small_gpu else dict(device_map="cuda"))
     te = Qwen2_5_VLForConditionalGeneration.from_pretrained(os.path.join(a.model_dir, "text_encoder"),
-                                                            dtype=torch.bfloat16, device_map="cuda")
+                                                            dtype=torch.bfloat16, **placement)
     pipe = QwenImageEditPlusPipeline.from_pretrained(a.model_dir, transformer=None, text_encoder=te,
                                                      torch_dtype=torch.bfloat16)
     image = Image.open(a.src).convert("RGB").resize((width, height), Image.LANCZOS)
@@ -58,7 +75,11 @@ def main():
         os.path.join(a.model_dir, a.gguf), config=os.path.join(a.model_dir, "transformer"),
         quantization_config=GGUFQuantizationConfig(compute_dtype=torch.bfloat16), torch_dtype=torch.bfloat16)
     pipe.register_modules(transformer=transformer)
-    pipe.transformer.to("cuda")
+    if small_gpu:
+        pipe.transformer.enable_group_offload(onload_device=torch.device("cuda"), offload_device=torch.device("cpu"),
+                                              offload_type="block_level", num_blocks_per_group=1, use_stream=True)
+    else:
+        pipe.transformer.to("cuda")
     pipe.vae.to("cuda")
     cuda = lambda x: None if x is None else x.cuda()  # noqa: E731
     out = pipe(image=[image], prompt_embeds=cuda(embeds[0][0]), prompt_embeds_mask=cuda(embeds[0][1]),

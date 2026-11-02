@@ -47,11 +47,18 @@ REQUIRED_FILES = (
     _W / "rvm" / "hub" / "PeterL1n_RobustVideoMatting_master" / "hubconf.py",
 )
 FIRERED_GGUF = CKPT_DIR / "firered-image-edit" / "FireRed-Image-Edit-1.1-Q5_K_M.gguf"
-MIN_VRAM_GIB = 20  # the VAE decode peaks at ~20GB (fun5b/run.py GpuPipeline.decode_video)
+# 20GB+ (RTX 3090) holds the whole model; from 12GB (RTX 3080 Ti) fun5b/run.py streams part of the DiT and
+# fun5b/edit_worker.py part of FireRed from host RAM (fun5b.config.low_vram(); ~1.2x the time per video step, FireRed
+# about the same). Below 12GB a chunk's activations alone do not fit beside the VAE.
+MIN_VRAM_GIB = 12
+LOW_VRAM_GIB = 20  # as fun5b/config.py (that one needs torch, which this venv does not import here)
 START_TIMEOUT = float(os.environ.get("FUN5B_START_TIMEOUT", "600"))  # model load ~2 min, first compile more
 HEARTBEAT_SECONDS = 30
 MAX_RENDER_SECONDS = float(os.environ.get("FUN5B_MAX_RENDER_SECONDS", str(6 * 60 * 60)))
 MEMORY_MAX = os.environ.get("FUN5B_MEMORY_MAX", "22G")  # as temo's scripts/fun-ui.sh
+# With streamed DiT blocks the server keeps ~9GB of them pinned in host RAM (peak 27GB), and FireRed's worker (a
+# child, in the same scope) runs its streamed models from host RAM too (~20GB): 40G got the worker OOM-killed.
+LOW_VRAM_MEMORY_MAX = os.environ.get("FUN5B_MEMORY_MAX", "48G")
 
 
 class RenderRejected(Exception):
@@ -86,6 +93,12 @@ def unavailable_reason():
 def plate_available():
     """FireRed (clean background painting) installed: its weights and its own venv."""
     return FIRERED_GGUF.is_file() and EDIT_PYTHON.is_file()
+
+
+def _low_vram_gpu():
+    import gpu_info
+
+    return 0 < gpu_info.gpu_total_gib() < LOW_VRAM_GIB
 
 
 def _connect(timeout=2):
@@ -137,7 +150,8 @@ def _memory_capped(cmd):
                            env={**os.environ, **extra}, capture_output=True, timeout=15)
     if probe.returncode != 0:
         return cmd, {}
-    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={MEMORY_MAX}",
+    memory_max = LOW_VRAM_MEMORY_MAX if _low_vram_gpu() else MEMORY_MAX
+    return ["systemd-run", "--user", "--scope", "--quiet", "-p", f"MemoryMax={memory_max}",
             "--", *cmd], extra
 
 
